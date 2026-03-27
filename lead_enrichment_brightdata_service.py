@@ -89,7 +89,7 @@ QUEUE_NORMAL = "wb:leads:queue:normal"  # bulk ≤100
 QUEUE_LOW    = "wb:leads:queue:low"     # bulk >100
 
 # ── LIO forwarding ────────────────────────────────────────────────────────────
-LIO_RECEIVE_URL = os.getenv("LIO_RECEIVE_URL", "http://192.168.11.41:5002/api/enrich/receive")
+LIO_RECEIVE_URL = os.getenv("LIO_RECEIVE_URL", "https://api-lio.worksbuddy.ai/api/enrich/receive")
 _lio_client: Optional[httpx.AsyncClient] = None
 
 
