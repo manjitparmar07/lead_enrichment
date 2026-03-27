@@ -88,6 +88,60 @@ QUEUE_HIGH   = "wb:leads:queue:high"    # single enrichments
 QUEUE_NORMAL = "wb:leads:queue:normal"  # bulk ≤100
 QUEUE_LOW    = "wb:leads:queue:low"     # bulk >100
 
+# ── LIO forwarding ────────────────────────────────────────────────────────────
+LIO_RECEIVE_URL = os.getenv("LIO_RECEIVE_URL", "http://192.168.11.41:5002/api/enrich/receive")
+_lio_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_lio_client() -> httpx.AsyncClient:
+    global _lio_client
+    if _lio_client is None or _lio_client.is_closed:
+        _lio_client = httpx.AsyncClient(
+            timeout=30.0,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    return _lio_client
+
+
+async def send_to_lio(lead: dict, sso_id: str = "") -> None:
+    """
+    Fire-and-forget: forward an enriched lead to the LIO service.
+    Called as asyncio.create_task() — never blocks enrich_single().
+    Logs a warning on failure but does not raise.
+    """
+    url = LIO_RECEIVE_URL
+    if not url:
+        logger.warning("[LIO] LIO_RECEIVE_URL is not set — skipping forward")
+        return
+
+    lead_id = lead.get("lead_id", "unknown")
+    payload = {
+        "enrichment_data": lead,
+        "sso_id": sso_id,
+        "organization_id": lead.get("organization_id", ""),
+    }
+
+    logger.info("[LIO] Sending lead %s to %s | sso_id=%s | org=%s",
+                lead_id, url, sso_id, lead.get("organization_id", ""))
+
+    try:
+        client = _get_lio_client()
+        resp = await client.post(url, json=payload)
+        logger.info("[LIO] Response for lead %s → HTTP %s | body=%s",
+                    lead_id, resp.status_code, resp.text[:500])
+        resp.raise_for_status()
+        logger.info("[LIO] Successfully forwarded lead %s", lead_id)
+    except httpx.TimeoutException:
+        logger.error("[LIO] Timeout sending lead %s to %s", lead_id, url)
+    except httpx.ConnectError as e:
+        logger.error("[LIO] Connection error sending lead %s to %s: %s", lead_id, url, e)
+    except httpx.HTTPStatusError as e:
+        logger.error("[LIO] HTTP error for lead %s → HTTP %s | body=%s",
+                     lead_id, e.response.status_code, e.response.text[:500])
+    except Exception as e:
+        logger.error("[LIO] Unexpected error sending lead %s: %s", lead_id, e, exc_info=True)
+
+
 _redis_pool: Any = None
 
 
@@ -3195,6 +3249,7 @@ async def enrich_single(
     org_id: str = "default",
     generate_outreach_flag: bool = True,
     tools: Optional[dict] = None,
+    sso_id: str = "",
 ) -> dict:
     """
     Sequential 8-stage enrichment waterfall:
@@ -3677,6 +3732,10 @@ async def enrich_single(
         lead["work_email"] or "not found", lead["data_completeness"],
         lead["product_category"] or "?",
     )
+
+    # Forward to LIO — fire-and-forget, does not block return
+    asyncio.create_task(send_to_lio(lead, sso_id=sso_id))
+
     return lead
 
 
@@ -4066,6 +4125,7 @@ async def enrich_bulk(
     notify_url: Optional[str] = None,
     webhook_auth: Optional[str] = None,
     org_id: str = "default",
+    sso_id: str = "",
 ) -> dict:
     """
     Bulk enrichment pipeline — multi-tenant aware.
@@ -4127,6 +4187,7 @@ async def enrich_bulk(
                     sub_job_ids=sub_job_ids,
                     r=r,
                     generate_outreach=True,
+                    sso_id=sso_id,
                 )
                 await _update_job(job_id, status="running")
                 job["status"] = "running"
