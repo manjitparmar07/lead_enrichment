@@ -182,15 +182,18 @@ async def _publish_lead_done(org_id: str, job_id: str, lead: dict) -> None:
         import ably_service
         channel = f"tenant:{org_id}:job:{job_id}"
         await ably_service.publish(channel, "lead:done", {
-            "job_id":   job_id,
-            "org_id":   org_id,
-            "lead_id":  lead.get("id"),
-            "name":     lead.get("name"),
-            "score":    lead.get("total_score"),
-            "tier":     lead.get("score_tier"),
-            "email":    lead.get("work_email"),
-            "company":  lead.get("company"),
-            "title":    lead.get("title"),
+            "job_id":         job_id,
+            "org_id":         org_id,
+            "lead_id":        lead.get("id"),
+            "linkedin_url":   lead.get("linkedin_url"),
+            "name":           lead.get("name"),
+            "score":          lead.get("total_score"),
+            "tier":           lead.get("score_tier"),
+            "email":          lead.get("work_email"),
+            "company":        lead.get("company"),
+            "title":          lead.get("title"),
+            "cache_hit":      bool(lead.get("_cache_hit")),
+            "linkedin_enrich": lead.get("linkedin_enrich"),
         })
     except Exception as e:
         logger.debug("[Ably] lead:done publish failed: %s", e)
@@ -460,6 +463,45 @@ async def init_leads_db() -> None:
                 await db.execute(idx_sql)
             except Exception:
                 pass
+        # ── processed_snapshots — webhook idempotency ─────────────────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS processed_snapshots (
+                snapshot_id  TEXT PRIMARY KEY,
+                job_id       TEXT,
+                org_id       TEXT,
+                processed_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        # ── enrichment_audit_log — who did what ────────────────────────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS enrichment_audit_log (
+                id           TEXT PRIMARY KEY,
+                org_id       TEXT NOT NULL,
+                action       TEXT NOT NULL,
+                lead_id      TEXT,
+                linkedin_url TEXT,
+                job_id       TEXT,
+                user_email   TEXT,
+                meta         TEXT,
+                created_at   TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_org ON enrichment_audit_log(org_id, created_at DESC)"
+        )
+        # ── lead_notes — manual annotations ───────────────────────────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS lead_notes (
+                id         TEXT PRIMARY KEY,
+                lead_id    TEXT NOT NULL,
+                org_id     TEXT NOT NULL,
+                note       TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notes_lead ON lead_notes(lead_id)"
+        )
         await db.commit()
     logger.info("[LeadEnrichmentBD] DB initialized: %s", LEADS_DB)
 
@@ -530,6 +572,100 @@ async def get_lead(lead_id: str) -> Optional[dict]:
         async with db.execute("SELECT * FROM enriched_leads WHERE id=?", (lead_id,)) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
+
+
+async def get_lead_by_url(linkedin_url: str) -> Optional[dict]:
+    """Look up an enriched lead by its LinkedIn URL (same as get_lead(_lead_id(url)))."""
+    lead_id = _lead_id(_normalize_linkedin_url(linkedin_url))
+    return await get_lead(lead_id)
+
+
+def _parse_json_safe(raw, default):
+    """Parse a JSON string field, returning default on any failure."""
+    if not raw:
+        return default
+    if isinstance(raw, (dict, list)):
+        return raw
+    try:
+        return json.loads(raw)
+    except Exception:
+        return default
+
+
+def _format_linkedin_enrich(lead: dict) -> dict:
+    """
+    Build the structured LinkedIn Enrichment view from a raw DB lead row.
+    Shared by enrich_single() (embedded in response) and the /view/linkedin route.
+    """
+    full         = _parse_json_safe(lead.get("full_data"), {})
+    lead_scoring = full.get("lead_scoring") or {}
+
+    return {
+        "lead_id":      lead.get("id"),
+        "linkedin_url": lead.get("linkedin_url"),
+        "enriched_at":  lead.get("enriched_at"),
+        "cache_hit":    bool(lead.get("_cache_hit")),
+
+        "identity": {
+            "first_name":   lead.get("first_name"),
+            "last_name":    lead.get("last_name"),
+            "name":         lead.get("name"),
+            "title":        lead.get("title"),
+            "company":      lead.get("company"),
+            "location":     lead.get("location"),
+            "country":      lead.get("country"),
+            "timezone":     lead.get("timezone"),
+            "about":        lead.get("about"),
+            "linkedin_url": lead.get("linkedin_url"),
+            "twitter_url":  lead.get("twitter_url"),
+            "followers":    lead.get("followers"),
+            "connections":  lead.get("connections"),
+            "skills":       _parse_json_safe(lead.get("skills"), []),
+            "profile":      full.get("person_profile", {}),
+        },
+
+        "contact": {
+            "work_email":        lead.get("work_email"),
+            "email":             lead.get("email"),
+            "phone":             lead.get("phone"),
+            "email_source":      lead.get("email_source"),
+            "email_confidence":  lead.get("email_confidence"),
+            "email_verified":    bool(lead.get("email_verified")),
+            "bounce_risk":       lead.get("bounce_risk"),
+            "enrichment_source": lead.get("enrichment_source"),
+        },
+
+        "scores": {
+            "total_score":       lead.get("total_score"),
+            "icp_score":         lead.get("icp_score"),
+            "intent_score":      lead.get("intent_score"),
+            "timing_score":      lead.get("timing_score"),
+            "data_completeness": lead.get("data_completeness"),
+            "score_tier":        lead.get("score_tier"),
+            "combined_score":    lead.get("combined_score"),
+            "score_reasons":     _parse_json_safe(lead.get("score_reasons"), []),
+            "breakdown":         lead_scoring,
+        },
+
+        "icp_match": {
+            "icp_score":        lead.get("icp_score"),
+            "product_category": lead.get("product_category"),
+            "score_tier":       lead.get("score_tier"),
+            "icp_detail":       lead_scoring.get("icp_fit") or {},
+        },
+
+        "behavioural_signals": _parse_json_safe(lead.get("behavioural_signals"), {}),
+        "pitch_intelligence":  _parse_json_safe(lead.get("pitch_intelligence"), {}),
+
+        "activity": {
+            "feed":           _parse_json_safe(lead.get("activity_feed"), []),
+            "warm_signal":    lead.get("warm_signal"),
+            "hiring_signals": full.get("hiring_signals", []),
+            "linkedin_posts": full.get("linkedin_posts", []),
+        },
+
+        "tags": _parse_json_safe(lead.get("auto_tags"), []),
+    }
 
 
 async def get_lead_lio_results(lead_id: str) -> dict:
@@ -631,6 +767,206 @@ async def delete_lead(lead_id: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Duplicate Detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CACHE_TTL_DAYS: int = int(os.getenv("LEAD_CACHE_TTL_DAYS", "90"))
+
+
+async def check_existing_lead(linkedin_url: str, org_id: str) -> Optional[dict]:
+    """
+    Return (lead_row, is_stale) for an already-enriched lead, or None if not found.
+    - is_stale=True  → enriched_at older than LEAD_CACHE_TTL_DAYS
+    - is_stale=False → fresh cache hit
+    """
+    lead_id = _lead_id(_normalize_linkedin_url(linkedin_url))
+    async with aiosqlite.connect(LEADS_DB) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM enriched_leads WHERE id=? AND organization_id=?",
+            (lead_id, org_id),
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return None
+    lead = dict(row)
+    enriched_at = lead.get("enriched_at") or lead.get("created_at", "")
+    stale = False
+    try:
+        from datetime import datetime, timezone, timedelta
+        ea = datetime.fromisoformat(enriched_at.replace("Z", "+00:00"))
+        stale = (datetime.now(timezone.utc) - ea) > timedelta(days=_CACHE_TTL_DAYS)
+    except Exception:
+        pass
+    lead["_cache_hit"] = True
+    lead["_stale"] = stale
+    return lead
+
+
+async def get_stale_leads(
+    org_id: str,
+    older_than_days: int = 90,
+    tier: Optional[str] = None,
+    min_score: int = 0,
+    limit: int = 200,
+) -> list[dict]:
+    """
+    Find leads older than `older_than_days` that are candidates for re-enrichment.
+    """
+    from datetime import datetime, timezone, timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+    clauses = ["organization_id=?", "enriched_at<?"]
+    params: list = [org_id, cutoff]
+    if tier:
+        clauses.append("score_tier=?"); params.append(tier)
+    if min_score:
+        clauses.append("total_score>=?"); params.append(min_score)
+    where = "WHERE " + " AND ".join(clauses)
+    max_limit = int(os.getenv("LEAD_REFRESH_LIMIT", "200"))
+    limit = min(limit, max_limit)
+    async with aiosqlite.connect(LEADS_DB) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            f"SELECT id, linkedin_url, enriched_at, total_score, score_tier "
+            f"FROM enriched_leads {where} ORDER BY total_score DESC LIMIT ?",
+            [*params, limit],
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Webhook Idempotency
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def mark_snapshot_processed(snapshot_id: str, job_id: Optional[str], org_id: str) -> None:
+    """Record that a snapshot has been processed (idempotency guard)."""
+    async with aiosqlite.connect(LEADS_DB) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO processed_snapshots(snapshot_id, job_id, org_id) VALUES(?,?,?)",
+            (snapshot_id, job_id, org_id),
+        )
+        await db.commit()
+
+
+async def is_snapshot_processed(snapshot_id: str) -> bool:
+    """Return True if this snapshot_id was already processed."""
+    async with aiosqlite.connect(LEADS_DB) as db:
+        async with db.execute(
+            "SELECT 1 FROM processed_snapshots WHERE snapshot_id=?", (snapshot_id,)
+        ) as cur:
+            return (await cur.fetchone()) is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Audit Logging
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def audit_log(
+    org_id: str,
+    action: str,
+    lead_id: Optional[str] = None,
+    linkedin_url: Optional[str] = None,
+    job_id: Optional[str] = None,
+    user_email: Optional[str] = None,
+    meta: Optional[dict] = None,
+) -> None:
+    """
+    Write an audit log entry (fire-and-forget — never raises).
+
+    Actions: enrich_single | bulk_submit | delete | re_enrich | refresh_scheduled
+    """
+    try:
+        entry_id = str(uuid.uuid4())
+        async with aiosqlite.connect(LEADS_DB) as db:
+            await db.execute(
+                """INSERT INTO enrichment_audit_log
+                   (id, org_id, action, lead_id, linkedin_url, job_id, user_email, meta)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    entry_id, org_id, action, lead_id, linkedin_url,
+                    job_id, user_email,
+                    json.dumps(meta) if meta else None,
+                ),
+            )
+            await db.commit()
+    except Exception as e:
+        logger.debug("[AuditLog] write failed: %s", e)
+
+
+async def list_audit_log(
+    org_id: str,
+    action: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    """List audit log entries for an org."""
+    clauses = ["org_id=?"]
+    params: list = [org_id]
+    if action:
+        clauses.append("action=?"); params.append(action)
+    where = "WHERE " + " AND ".join(clauses)
+    async with aiosqlite.connect(LEADS_DB) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            f"SELECT COUNT(*) FROM enrichment_audit_log {where}", params
+        ) as cur:
+            total = (await cur.fetchone())[0]
+        async with db.execute(
+            f"SELECT * FROM enrichment_audit_log {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ) as cur:
+            rows = [dict(r) for r in await cur.fetchall()]
+    # Parse meta JSON
+    for row in rows:
+        if row.get("meta"):
+            try:
+                row["meta"] = json.loads(row["meta"])
+            except Exception:
+                pass
+    return {"total": int(total), "entries": rows}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lead Notes
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def add_lead_note(lead_id: str, org_id: str, note: str) -> dict:
+    """Add a text note to a lead. Returns the created note row."""
+    note_id = str(uuid.uuid4())
+    async with aiosqlite.connect(LEADS_DB) as db:
+        await db.execute(
+            "INSERT INTO lead_notes(id, lead_id, org_id, note) VALUES(?,?,?,?)",
+            (note_id, lead_id, org_id, note.strip()),
+        )
+        await db.commit()
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM lead_notes WHERE id=?", (note_id,)) as cur:
+            return dict(await cur.fetchone())
+
+
+async def list_lead_notes(lead_id: str, org_id: str) -> list[dict]:
+    """Return all notes for a lead, newest first."""
+    async with aiosqlite.connect(LEADS_DB) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM lead_notes WHERE lead_id=? AND org_id=? ORDER BY created_at DESC",
+            (lead_id, org_id),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def delete_lead_note(note_id: str, org_id: str) -> bool:
+    """Delete a note by id (org-scoped for safety)."""
+    async with aiosqlite.connect(LEADS_DB) as db:
+        async with db.execute(
+            "DELETE FROM lead_notes WHERE id=? AND org_id=?", (note_id, org_id)
+        ) as cur:
+            deleted = cur.rowcount > 0
+        await db.commit()
+    return deleted
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LLM caller helper
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -674,11 +1010,18 @@ async def _call_llm(
     # Groq base URL must include /openai prefix: https://api.groq.com/openai
     g_key = groq_api_key or _groq_key()
     if g_key:
-        try:
-            groq_model = model_override or _groq_model()
-            return await _post("https://api.groq.com/openai", g_key, groq_model)
-        except Exception as e:
-            logger.warning("[LLM] Groq failed: %s", e)
+        groq_model = model_override or _groq_model()
+        for attempt in range(3):
+            try:
+                return await _post("https://api.groq.com/openai", g_key, groq_model)
+            except Exception as e:
+                if "429" in str(e) and attempt < 2:
+                    wait = 5 * (attempt + 1)  # 5s, 10s
+                    logger.warning("[LLM] Groq 429 — retrying in %ds (attempt %d/3)", wait, attempt + 1)
+                    await asyncio.sleep(wait)
+                else:
+                    logger.warning("[LLM] Groq failed: %s", e)
+                    break
 
     return None
 
@@ -2406,23 +2749,469 @@ SCORING GUIDE:
 - tags: 3-6 relevant tags like ["SaaS","VP-Eng","Series-B","Hot","San Francisco"]"""
 
 
+def _render_lio_template(template: str, vars: dict) -> str:
+    """Fill {placeholders} in a LIO user_template; missing keys become empty string."""
+    class _SafeDict(dict):
+        def __missing__(self, key):
+            return ""
+    return template.format_map(_SafeDict(vars))
+
+
+def _parse_list_from_llm(raw: str) -> list:
+    """Extract first JSON array from LLM response."""
+    try:
+        m = re.search(r"\[.*\]", raw, re.DOTALL)
+        if m:
+            result = json.loads(m.group())
+            if isinstance(result, list):
+                return result
+    except Exception:
+        pass
+    return []
+
+
+async def run_lio_pipeline(
+    profile: dict,
+    contact: dict,
+    org_id: str = "default",
+) -> dict:
+    """
+    Run all 7 LIO stages using the org's configured prompts + workspace context.
+
+    Stages:
+      0 — Company Intelligence
+      1 — Auto Tags
+      2 — Behavioural Signals
+      3 — Buying Signals        (needs 0 + 2)
+      4 — Pitch Intelligence    (needs 0 + 2 + 3 + workspace context)
+      5 — Outreach Generator    (needs 2 + 4 + workspace context)
+      6 — Lead Score            (needs 2 + 3)
+
+    Returns dict with keys:
+      company_intel, tags, behavioural_signals, buying_signals,
+      pitch_intelligence, outreach, lead_score
+    """
+    from enrichment_config_service import get_lio_prompts, get_workspace_context
+
+    prompts = await get_lio_prompts(org_id)
+    ctx     = await get_workspace_context(org_id)
+
+    name    = profile.get("name", "")
+    first, last = _parse_name(name)
+    title   = profile.get("position") or profile.get("headline", "")
+    company = profile.get("current_company_name", "")
+    company_extras = profile.get("_company_extras") or {}
+    industry = company_extras.get("industry", "")
+    city     = profile.get("city", "") or profile.get("location", "")
+    country  = profile.get("country", "")
+    email    = contact.get("email") or ""
+
+    # Compact profile for LLM — strip heavy raw fields to stay within token limits
+    compact = {k: v for k, v in profile.items() if k not in ("_activity_full", "_posts")}
+    raw_json = json.dumps(compact, default=str)[:6000]
+
+    results: dict = {}
+
+    # ── Stage 0: Company Intelligence ─────────────────────────────────────────
+    p = prompts[0]
+    try:
+        user = _render_lio_template(p["user_template"], {"raw_brightdata_json": raw_json})
+        raw  = await _call_llm(
+            [{"role": "system", "content": p["system"]}, {"role": "user", "content": user}],
+            max_tokens=400, temperature=p.get("temperature", 0.2), model_override=p.get("model"),
+        )
+        results["company_intel"] = _parse_json_from_llm(raw) if raw else {}
+    except Exception as e:
+        logger.warning("[LIO:0] company_intel failed: %s", e)
+        results["company_intel"] = {}
+
+    # ── Stage 1: Auto Tags ─────────────────────────────────────────────────────
+    p = prompts[1]
+    try:
+        user = _render_lio_template(p["user_template"], {"raw_brightdata_json": raw_json})
+        raw  = await _call_llm(
+            [{"role": "system", "content": p["system"]}, {"role": "user", "content": user}],
+            max_tokens=200, temperature=p.get("temperature", 0.3), model_override=p.get("model"),
+        )
+        results["tags"] = _parse_list_from_llm(raw) if raw else []
+    except Exception as e:
+        logger.warning("[LIO:1] auto_tags failed: %s", e)
+        results["tags"] = []
+
+    # ── Stage 2: Behavioural Signals ──────────────────────────────────────────
+    p = prompts[2]
+    try:
+        user = _render_lio_template(p["user_template"], {"raw_brightdata_json": raw_json})
+        raw  = await _call_llm(
+            [{"role": "system", "content": p["system"]}, {"role": "user", "content": user}],
+            max_tokens=400, temperature=p.get("temperature", 0.3), model_override=p.get("model"),
+        )
+        results["behavioural_signals"] = _parse_json_from_llm(raw) if raw else {}
+    except Exception as e:
+        logger.warning("[LIO:2] behavioural_signals failed: %s", e)
+        results["behavioural_signals"] = {}
+
+    # ── Stage 3: Buying Signals ────────────────────────────────────────────────
+    p = prompts[3]
+    try:
+        user = _render_lio_template(p["user_template"], {
+            "raw_brightdata_json":  raw_json,
+            "behavioural_signals":  json.dumps(results["behavioural_signals"]),
+            "company_intel":        json.dumps(results["company_intel"]),
+        })
+        raw  = await _call_llm(
+            [{"role": "system", "content": p["system"]}, {"role": "user", "content": user}],
+            max_tokens=300, temperature=p.get("temperature", 0.2), model_override=p.get("model"),
+        )
+        results["buying_signals"] = _parse_json_from_llm(raw) if raw else {}
+    except Exception as e:
+        logger.warning("[LIO:3] buying_signals failed: %s", e)
+        results["buying_signals"] = {}
+
+    # ── Stage 4: Pitch Intelligence ────────────────────────────────────────────
+    p = prompts[4]
+    try:
+        user = _render_lio_template(p["user_template"], {
+            "first_name":          first,
+            "last_name":           last,
+            "inferred_title":      title,
+            "company":             company,
+            "industry":            industry,
+            "behavioural_signals": json.dumps(results["behavioural_signals"]),
+            "buying_signals":      json.dumps(results["buying_signals"]),
+            "company_intel":       json.dumps(results["company_intel"]),
+            "product_name":        ctx.get("product_name", ""),
+            "value_proposition":   ctx.get("value_proposition", ""),
+            "tone":                ctx.get("tone", "professional"),
+            "banned_phrases":      ctx.get("banned_phrases", ""),
+        })
+        raw  = await _call_llm(
+            [{"role": "system", "content": p["system"]}, {"role": "user", "content": user}],
+            max_tokens=500, temperature=p.get("temperature", 0.4), model_override=p.get("model"),
+        )
+        results["pitch_intelligence"] = _parse_json_from_llm(raw) if raw else {}
+    except Exception as e:
+        logger.warning("[LIO:4] pitch_intelligence failed: %s", e)
+        results["pitch_intelligence"] = {}
+
+    # ── Stage 5: Outreach Generator ────────────────────────────────────────────
+    p = prompts[5]
+    try:
+        user = _render_lio_template(p["user_template"], {
+            "first_name":          first,
+            "last_name":           last,
+            "inferred_title":      title,
+            "company":             company,
+            "city":                city,
+            "country":             country,
+            "pitch_intelligence":  json.dumps(results["pitch_intelligence"]),
+            "behavioural_signals": json.dumps(results["behavioural_signals"]),
+            "product_name":        ctx.get("product_name", ""),
+            "tone":                ctx.get("tone", "professional"),
+            "cta_style":           ctx.get("cta_style", "question"),
+            "banned_phrases":      ctx.get("banned_phrases", ""),
+            "case_study":          ctx.get("case_study", ""),
+        })
+        raw  = await _call_llm(
+            [{"role": "system", "content": p["system"]}, {"role": "user", "content": user}],
+            max_tokens=600, temperature=p.get("temperature", 0.7), model_override=p.get("model"),
+        )
+        results["outreach"] = _parse_json_from_llm(raw) if raw else {}
+    except Exception as e:
+        logger.warning("[LIO:5] outreach failed: %s", e)
+        results["outreach"] = {}
+
+    # ── Stage 6: Lead Score ────────────────────────────────────────────────────
+    p = prompts[6]
+    try:
+        buying = results.get("buying_signals", {})
+        warm_count = len(profile.get("_activity_full") or [])
+        user = _render_lio_template(p["user_template"], {
+            "first_name":          first,
+            "last_name":           last,
+            "inferred_title":      title,
+            "company":             company,
+            "industry":            industry,
+            "icp_fit_score":       0,
+            "intent_level":        buying.get("intent_level", "medium"),
+            "timing_score":        buying.get("timing_score", 0),
+            "warm_signal_count":   warm_count,
+            "email_status":        "found" if email else "not_found",
+            "company_stage":       results["company_intel"].get("company_stage", ""),
+            "behavioural_signals": json.dumps(results["behavioural_signals"]),
+            "buying_signals":      json.dumps(buying),
+        })
+        raw  = await _call_llm(
+            [{"role": "system", "content": p["system"]}, {"role": "user", "content": user}],
+            max_tokens=300, temperature=p.get("temperature", 0.2), model_override=p.get("model"),
+        )
+        results["lead_score"] = _parse_json_from_llm(raw) if raw else {}
+    except Exception as e:
+        logger.warning("[LIO:6] lead_score failed: %s", e)
+        results["lead_score"] = {}
+
+    logger.info(
+        "[LIO Pipeline] org=%s  company_intel=%s  tags=%d  behavioural=%s  "
+        "buying=%s  pitch=%s  outreach=%s  score=%s",
+        org_id,
+        bool(results["company_intel"]), len(results["tags"]),
+        bool(results["behavioural_signals"]), bool(results["buying_signals"]),
+        bool(results["pitch_intelligence"]), bool(results["outreach"]),
+        bool(results["lead_score"]),
+    )
+    return results
+
+
+async def generate_outreach_with_lio(lead: dict, org_id: str = "default") -> dict:
+    """
+    Generate outreach for a lead using LIO Stage 5 (Outreach Generator) system + user prompt
+    from the org's LIO config.  Uses profile data already stored on the lead row.
+
+    Returns:
+        {
+          "cold_email":    {"subject": ..., "body": ...},
+          "linkedin_note": ...,
+          "linkedin_follow_up": ...,
+        }
+    """
+    from enrichment_config_service import get_lio_prompts, get_workspace_context
+
+    prompts = await get_lio_prompts(org_id)
+    ctx     = await get_workspace_context(org_id)
+    p5      = prompts[5]   # Stage 5 — Outreach Generator
+
+    # ── Build vars from stored lead fields ────────────────────────────────────
+    name = lead.get("name") or ""
+    first, last = _parse_name(name)
+    title   = lead.get("title")   or ""
+    company = lead.get("company") or ""
+    city    = lead.get("city")    or ""
+    country = lead.get("country") or ""
+
+    # ── Pull enrichment fields from top-level lead columns (primary) and full_data (fallback) ──
+    full = {}
+    try:
+        raw_fd = lead.get("full_data")
+        full = json.loads(raw_fd) if isinstance(raw_fd, str) else (raw_fd or {})
+    except Exception:
+        pass
+
+    def _try_json(val):
+        if not val:
+            return {}
+        if isinstance(val, dict):
+            return val
+        try:
+            return json.loads(val)
+        except Exception:
+            return {}
+
+    # pitch_intelligence is a top-level DB column (JSON string) — preferred over full_data
+    pitch_intel = (
+        _try_json(lead.get("pitch_intelligence")) or
+        full.get("lead_scoring", {}).get("pitch_intelligence") or
+        full.get("pitch_intelligence") or
+        {}
+    )
+
+    # behavioural_signals is a top-level DB column (JSON string)
+    behavioural_sigs = (
+        _try_json(lead.get("behavioural_signals")) or
+        full.get("behavioural_signals") or
+        {}
+    )
+
+    # activity_feed — top 5 posts for personalization context
+    activity_feed_raw = lead.get("activity_feed") or full.get("activity_feed") or []
+    if isinstance(activity_feed_raw, str):
+        try:
+            activity_feed_raw = json.loads(activity_feed_raw)
+        except Exception:
+            activity_feed_raw = []
+    recent_posts = [
+        a.get("title", "")[:200]
+        for a in (activity_feed_raw[:5] if isinstance(activity_feed_raw, list) else [])
+        if a.get("title")
+    ]
+
+    # about / bio
+    about = lead.get("about") or full.get("person_profile", {}).get("about") or ""
+
+    vars_map = {
+        "first_name":          first,
+        "last_name":           last,
+        "inferred_title":      title,
+        "company":             company,
+        "city":                city,
+        "country":             country,
+        "about":               about[:300] if about else "",
+        "recent_posts":        json.dumps(recent_posts),
+        "pitch_intelligence":  json.dumps(pitch_intel),
+        "behavioural_signals": json.dumps(behavioural_sigs),
+        "product_name":        ctx.get("product_name", ""),
+        "tone":                ctx.get("tone", "professional"),
+        "cta_style":           ctx.get("cta_style", "question"),
+        "banned_phrases":      ctx.get("banned_phrases", ""),
+        "case_study":          ctx.get("case_study", ""),
+    }
+
+    user_prompt = _render_lio_template(p5["user_template"], vars_map)
+
+    logger.info(
+        "[LIO Outreach] Running Stage 5 for lead=%s org=%s name=%r company=%r",
+        lead.get("id"), org_id, name, company,
+    )
+
+    raw = await _call_llm(
+        [
+            {"role": "system", "content": p5["system"]},
+            {"role": "user",   "content": user_prompt},
+        ],
+        max_tokens=2000,
+        temperature=p5.get("temperature", 0.7),
+        model_override=p5.get("model"),
+    )
+
+    if not raw:
+        raise RuntimeError(
+            "LLM unavailable — outreach could not be generated. "
+            "Check that GROQ_API_KEY or WB_LLM_HOST is configured."
+        )
+
+    result = _parse_json_from_llm(raw)
+    if not result:
+        raise RuntimeError(f"LLM returned unparseable response: {raw[:200]}")
+
+    cold_email_block = result.get("cold_email", {}) or {}
+    follow_up_block  = result.get("follow_up",  {}) or {}
+
+    logger.info(
+        "[LIO Outreach] Generated for lead=%s — subject=%r note_len=%d",
+        lead.get("id"),
+        cold_email_block.get("subject", ""),
+        len(result.get("linkedin_note", "") or ""),
+    )
+
+    full_email = cold_email_block.get("full_email") or ""
+    body       = cold_email_block.get("body")       or full_email  # body → full_email fallback
+
+    return {
+        "cold_email": {
+            "subject":    cold_email_block.get("subject")  or "",
+            "greeting":   cold_email_block.get("greeting") or "",
+            "opening":    cold_email_block.get("opening")  or "",
+            "body":       body,
+            "cta":        cold_email_block.get("cta")      or "",
+            "sign_off":   cold_email_block.get("sign_off") or "",
+            "full_email": full_email or body,   # full_email → body fallback
+        },
+        "linkedin_note": result.get("linkedin_note") or "",
+        "follow_up": {
+            "day3": follow_up_block.get("day3") or "",
+            "day7": follow_up_block.get("day7") or "",
+        },
+    }
+
+
+def _merge_lio_into_enrichment(enrichment: dict, lio: dict) -> dict:
+    """
+    Overlay LIO pipeline outputs onto the base enrichment dict.
+    LIO results take priority for: outreach, scoring, tags, signals, pitch intel.
+    """
+    # ── Outreach (Stage 5) ─────────────────────────────────────────────────────
+    lio_out = lio.get("outreach", {})
+    lio_email = lio_out.get("email", {})
+    lio_linkedin = lio_out.get("linkedin", {})
+    if lio_email or lio_linkedin:
+        outreach = enrichment.setdefault("outreach", {})
+        if lio_email.get("subject"):
+            outreach["email_subject"] = lio_email["subject"]
+        if lio_email.get("body"):
+            outreach["cold_email"] = lio_email["body"]
+        if lio_linkedin.get("connection_note"):
+            outreach["linkedin_note"] = lio_linkedin["connection_note"]
+        if lio_linkedin.get("follow_up"):
+            outreach["linkedin_follow_up"] = lio_linkedin["follow_up"]
+
+    # ── Lead Score (Stage 6) ───────────────────────────────────────────────────
+    lio_score = lio.get("lead_score", {})
+    if lio_score:
+        scoring = enrichment.setdefault("lead_scoring", {})
+        if lio_score.get("lead_score") is not None:
+            scoring["total_score"] = lio_score["lead_score"]
+        if lio_score.get("priority"):
+            scoring["icp_match_tier"] = lio_score["priority"]
+        if lio_score.get("reason"):
+            scoring["score_explanation"] = lio_score["reason"]
+        if lio_score.get("next_best_action"):
+            scoring["next_best_action"] = lio_score["next_best_action"]
+
+    # ── Pitch Intelligence (Stage 4) ──────────────────────────────────────────
+    if lio.get("pitch_intelligence"):
+        enrichment.setdefault("lead_scoring", {})["pitch_intelligence"] = lio["pitch_intelligence"]
+
+    # ── Tags (Stage 1) ─────────────────────────────────────────────────────────
+    if lio.get("tags"):
+        enrichment.setdefault("crm", {})["tags"] = lio["tags"]
+
+    # ── Behavioural Signals (Stage 2) ──────────────────────────────────────────
+    if lio.get("behavioural_signals"):
+        enrichment["behavioural_signals"] = lio["behavioural_signals"]
+
+    # ── Buying Signals → Intent Signals (Stage 3) ──────────────────────────────
+    buying = lio.get("buying_signals", {})
+    if buying:
+        intent = enrichment.setdefault("intent_signals", {})
+        intent["intent_level"]       = buying.get("intent_level")
+        intent["trigger_events"]     = buying.get("trigger_events", [])
+        intent["timing_score"]       = buying.get("timing_score")
+        intent["recommended_action"] = buying.get("recommended_action")
+
+    # ── Company Intel (Stage 0) ────────────────────────────────────────────────
+    if lio.get("company_intel"):
+        enrichment["company_intelligence"] = lio["company_intel"]
+
+    return enrichment
+
+
 async def build_comprehensive_enrichment(
     linkedin_url: str,
     profile: dict,
     contact: dict,
     website_intel: dict = None,
+    org_id: str = "default",
 ) -> dict:
     """
     Main LLM call to produce the full 8-stage enrichment JSON.
+    System prompt and model are read from the org's LIO config (workspace_configs).
     Falls back to a rule-based assembly if LLM is unavailable.
     """
-    now = datetime.now(timezone.utc).isoformat()
+    from enrichment_config_service import get_workspace_config
+
+    now    = datetime.now(timezone.utc).isoformat()
     prompt = _build_comprehensive_prompt(linkedin_url, profile, contact, now, website_intel=website_intel)
 
+    # Read system prompt + model from LIO config; fall back to hardcoded defaults
+    _DEFAULT_SYSTEM = "Expert B2B lead intelligence analyst. Return ONLY valid JSON."
+    try:
+        cfg = await get_workspace_config(org_id)
+        system_prompt = cfg.get("lio_system_prompt", "").strip() or _DEFAULT_SYSTEM
+        model_override = cfg.get("lio_model", "").strip() or None
+    except Exception:
+        system_prompt  = _DEFAULT_SYSTEM
+        model_override = None
+
+    logger.debug(
+        "[Enrichment] org=%s  system_prompt_source=%s  model=%s",
+        org_id,
+        "config" if system_prompt != _DEFAULT_SYSTEM else "default",
+        model_override or "default",
+    )
+
     raw = await _call_llm([
-        {"role": "system", "content": "Expert B2B lead intelligence analyst. Return ONLY valid JSON."},
-        {"role": "user", "content": prompt},
-    ], max_tokens=2200, temperature=0.25)
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": prompt},
+    ], max_tokens=2200, temperature=0.25, model_override=model_override)
 
     if raw:
         data = _parse_json_from_llm(raw)
@@ -2430,8 +3219,7 @@ async def build_comprehensive_enrichment(
             logger.info("[Enrichment] LLM produced comprehensive 8-stage report")
             return data
 
-    # Rule-based fallback if LLM unavailable
-    logger.warning("[Enrichment] LLM unavailable — using rule-based fallback")
+    logger.warning("[Enrichment] LLM unavailable or unusable — using rule-based fallback")
     return _rule_based_enrichment(linkedin_url, profile, contact, now, website_intel=website_intel)
 
 
@@ -2602,24 +3390,39 @@ def _rule_based_enrichment(
     else:
         outreach_angle = "Role & company alignment"
 
+    # Rule-based fallback subject: 10-20 words, specific to role + company
+    _subj_role = title[:40] if title else f"{dept.split('/')[0].strip()} leader"
+    cold_email_subject = f"Quick idea for how {company} could save 10+ hours a week on prospecting"
+
+    _body_product_line = (
+        f"Worksbuddy helps {category} teams {vp[:100].lower().rstrip('.')} — cutting manual prospecting time by over 10 hours per week."
+        if vp else
+        f"Worksbuddy helps {dept.split('/')[0].strip()} teams automate lead research, score prospects, and launch personalised outreach — all from a single platform, saving over 10 hours per week."
+    )
+    _body_pain = (
+        f"We've seen that {dept.split('/')[0].strip()} teams at companies like {company} often spend too much time on manual data work that could be automated."
+    )
+    _body_proof = (
+        f"One of our customers — a team similar in size to yours — reduced their prospecting cycle by 40% within the first month of using Worksbuddy."
+    )
+    _body_relevance = (
+        f"Given your role as {_subj_role} at {company}, I thought this might be directly relevant to what you're working on right now."
+    )
+
     cold_email = (
         f"Hi {fn},\n\n"
-        f"Came across your profile — your work as {title} at {company} stood out.\n\n"
+        f"Came across your profile and your work as {title} at {company} immediately caught my attention.\n\n"
+        f"{_body_pain} {_body_product_line} "
+        f"{_body_proof} {_body_relevance}\n\n"
+        f"Would you be open to a quick 15-minute call this week to see if it could work for your team?\n\n"
+        f"Best,\nWorksbuddy Team"
     )
-    if vp:
-        cold_email += (
-            f"Worksbuddy helps {category} teams {vp[:80].lower().rstrip('.')} — "
-            f"saving 10+ hours/week on manual prospecting.\n\n"
-        )
-    else:
-        cold_email += (
-            f"Worksbuddy helps {dept.split('/')[0].strip()} teams automate lead research, "
-            f"score prospects, and launch personalized outreach — all from one place. "
-            f"Teams save 10+ hours/week on manual prospecting.\n\n"
-        )
-    cold_email += f"Worth a 10-minute look?\n\n— Worksbuddy Team"
 
-    linkedin_note = f"Hi {fn} — saw your work at {company} and think Worksbuddy could be a fit for your team. Worth connecting?"[:300]
+    linkedin_note = (
+        f"Hi {fn} — I noticed your work at {company} and thought Worksbuddy might be relevant to your team. "
+        f"We help {dept.split('/')[0].strip()} teams cut manual prospecting time significantly. "
+        f"Would love to connect — are you currently exploring ways to scale outreach?"
+    )[:300]
 
     # Build career history from experience
     career_history = []
@@ -2741,7 +3544,7 @@ def _rule_based_enrichment(
         },
         # ── Stage 8: Outreach ──────────────────────────────────────────────
         "outreach": {
-            "email_subject": f"Quick question, {fn}",
+            "email_subject": cold_email_subject,
             "cold_email": cold_email,
             "linkedin_note": linkedin_note,
             "best_channel": "Email" if email else "LinkedIn",
@@ -3280,6 +4083,16 @@ async def enrich_single(
         logger.info("[Enrich] Company URL detected — routing to company pipeline: %s", url)
         return await enrich_company_url(url, job_id=job_id, org_id=org_id)
 
+    # ── Cache check: return existing enrichment if already in DB ─────────────
+    cached = await get_lead(lead_id)
+    if cached and cached.get("status") == "enriched":
+        logger.info("[Enrich] Cache HIT for %s (lead_id=%s) — skipping Bright Data", url, lead_id)
+        cached["_cache_hit"] = True
+        cached["linkedin_enrich"] = _format_linkedin_enrich(cached)
+        return cached
+
+    logger.info("[Enrich] Cache MISS for %s — fetching from Bright Data", url)
+
     # ── Tool availability (from enrichment config) ────────────────────────────
     _tools = tools or {}
     _brightdata_ok = _tools.get("brightdata", True)
@@ -3411,9 +4224,9 @@ async def enrich_single(
             "note": f"pages={len(website_intel.get('pages_scraped', []))}, category={website_intel.get('product_category', '?')}",
         })
 
-    # Step 7: Comprehensive LLM enrichment → 8-stage JSON
+    # Step 7: Comprehensive LLM enrichment → 8-stage JSON + LIO pipeline
     logger.info("[Stage 7] Scoring — LLM enrichment starting")
-    enrichment = await build_comprehensive_enrichment(url, profile, contact, website_intel=website_intel)
+    enrichment = await build_comprehensive_enrichment(url, profile, contact, website_intel=website_intel, org_id=org_id)
 
     logger.info("[Stage 8] Outreach — generating personalized sequence")
 
@@ -3733,6 +4546,10 @@ async def enrich_single(
         lead["product_category"] or "?",
     )
 
+    # Embed structured LinkedIn Enrich view for immediate use by caller / LIO
+    lead["_cache_hit"] = False
+    lead["linkedin_enrich"] = _format_linkedin_enrich(lead)
+
     # Forward to LIO — fire-and-forget, does not block return
     asyncio.create_task(send_to_lio(lead, sso_id=sso_id))
 
@@ -3910,7 +4727,7 @@ async def enrich_single_stream(
                 "fields_found": website_intel.get("pages_scraped", []),
                 "note": f"pages={len(website_intel.get('pages_scraped', []))}, category={website_intel.get('product_category', '?')}",
             })
-        enrichment = await build_comprehensive_enrichment(url, profile, contact, website_intel=website_intel)
+        enrichment = await build_comprehensive_enrichment(url, profile, contact, website_intel=website_intel, org_id=org_id)
         scoring = enrichment.get("lead_scoring", enrichment.get("scoring", {}))
         total = scoring.get("overall_score", 0)
         tier_raw = scoring.get("icp_match_tier") or scoring.get("score_tier", "")
@@ -4174,8 +4991,8 @@ async def enrich_bulk(
         if r:
             try:
                 import queue_manager
-                # Compute adaptive chunk size and pre-split so sub-jobs align with queue tasks
-                chunk_size = await queue_manager.compute_chunk_size(r)
+                # Fixed chunk size of 5 — each chunk = 5 URLs regardless of total count
+                chunk_size = 5
                 url_chunks = [urls[i: i + chunk_size] for i in range(0, len(urls), chunk_size)]
                 sub_job_ids = [str(uuid.uuid4()) for _ in url_chunks]
                 for idx, (sjid, chunk) in enumerate(zip(sub_job_ids, url_chunks)):
@@ -4200,8 +5017,8 @@ async def enrich_bulk(
                 logger.warning("[BulkEnrich] Queue push failed (%s) — falling back to in-process", e)
 
         # Fallback: in-process sequential task (Redis unavailable)
-        # Compute chunks: chunk_size = max(5, total // 4)  → 100→4×25, 10→2×5
-        chunk_size = max(5, len(urls) // 4) if len(urls) >= 4 else len(urls) or 1
+        # Fixed chunk size of 5
+        chunk_size = 5
         url_chunks = [urls[i: i + chunk_size] for i in range(0, len(urls), chunk_size)]
         sub_job_ids = [str(uuid.uuid4()) for _ in url_chunks]
         for idx, (sjid, chunk) in enumerate(zip(sub_job_ids, url_chunks)):
@@ -4276,7 +5093,7 @@ async def _process_sequential_batch(
 
 # Keep old name as alias for webhook-delivered batch processing
 async def _process_fallback_batch(job_id: str, urls: list[str]) -> None:
-    chunk_size = max(5, len(urls) // 4) if len(urls) >= 4 else len(urls) or 1
+    chunk_size = 5
     url_chunks = [urls[i: i + chunk_size] for i in range(0, len(urls), chunk_size)]
     sub_job_ids = [str(uuid.uuid4()) for _ in url_chunks]
     for idx, (sjid, chunk) in enumerate(zip(sub_job_ids, url_chunks)):
@@ -4317,7 +5134,7 @@ async def process_webhook_profiles(profiles: list[dict], job_id: Optional[str] =
                     "note": f"pages={len(website_intel.get('pages_scraped', []))}, category={website_intel.get('product_category', '?')}",
                 })
 
-            enrichment = await build_comprehensive_enrichment(url, profile, contact, website_intel=website_intel)
+            enrichment = await build_comprehensive_enrichment(url, profile, contact, website_intel=website_intel, org_id=org_id)
 
             scoring = enrichment.get("lead_scoring", enrichment.get("scoring", {}))
             tier_raw = scoring.get("icp_match_tier") or scoring.get("score_tier", "")
@@ -4492,31 +5309,92 @@ async def regenerate_outreach_for_lead(lead_id: str) -> Optional[dict]:
     lead = await get_lead(lead_id)
     if not lead:
         return None
-    profile = json.loads(lead.get("raw_profile") or "{}")
-    contact = {
-        "email": lead.get("work_email"), "phone": lead.get("direct_phone"),
-        "source": lead.get("email_source"), "confidence": lead.get("email_confidence"),
-    }
-    # Re-load website intel from stored JSON
-    website_intel_raw = lead.get("website_intelligence")
-    website_intel = json.loads(website_intel_raw) if website_intel_raw else None
 
-    enrichment = await build_comprehensive_enrichment(
-        lead["linkedin_url"], profile, contact, website_intel=website_intel
-    )
-    outreach = enrichment.get("outreach", {})
+    org_id = lead.get("organization_id") or "default"
+
+    # Use LIO Stage 5 system + user prompt — fast, targeted, config-driven
+    # Let RuntimeError propagate so the route can return a proper error response
+    generated = await generate_outreach_with_lio(lead, org_id=org_id)
+
+    email_subject = generated["cold_email"]["subject"]
+    cold_email    = generated["cold_email"]["full_email"] or generated["cold_email"]["body"]
+    linkedin_note = generated["linkedin_note"]
+
     async with aiosqlite.connect(LEADS_DB) as db:
-        await db.execute("""UPDATE enriched_leads SET
-            email_subject=?, cold_email=?, linkedin_note=?,
-            best_channel=?, best_send_time=?, outreach_angle=?,
-            sequence_type=?, outreach_sequence=?, email_status=?,
-            full_data=?
-            WHERE id=?""",
-            (outreach.get("email_subject"), outreach.get("cold_email"),
-             outreach.get("linkedin_note"), outreach.get("best_channel"),
-             outreach.get("best_send_time"), outreach.get("outreach_angle"),
-             outreach.get("sequence_type"), _safe_json(outreach.get("sequence")),
-             outreach.get("email_status"), json.dumps(enrichment), lead_id),
+        await db.execute(
+            """UPDATE enriched_leads SET
+               email_subject=?, cold_email=?, linkedin_note=?
+               WHERE id=?""",
+            (email_subject, cold_email, linkedin_note, lead_id),
         )
         await db.commit()
+    return await get_lead(lead_id)
+
+
+async def regenerate_company_for_lead(lead_id: str) -> Optional[dict]:
+    """
+    Re-run AI analysis (culture_signals, account_pitch, company_tags) for the company
+    associated with this lead. Updates both company_enrichments and enriched_leads tables.
+    """
+    lead = await get_lead(lead_id)
+    if not lead:
+        return None
+
+    import company_service as cs
+    from enrichment_config_service import get_workspace_config
+
+    company_linkedin = lead.get("company_linkedin") or ""
+    org_id = lead.get("organization_id") or "default"
+
+    # Get current company record
+    company_record = None
+    if company_linkedin:
+        company_record = await cs._get_company(company_linkedin, org_id)
+
+    if not company_record:
+        # Build a minimal record from lead fields so AI analysis can still run
+        company_record = {
+            "name":           lead.get("company") or "",
+            "industry":       lead.get("industry") or "",
+            "employee_count": lead.get("employee_count") or 0,
+            "funding_stage":  lead.get("funding_stage") or "",
+            "website":        lead.get("company_website") or "",
+            "wappalyzer_tech": lead.get("wappalyzer_tech") or "[]",
+            "linkedin_posts": lead.get("linkedin_posts") or "[]",
+            "news_mentions":  lead.get("news_mentions") or "[]",
+            "crunchbase_data": lead.get("crunchbase_data") or "{}",
+        }
+
+    ws_config = {}
+    try:
+        ws_config = await get_workspace_config(org_id)
+    except Exception:
+        pass
+
+    # Run AI analysis
+    ai = await cs.run_company_ai_analysis(company_record, ws_config)
+
+    tags_json   = json.dumps(ai.get("company_tags") or [])
+    culture_json = json.dumps(ai.get("culture_signals") or {})
+    pitch_json   = json.dumps(ai.get("account_pitch") or {})
+
+    # Update company record in company_enrichments table (if it exists)
+    if company_linkedin and company_record.get("id"):
+        await cs._upsert_company({
+            **company_record,
+            "company_tags":    tags_json,
+            "culture_signals": culture_json,
+            "account_pitch":   pitch_json,
+        })
+
+    # Update lead row
+    async with aiosqlite.connect(LEADS_DB) as db:
+        await db.execute(
+            """UPDATE enriched_leads SET
+               company_tags=?, culture_signals=?, account_pitch=?
+               WHERE id=?""",
+            (tags_json, culture_json, pitch_json, lead_id),
+        )
+        await db.commit()
+
     return await get_lead(lead_id)

@@ -421,7 +421,7 @@ _STRICT = (
 )
 
 # Bump this string whenever DEFAULT_LIO_PROMPTS change — forces DB reset on next load
-_PROMPT_VERSION = "v3"
+_PROMPT_VERSION = "v5"
 
 DEFAULT_LIO_PROMPTS: List[dict] = [
     # ── Stage 0 ───────────────────────────────────────────────────────────────
@@ -577,17 +577,45 @@ DEFAULT_LIO_PROMPTS: List[dict] = [
         "model": "llama-3.3-70b-versatile",
         "temperature": 0.7,
         "system": (
-            "You are a top-performing B2B SDR. Write concise, high-conversion outreach.\n\n"
-            f"{_STRICT}\n"
-            "- Email body: max 120 words.\n"
-            "- LinkedIn connection_note: max 40 words. follow_up: max 40 words.\n"
-            "- NEVER start with 'I noticed', 'I came across', 'Hope you're doing well'.\n"
-            "- Start with the personalization_hook from pitch intelligence.\n"
-            "- No banned phrases."
+            "You are a world-class B2B SDR. Write hyper-personalised cold outreach from LinkedIn profile data.\n\n"
+            "STRICT OUTPUT RULES:\n"
+            "- Return ONLY a valid JSON object. No markdown, no explanation, no extra keys.\n"
+            "- Every key listed below is MANDATORY. Never omit a key. Never return an empty string for any field.\n"
+            "- Use null only if a field is truly impossible to fill.\n\n"
+            "FIELD REQUIREMENTS (enforce strictly):\n"
+            "- subject: MUST be 10 to 20 words. Count the words. If under 10 words, expand it. No questions. No ALL CAPS. Intriguing, specific, honest.\n"
+            "- greeting: Always 'Hi [FirstName],' — first name only, followed by a comma.\n"
+            "- opening: Exactly 1 sentence. Reference a SPECIFIC post, achievement, or topic from their profile. Never start with 'I noticed', 'I came across', 'Hope you', 'I saw'.\n"
+            "- body: MINIMUM 6 sentences, MAXIMUM 10 sentences. Structure: (1-2) pain you spotted from their profile → (3-4) how your product solves it specifically → (5) one concrete proof point, stat, or customer result → (6) why it's relevant to them right now.\n"
+            "- cta: 1 sentence. Suggest a specific 15-min call or ask a pointed question. Never say 'let me know if interested' or 'feel free to reach out'.\n"
+            "- sign_off: Always exactly 'Best,\\n[Your Name]'.\n"
+            "- full_email: The complete ready-to-send email. Assemble as: greeting + two newlines + opening + two newlines + body + two newlines + cta + two newlines + sign_off. Must be at least 150 words.\n"
+            "- linkedin_note: Max 100 words. Reference a specific post or topic. End with a question. Zero sales pitch.\n"
+            "- follow_up.day3: 1 to 2 sentences. Friendly bump. Add one new angle not mentioned in the email.\n"
+            "- follow_up.day7: 1 sentence. Final bump. Include a relevant insight or question.\n\n"
+            "REQUIRED JSON SCHEMA:\n"
+            '{{\n'
+            '  "linkedin_note": "...",\n'
+            '  "cold_email": {{\n'
+            '    "subject": "10 to 20 words — specific, intriguing, no questions",\n'
+            '    "greeting": "Hi [FirstName],",\n'
+            '    "opening": "1 sentence — specific reference, no cliché opener",\n'
+            '    "body": "minimum 6 sentences — pain → solution → proof → relevance",\n'
+            '    "cta": "1 sentence — specific ask or question",\n'
+            '    "sign_off": "Best,\\n[Your Name]",\n'
+            '    "full_email": "complete assembled email — minimum 150 words"\n'
+            '  }},\n'
+            '  "follow_up": {{\n'
+            '    "day3": "1-2 sentences — friendly bump with new angle",\n'
+            '    "day7": "1 sentence — final bump with insight"\n'
+            '  }}\n'
+            '}}'
         ),
         "user_template": (
             "Prospect: {first_name} {last_name}, {inferred_title} at {company}\n"
             "Location: {city}, {country}\n\n"
+            "Bio / About: {about}\n\n"
+            "Recent LinkedIn posts (use these for specific personalisation):\n{recent_posts}\n\n"
             "Pitch intelligence:\n{pitch_intelligence}\n\n"
             "Behavioural signals:\n{behavioural_signals}\n\n"
             "Our product: {product_name}\n"
@@ -595,17 +623,7 @@ DEFAULT_LIO_PROMPTS: List[dict] = [
             "CTA style: {cta_style}\n"
             "Banned phrases: {banned_phrases}\n"
             "Case study: {case_study}\n\n"
-            "Return ONLY this exact JSON:\n"
-            '{{\n'
-            '  "email": {{\n'
-            '    "subject": "max 6 words, no clickbait",\n'
-            '    "body": "max 120 words"\n'
-            '  }},\n'
-            '  "linkedin": {{\n'
-            '    "connection_note": "max 40 words",\n'
-            '    "follow_up": "max 40 words — use after they connect"\n'
-            '  }}\n'
-            '}}'
+            "Return ONLY the required JSON object as defined in the system prompt."
         ),
     },
     # ── Stage 6 ───────────────────────────────────────────────────────────────
