@@ -18,7 +18,7 @@ export REDIS_URL="${REDIS_URL:-redis://redis:6379}"
 exec gunicorn main:app \
     --worker-class uvicorn.workers.UvicornWorker \
     --workers 2 \
-    --bind 0.0.0.0:8020 \
+    --bind 0.0.0.0:${PORT:-8020} \
     --timeout 120 \
     --keep-alive 5 \
     --access-logfile - \

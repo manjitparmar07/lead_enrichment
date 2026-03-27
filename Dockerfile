@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 # ── Stage 1: Builder ─────────────────────────────────────────────────────────
 FROM python:3.11-slim AS builder
 
@@ -9,7 +11,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip \
+
+# BuildKit cache mount — unchanged packages are never re-downloaded between builds
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir --prefix=/install -r requirements.txt \
     && pip install --no-cache-dir --prefix=/install gunicorn==21.2.0
 
@@ -21,10 +26,8 @@ WORKDIR /app
 
 # System deps: Tesseract OCR + Playwright/Chromium runtime libs
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Tesseract OCR
     tesseract-ocr \
     tesseract-ocr-eng \
-    # Playwright Chromium deps
     libnss3 \
     libnspr4 \
     libatk1.0-0 \
@@ -45,7 +48,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2 \
     libasound2 \
     libatspi2.0-0 \
-    # Health check
     curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -62,21 +64,16 @@ RUN useradd -m -u 1000 appuser
 # Copy application source
 COPY . .
 
-# Persist SQLite DB and config files via this directory
-RUN mkdir -p configs && chown -R appuser:appuser /app
+# Seed configs so entrypoint can cp -n (no-overwrite) into the volume mount
+RUN mkdir -p configs && cp -r /app/configs /app/configs_seed
+
+RUN chown -R appuser:appuser /app
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 USER appuser
 
-EXPOSE 8020
+EXPOSE ${PORT:-8020}
 
-# Production: 2 uvicorn workers behind gunicorn
-# Adjust --workers based on available CPUs: (2 * CPU) + 1 is a common formula
-CMD ["gunicorn", "main:app", \
-     "--worker-class", "uvicorn.workers.UvicornWorker", \
-     "--workers", "2", \
-     "--bind", "0.0.0.0:8020", \
-     "--timeout", "120", \
-     "--keep-alive", "5", \
-     "--access-logfile", "-", \
-     "--error-logfile", "-", \
-     "--log-level", "info"]
+ENTRYPOINT ["/entrypoint.sh"]
