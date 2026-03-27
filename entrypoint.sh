@@ -8,6 +8,12 @@ if [ -d /app/configs_seed ] && [ "$(ls -A /app/configs_seed 2>/dev/null)" ]; the
     cp -rn /app/configs_seed/. /app/configs/
 fi
 
+# ── Ensure system_keys.json exists (gitignored, so not baked into image) ─────
+[ -f /app/configs/system_keys.json ] || echo '{}' > /app/configs/system_keys.json
+
+# ── Redis URL default — use docker-compose service name if not overridden ─────
+export REDIS_URL="${REDIS_URL:-redis://redis:6379}"
+
 # ── Start gunicorn ────────────────────────────────────────────────────────────
 exec gunicorn main:app \
     --worker-class uvicorn.workers.UvicornWorker \
