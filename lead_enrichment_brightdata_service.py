@@ -664,7 +664,10 @@ def _format_linkedin_enrich(lead: dict) -> dict:
             "linkedin_posts": full.get("linkedin_posts", []),
         },
 
-        "tags": _parse_json_safe(lead.get("auto_tags"), []),
+        "tags": (
+            _parse_json_safe(lead.get("auto_tags"), []) or
+            _parse_json_safe(lead.get("tags"), [])
+        ),
     }
 
 
@@ -1162,12 +1165,56 @@ def _normalize_bd_profile(raw: dict) -> dict:
                 normalized_certs.append({"name": cert.strip(), "issuer": "", "date": "", "credential_url": "", "credential_id": ""})
         p["certifications"] = [c for c in normalized_certs if c["name"]]
 
-    # ── Skills: may come as list or comma string ──────────────────────────────
+    # ── Skills: normalize + infer when BD doesn't return them ────────────────
     skills = p.get("skills")
+
+    # BD sometimes returns list of dicts: [{"name": "Python"}] — flatten to strings
+    if skills and isinstance(skills, list):
+        flat = []
+        for s in skills:
+            if isinstance(s, dict):
+                flat.append(s.get("name") or s.get("skill") or s.get("title") or "")
+            elif isinstance(s, str):
+                flat.append(s)
+        skills = [s.strip() for s in flat if s.strip()]
+        p["skills"] = skills
+
+    # Try comma-string fallbacks
     if not skills:
         skills_str = p.get("skills_label") or p.get("top_skills") or ""
         if skills_str and isinstance(skills_str, str):
-            p["skills"] = [s.strip() for s in skills_str.split(",") if s.strip()]
+            skills = [s.strip() for s in skills_str.split(",") if s.strip()]
+            p["skills"] = skills
+
+    # Infer from certifications when still empty
+    if not skills:
+        inferred = []
+        for cert in (p.get("certifications") or []):
+            if isinstance(cert, dict):
+                name = cert.get("name") or ""
+                if name and len(name) < 60:
+                    inferred.append(name)
+        if inferred:
+            skills = inferred[:6]
+            p["skills"] = skills
+
+    # Infer from about text via keyword matching
+    if not skills:
+        about_lower = (p.get("about") or "").lower()
+        skill_keywords = [
+            ("roofing", "Roofing"), ("construction", "Construction"), ("project management", "Project Management"),
+            ("python", "Python"), ("javascript", "JavaScript"), ("react", "React"),
+            ("aws", "AWS"), ("azure", "Azure"), ("machine learning", "Machine Learning"),
+            ("data analysis", "Data Analysis"), ("sales", "Sales"), ("marketing", "Marketing"),
+            ("leadership", "Leadership"), ("finance", "Finance"), ("accounting", "Accounting"),
+            ("design", "Design"), ("product management", "Product Management"),
+            ("software engineering", "Software Engineering"), ("devops", "DevOps"),
+            ("cybersecurity", "Cybersecurity"), ("hr", "Human Resources"),
+            ("operations", "Operations Management"), ("supply chain", "Supply Chain"),
+        ]
+        inferred = [label for kw, label in skill_keywords if kw in about_lower]
+        if inferred:
+            p["skills"] = inferred[:8]
 
     # ── Timezone: derive from country_code ────────────────────────────────────
     if not p.get("timezone"):
@@ -1191,24 +1238,56 @@ def _normalize_bd_profile(raw: dict) -> dict:
         }
         p["timezone"] = _TZ_MAP.get(p.get("country_code") or p.get("country") or "", "")
 
-    # ── Position: try to extract from about text if BD doesn't return headline ──
+    # ── Position: multi-strategy inference when BD doesn't return headline ──────
     if not p.get("position"):
         about_text = p.get("about") or ""
-        # Patterns:
-        #   "I'm the CEO and Founder of LBM Solutions…"  (has "the")
-        #   "I'm a Senior Engineer with 10 years…"       (has "a/an")
-        #   "I am the VP of Engineering at…"
+        candidate  = ""
+
+        # Strategy 1: "I'm a/an/the <title> at/with/of..."
         m = re.match(
             r"^I(?:'m| am) (?:a |an |the )(.+?)(?:\s+with\b|\s+at\b|\s+of\b|\.|,|–|-)",
             about_text, re.IGNORECASE,
         )
         if m:
             candidate = m.group(1).strip().rstrip("and").strip()
-            if 3 < len(candidate) < 70:
-                p["position"] = candidate
-        # Fallback: try headline key variants
+
+        # Strategy 2: "<Title> at <Company>" at start of about
+        if not candidate:
+            m = re.match(
+                r"^([A-Z][^.!?\n]{3,60}?)\s+(?:at|@)\s+[A-Z]",
+                about_text,
+            )
+            if m:
+                candidate = m.group(1).strip()
+
+        # Strategy 3: "<Title> specializing/focusing/with X years" — e.g. "Construction operator specializing in..."
+        if not candidate:
+            m = re.match(
+                r"^([A-Z][^.!?\n]{3,60}?)\s+(?:specializ|focus|with \d|based in|helping|who )",
+                about_text, re.IGNORECASE,
+            )
+            if m:
+                candidate = m.group(1).strip()
+
+        # Strategy 4: First sentence of about if it looks like a title (short, no verb)
+        if not candidate and about_text:
+            first_sentence = re.split(r"[.!?\n]", about_text)[0].strip()
+            if 5 < len(first_sentence) < 60 and not re.search(r"\b(I |we |our |you )", first_sentence, re.IGNORECASE):
+                candidate = first_sentence
+
+        # Strategy 5: most-recent experience title
+        if not candidate:
+            exp = p.get("experience") or []
+            if isinstance(exp, list) and exp:
+                first_exp = exp[0] if isinstance(exp[0], dict) else {}
+                candidate = first_exp.get("title") or first_exp.get("position") or ""
+
+        if candidate and 3 < len(candidate) < 80:
+            p["position"] = candidate
+
+        # Final fallback: explicit headline key variants
         if not p.get("position"):
-            p["position"] = p.get("headline") or p.get("bio") or p.get("title") or ""
+            p["position"] = p.get("headline") or p.get("bio") or p.get("title") or p.get("job_title") or ""
 
     # ── Honors & Awards → merge into certifications ──────────────────────────
     honors = p.get("honors_and_awards") or []
@@ -1397,10 +1476,16 @@ def _normalize_bd_profile(raw: dict) -> dict:
         p["first_name"] = parts[0] if parts else ""
         p["last_name"] = " ".join(parts[1:]) if len(parts) > 1 else ""
 
-    # ── Position / headline: already handled above with about-text extraction ──
-    # Kept as safety fallback for profiles that do have a headline field
+    # ── Position / headline: final safety net ────────────────────────────────
     if not p.get("position"):
-        p["position"] = p.get("headline") or p.get("bio") or p.get("job_title") or ""
+        exp = p.get("experience") or []
+        exp_title = ""
+        if isinstance(exp, list) and exp and isinstance(exp[0], dict):
+            exp_title = exp[0].get("title") or exp[0].get("position") or ""
+        p["position"] = (
+            p.get("headline") or p.get("bio") or p.get("job_title")
+            or exp_title or ""
+        )
 
     # ── Location: city may be "City, State, Country" string ──────────────────
     city_raw = p.get("city") or p.get("location") or ""
@@ -4322,13 +4407,17 @@ async def enrich_single(
 
     # ── P3: AI Analysis Layer (tags, behavioural signals, pitch intelligence) ─
     try:
-        from ai_analysis import run_ai_analysis
+        from ai_analysis import run_ai_analysis, _rule_based_analysis
         import workspace_service as _ws
         _ws_config = await _ws.get_workspace_config(org_id)
         _ai = await run_ai_analysis(profile, _ws_config)
     except Exception as _ai_err:
-        logger.warning("[AIAnalysis] Skipped: %s", _ai_err)
-        _ai = {}
+        logger.warning("[AIAnalysis] Skipped (%s) — using rule-based fallback", _ai_err)
+        try:
+            from ai_analysis import _rule_based_analysis
+            _ai = _rule_based_analysis(profile, {})
+        except Exception:
+            _ai = {}
 
     lead: dict = {
         "id": lead_id,
@@ -4936,6 +5025,20 @@ async def enrich_single_stream(
 # Bulk pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+def _dynamic_chunk_size(total: int) -> int:
+    """
+    Dynamic chunk sizing based on batch size.
+    Target: ~20 chunks per job. Minimum chunk size = 1.
+
+      total ≤ 20   → chunk_size = 1  (1 URL per chunk, up to 20 chunks)
+      total = 100  → chunk_size = 5  (5 URLs per chunk, 20 chunks)
+      total = 200  → chunk_size = 10 (10 URLs per chunk, 20 chunks)
+      total = 500  → chunk_size = 25 (25 URLs per chunk, 20 chunks)
+    """
+    return max(1, total // 20)
+
+
 async def enrich_bulk(
     urls: list[str],
     webhook_url: Optional[str] = None,
@@ -4991,8 +5094,7 @@ async def enrich_bulk(
         if r:
             try:
                 import queue_manager
-                # Fixed chunk size of 5 — each chunk = 5 URLs regardless of total count
-                chunk_size = 5
+                chunk_size = _dynamic_chunk_size(len(urls))
                 url_chunks = [urls[i: i + chunk_size] for i in range(0, len(urls), chunk_size)]
                 sub_job_ids = [str(uuid.uuid4()) for _ in url_chunks]
                 for idx, (sjid, chunk) in enumerate(zip(sub_job_ids, url_chunks)):
@@ -5017,8 +5119,7 @@ async def enrich_bulk(
                 logger.warning("[BulkEnrich] Queue push failed (%s) — falling back to in-process", e)
 
         # Fallback: in-process sequential task (Redis unavailable)
-        # Fixed chunk size of 5
-        chunk_size = 5
+        chunk_size = _dynamic_chunk_size(len(urls))
         url_chunks = [urls[i: i + chunk_size] for i in range(0, len(urls), chunk_size)]
         sub_job_ids = [str(uuid.uuid4()) for _ in url_chunks]
         for idx, (sjid, chunk) in enumerate(zip(sub_job_ids, url_chunks)):
@@ -5027,7 +5128,7 @@ async def enrich_bulk(
             "[BulkEnrich] Starting in-process batch for %d URLs → %d chunks (org=%s)",
             len(urls), len(url_chunks), org_id,
         )
-        asyncio.create_task(_process_sequential_batch(job_id, url_chunks, sub_job_ids, org_id=org_id))
+        asyncio.create_task(_process_sequential_batch(job_id, url_chunks, sub_job_ids, org_id=org_id, sso_id=sso_id))
 
     return job
 
@@ -5037,6 +5138,7 @@ async def _process_sequential_batch(
     url_chunks: list[list[str]],
     sub_job_ids: list[str],
     org_id: str = "default",
+    sso_id: str = "",
 ) -> None:
     """
     In-process sequential bulk enrichment — fallback when Redis is unavailable.
@@ -5055,7 +5157,7 @@ async def _process_sequential_batch(
         chunk_ok = chunk_fail = 0
         for i, url in enumerate(chunk):
             try:
-                lead = await enrich_single(url, job_id=job_id, org_id=org_id)
+                lead = await enrich_single(url, job_id=job_id, org_id=org_id, sso_id=sso_id)
                 chunk_ok += 1
                 logger.info(
                     "[BulkBatch] Chunk %d/%d · URL %d/%d OK: %s",

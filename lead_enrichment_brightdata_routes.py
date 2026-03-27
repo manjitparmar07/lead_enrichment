@@ -716,7 +716,7 @@ async def list_jobs():
     jobs = await svc.list_jobs(limit=50)
     import asyncio as _asyncio
     sub_job_lists = await _asyncio.gather(
-        *[svc.list_sub_jobs(j["id"]) for j in jobs],
+        *[svc.list_sub_jobs(j["id"], org_id=j.get("organization_id", "default")) for j in jobs],
         return_exceptions=True,
     )
     for job, sub_jobs in zip(jobs, sub_job_lists):
@@ -727,7 +727,9 @@ async def list_jobs():
 @router.get("/jobs/{job_id}/sub-jobs", include_in_schema=False)
 async def get_sub_jobs(job_id: str):
     """List sub-jobs (chunks) for a specific enrichment job."""
-    sub_jobs = await svc.list_sub_jobs(job_id)
+    job = await svc.get_job(job_id)
+    org_id = job.get("organization_id", "default") if job else "default"
+    sub_jobs = await svc.list_sub_jobs(job_id, org_id=org_id)
     return {"sub_jobs": sub_jobs, "total": len(sub_jobs)}
 
 
@@ -739,7 +741,7 @@ async def get_job(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
 
     result = await svc.list_leads(limit=1, offset=0, job_id=job_id)
-    sub_jobs = await svc.list_sub_jobs(job_id)
+    sub_jobs = await svc.list_sub_jobs(job_id, org_id=job.get("organization_id", "default"))
     return {**job, "leads_count": result["total"], "sub_jobs": sub_jobs}
 
 

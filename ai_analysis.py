@@ -101,13 +101,38 @@ def _rule_based_analysis(profile: dict, ws: dict) -> dict:
     for keywords, label in tag_map:
         if any(k in combined for k in keywords):
             tags.append(label)
-        if len(tags) >= 8:
+        if len(tags) >= 10:
             break
-    if not tags:
-        if title:
-            tags = [title.title()[:30]]
-        else:
-            tags = ["Professional"]
+
+    # Pad to minimum 4 using title/company/seniority fallbacks
+    if len(tags) < 4:
+        seniority_map = [
+            (["cto", "chief technology"], "C-Suite Tech"),
+            (["ceo", "chief executive", "founder", "co-founder"], "Founder / CEO"),
+            (["coo", "chief operating"], "Operations Leader"),
+            (["vp ", "vice president"], "VP Level"),
+            (["director"], "Director Level"),
+            (["manager", "head of"], "Team Manager"),
+        ]
+        for keywords, label in seniority_map:
+            if label not in tags and any(k in title for k in keywords):
+                tags.append(label)
+                if len(tags) >= 4:
+                    break
+
+    if len(tags) < 4:
+        # Add company-based tag
+        if company and len(tags) < 4:
+            tags.append(f"{company[:20].title()} Team")
+        # Final fallback generic tags
+        generic = ["B2B Professional", "LinkedIn Active", "Decision Maker", "Industry Expert"]
+        for g in generic:
+            if len(tags) >= 4:
+                break
+            if g not in tags:
+                tags.append(g)
+
+    tags = tags[:10]
 
     # Warm signal detection
     warm = None
@@ -204,7 +229,7 @@ Return ONLY valid JSON with exactly these 3 keys:
 }}
 
 Rules:
-- auto_tags: 6-8 short tags (2-3 words max), describing professional interests, tech focus, mindset
+- auto_tags: MINIMUM 4, MAXIMUM 10 short tags (2-3 words max), describing professional interests, tech focus, mindset. Count before returning — must have at least 4.
 - All values must be non-null strings based ONLY on the data above
 - If no warm signal found, set warm_signal to null
 - Return ONLY the JSON object, no explanation, no markdown fences"""
@@ -224,9 +249,18 @@ Rules:
         if raw:
             data = _parse_json(raw)
             if data and "auto_tags" in data:
-                tags    = data.get("auto_tags") or []
+                tags    = (data.get("auto_tags") or [])[:10]  # cap at 10
                 signals = data.get("behavioural_signals") or {}
                 pitch   = data.get("pitch_intelligence") or {}
+                # If LLM returned fewer than 4, pad with rule-based tags
+                if len(tags) < 4:
+                    rb = _rule_based_analysis(profile, ws_config)
+                    rb_tags = json.loads(rb["auto_tags_json"])
+                    for t in rb_tags:
+                        if t not in tags:
+                            tags.append(t)
+                        if len(tags) >= 4:
+                            break
 
                 warm = signals.get("warm_signal")
                 if warm and str(warm).lower() in ("null", "none", "no warm signal"):

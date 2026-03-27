@@ -453,7 +453,7 @@ DEFAULT_LIO_PROMPTS: List[dict] = [
         "_v": _PROMPT_VERSION,
         "id": 1,
         "name": "Auto Tags",
-        "description": "Generates 6–8 behavioural tags describing what the prospect actively does and cares about.",
+        "description": "Generates 4–10 behavioural tags describing what the prospect actively does and cares about.",
         "recommended_tier": "fast",
         "model": "llama-3.1-8b-instant",
         "temperature": 0.3,
@@ -461,12 +461,13 @@ DEFAULT_LIO_PROMPTS: List[dict] = [
             "You are a B2B sales researcher. Generate behavioural tags from LinkedIn profile data.\n\n"
             f"{_STRICT}\n"
             "- Return ONLY a valid JSON array of strings.\n"
+            "- MINIMUM 4 tags, MAXIMUM 10 tags. Count before returning.\n"
             "- Tags must be 2-3 words max. Avoid job titles. Avoid 'leader', 'expert', 'professional'."
         ),
         "user_template": (
             "LinkedIn Profile (BrightData):\n"
             "{raw_brightdata_json}\n\n"
-            "Generate 6-8 tags describing their interests, tools used, topics they post about, and business mindset.\n"
+            "Generate between 4 and 10 tags describing their interests, tools used, topics they post about, and business mindset.\n"
             "Base tags on their posts, activity (liked content), and about section.\n\n"
             'Return ONLY: ["tag1", "tag2", "tag3", ...]'
         ),

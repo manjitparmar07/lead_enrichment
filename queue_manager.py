@@ -214,6 +214,7 @@ async def push_job(
     sub_job_ids: list[str],
     r: Any,
     generate_outreach: bool = True,
+    sso_id: str = "",
 ) -> int:
     """
     Push pre-split URL chunks to the per-tenant queue.
@@ -237,6 +238,7 @@ async def push_job(
             "urls":              chunk,
             "sub_job_id":        sub_job_id,
             "generate_outreach": generate_outreach,
+            "sso_id":            sso_id,
         }
         pipe.rpush(tenant_key, json.dumps(task))
 
@@ -344,6 +346,7 @@ async def _worker(worker_id: int, r: Any) -> None:
             urls       = task.get("urls", [])
             sub_job_id = task.get("sub_job_id")
             gen_out    = task.get("generate_outreach", True)
+            sso_id     = task.get("sso_id", "")
 
             if not urls:
                 continue
@@ -368,14 +371,19 @@ async def _worker(worker_id: int, r: Any) -> None:
                         job_id=job_id or None,
                         org_id=org_id,
                         generate_outreach_flag=gen_out,
+                        sso_id=sso_id,
                     )
                     for url in urls
                 ],
                 return_exceptions=True,
             )
 
-            ok   = sum(1 for r_ in results if not isinstance(r_, Exception))
-            fail = len(results) - ok
+            ok    = sum(1 for r_ in results if not isinstance(r_, Exception))
+            fail  = len(results) - ok
+            cache = sum(1 for r_ in results if not isinstance(r_, Exception) and r_.get("_cache_hit"))
+
+            if cache:
+                logger.info("[Worker-%d] %d/%d served from cache", worker_id, cache, ok)
 
             if fail:
                 for i, r_ in enumerate(results):
@@ -431,7 +439,7 @@ async def _worker(worker_id: int, r: Any) -> None:
             logger.info("[Worker-%d] Cancelled — shutting down", worker_id)
             break
         except Exception as e:
-            logger.error("[Worker-%d] Unexpected error: %s", e, exc_info=True)
+            logger.error("[Worker-%d] Unexpected error: %s", worker_id, e, exc_info=True)
             await asyncio.sleep(1)   # backoff before retry
 
 
