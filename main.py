@@ -19,13 +19,20 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from auth_routes import router as auth_router
-from lead_enrichment_brightdata_routes import router as lead_enrichment_router
+from lead_enrichment_brightdata_routes import (
+    router as lead_enrichment_router,
+    _linkedin_enrich_router,
+    _email_enrich_router,
+    _outreach_enrich_router,
+    _company_enrich_router,
+)
 from keys_routes import router as keys_router
 from ably_routes import router as ably_router
 from workspace_routes import router as workspace_router
 from enrichment_config_routes import router as enrichment_config_router
 from company_routes import router as company_router
 from ai_enrichment_routes import router as ai_enrichment_router
+from analytics_routes import router as analytics_router
 from security import SecurityMiddleware
 import keys_service
 import lead_enrichment_worker as worker
@@ -45,30 +52,44 @@ app = FastAPI(
     title="WorksBuddy Lead Enrichment API",
     version="1.0.0",
     description=(
-        "## Endpoints\n\n"
-        "### Bulk Enrichment\n"
-        "- `POST /api/leads/enrich/bulk` — Submit LinkedIn URLs, token in body\n"
-        "- `GET  /api/leads/jobs` — List all jobs\n"
-        "- `GET  /api/leads/jobs/{job_id}` — Poll job status\n\n"
-        "### AI Enrichment (no auth)\n"
-        "Pass a BrightData profile object as `{ \"profile\": { ... } }`\n\n"
-        "**Core:** Identity · Contact · Scores\n\n"
-        "**Intelligence:** ICP Match · Behavioural Signals · Pitch Intelligence · Activity\n\n"
-        "**Output:** Tags · Outreach · Persona Analysis"
+        "## Enrichment View APIs\n\n"
+        "Each enriched lead exposes 4 focused views by `lead_id`:\n\n"
+        "| Endpoint | Description |\n"
+        "|---|---|\n"
+        "| `GET /api/leads/{lead_id}/linkedin` | Full LinkedIn profile — identity, contact, scores, ICP, signals, activity, tags |\n"
+        "| `GET /api/leads/{lead_id}/email` | Email enrichment — Apollo/Hunter result, confidence, verification |\n"
+        "| `GET /api/leads/{lead_id}/outreach` | AI outreach — cold email, LinkedIn note, sequence, pitch |\n"
+        "| `GET /api/leads/{lead_id}/company` | Company enrichment — website intel, market signals, intent, scores |\n\n"
+        "## Bulk Enrichment\n\n"
+        "- `POST /api/leads/enrich/bulk` — Submit up to 5000 LinkedIn URLs (JWT token in body)\n"
+        "- `GET  /api/leads/jobs` — List all enrichment jobs\n"
+        "- `GET  /api/leads/jobs/{job_id}` — Poll job status + progress\n\n"
+        "## AI Enrichment\n\n"
+        "Pass a BrightData profile object as `{ \"profile\": { ... } }` for standalone AI analysis.\n\n"
+        "**Output:** Identity · Contact · Scores · ICP Match · Behavioural Signals · Pitch Intelligence · Tags · Outreach"
     ),
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(auth_router,               prefix="/api", include_in_schema=False)
 app.include_router(lead_enrichment_router,    prefix="/api")
+# ── 4 Enrichment View APIs (visible in /docs) ─────────────────────────────────
+app.include_router(_linkedin_enrich_router,   prefix="/api")
+app.include_router(_email_enrich_router,      prefix="/api")
+app.include_router(_outreach_enrich_router,   prefix="/api")
+app.include_router(_company_enrich_router,    prefix="/api")
+# ──────────────────────────────────────────────────────────────────────────────
 app.include_router(keys_router,               prefix="/api", include_in_schema=False)
 app.include_router(ably_router,               prefix="/api", include_in_schema=False)
 app.include_router(workspace_router,          prefix="/api", include_in_schema=False)
 app.include_router(enrichment_config_router,  prefix="/api", include_in_schema=False)
 app.include_router(company_router,            prefix="/api", include_in_schema=False)
 app.include_router(ai_enrichment_router,      prefix="/api")
+app.include_router(analytics_router,          prefix="/api")
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
+# Production requests go through nginx which owns CORS headers.
+# This middleware covers direct access to port 8020 (dev / internal tools).
 _PROD_ORIGINS = [
     "https://lead-enrichment.worksbuddy.ai",
     "https://leads.worksbuddy.ai",
@@ -84,6 +105,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # ── Startup / Shutdown ────────────────────────────────────────────────────────

@@ -141,6 +141,7 @@ async def login(body: LoginRequest):
     # ── Issue token ───────────────────────────────────────────────────────────
     token = _issue_token({
         "user_id":         user_id,
+        "sso_id":          user_id,   # explicit sso_id — used by bulk API + LIO forwarding
         "email":           email,
         "full_name":       full_name,
         "organization_id": org_id,
@@ -155,6 +156,7 @@ async def login(body: LoginRequest):
         "expires_in":   JWT_EXPIRE_HOURS * 3600,
         "user": {
             "user_id":         user_id,
+            "sso_id":          user_id,
             "email":           email,
             "full_name":       full_name,
             "role":            role,
