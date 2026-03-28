@@ -124,25 +124,18 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
     # phone: direct_phone is the DB column; phone is legacy
     phone = lead.get("direct_phone") or lead.get("phone", "") or ""
 
+    # enrichment_data = the full linkedin_enrich structured view
+    linkedin_enrich = lead.get("linkedin_enrich") or {}
+    # Ensure email inside linkedin_enrich contact is also clean
+    contact_block = linkedin_enrich.get("contact", {})
+    if contact_block.get("work_email") and "placeholder" in str(contact_block["work_email"]).lower():
+        contact_block["work_email"] = None
+    if contact_block.get("email") and "placeholder" in str(contact_block["email"]).lower():
+        contact_block["email"] = None
+
     payload = {
-        "enrichment_data": {
-            "lead_id": lead_id,
-            "linkedin_url": lead.get("linkedin_url", ""),
-            "full_name": lead.get("full_name") or lead.get("name", ""),
-            "first_name": lead.get("first_name", ""),
-            "last_name": lead.get("last_name", ""),
-            "email": email,
-            "phone": phone,
-            "title": lead.get("title", ""),
-            "company": lead.get("company", ""),
-            "company_domain": lead.get("company_domain", ""),
-            "location": lead.get("location", ""),
-            "country": lead.get("country", ""),
-            "industry": lead.get("industry", ""),
-            "summary": lead.get("about", "") or lead.get("summary", ""),
-            "linkedin_enrich": lead.get("linkedin_enrich", {}),
-        },
-        "sso_id": sso_id,
+        "enrichment_data": linkedin_enrich,
+        "sso_id":          sso_id,
         "organization_id": lead.get("organization_id", ""),
     }
 
