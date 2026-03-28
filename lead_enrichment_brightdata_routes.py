@@ -659,7 +659,19 @@ async def enrich_bulk(body: BulkEnrichRequest, request: Request):
         for url in urls_to_submit:
             existing = await svc.check_existing_lead(url, org_id)
             if existing and not existing.get("_stale"):
-                skipped_urls.append(url)
+                # Check data is complete — has name and enriched status
+                data_complete = (
+                    existing.get("name") or existing.get("full_name")
+                ) and existing.get("status") == "enriched"
+                if data_complete:
+                    # Data is good — forward to LIO and skip re-enrichment
+                    existing["linkedin_enrich"] = svc._format_linkedin_enrich(existing)
+                    import asyncio as _asyncio
+                    _asyncio.create_task(svc.send_to_lio(existing, sso_id=sso_id))
+                    skipped_urls.append(url)
+                else:
+                    # Data incomplete — re-enrich to fetch missing fields
+                    filtered.append(url)
             else:
                 filtered.append(url)
         urls_to_submit = filtered
