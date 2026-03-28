@@ -1127,6 +1127,8 @@ def _normalize_linkedin_url(url: str) -> str:
     url = url.strip().rstrip("/")
     if not url.startswith("http"):
         url = f"https://{url}"
+    # Normalise country-specific LinkedIn domains (in., nl., uk., de., etc.) → www.
+    url = re.sub(r"https?://[a-z]{2}\.linkedin\.com", "https://www.linkedin.com", url)
     return url
 
 
