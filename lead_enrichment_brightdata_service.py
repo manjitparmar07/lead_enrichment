@@ -114,9 +114,25 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
         logger.warning("[LIO] LIO_RECEIVE_URL is not set — skipping forward")
         return
 
-    lead_id = lead.get("lead_id", "unknown")
+    lead_id = lead.get("lead_id") or lead.get("id", "unknown")
     payload = {
-        "enrichment_data": lead,
+        "enrichment_data": {
+            "lead_id": lead_id,
+            "linkedin_url": lead.get("linkedin_url", ""),
+            "full_name": lead.get("full_name") or lead.get("name", ""),
+            "first_name": lead.get("first_name", ""),
+            "last_name": lead.get("last_name", ""),
+            "email": lead.get("email", ""),
+            "phone": lead.get("phone", ""),
+            "title": lead.get("title", ""),
+            "company": lead.get("company", ""),
+            "company_domain": lead.get("company_domain", ""),
+            "location": lead.get("location", ""),
+            "country": lead.get("country", ""),
+            "industry": lead.get("industry", ""),
+            "summary": lead.get("summary", ""),
+            "linkedin_enrich": lead.get("linkedin_enrich", {}),
+        },
         "sso_id": sso_id,
         "organization_id": lead.get("organization_id", ""),
     }
