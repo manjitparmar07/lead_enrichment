@@ -4174,6 +4174,7 @@ async def enrich_single(
         logger.info("[Enrich] Cache HIT for %s (lead_id=%s) — skipping Bright Data", url, lead_id)
         cached["_cache_hit"] = True
         cached["linkedin_enrich"] = _format_linkedin_enrich(cached)
+        asyncio.create_task(send_to_lio(cached, sso_id=sso_id))
         return cached
 
     logger.info("[Enrich] Cache MISS for %s — fetching from Bright Data", url)
