@@ -660,9 +660,10 @@ async def enrich_bulk(body: BulkEnrichRequest, request: Request):
             existing = await svc.check_existing_lead(url, org_id)
             if existing and not existing.get("_stale"):
                 # Check data is complete — has name and enriched status
-                data_complete = (
-                    existing.get("name") or existing.get("full_name")
-                ) and existing.get("status") == "enriched"
+                data_complete = bool(
+                    (existing.get("name") or existing.get("full_name"))
+                    and existing.get("enriched_at")
+                )
                 if data_complete:
                     # Data is good — forward to LIO and skip re-enrichment
                     existing["linkedin_enrich"] = svc._format_linkedin_enrich(existing)
