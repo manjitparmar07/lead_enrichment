@@ -115,6 +115,15 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
         return
 
     lead_id = lead.get("lead_id") or lead.get("id", "unknown")
+
+    # work_email is the DB column name; email is legacy/nested key — prefer work_email
+    raw_email = lead.get("work_email") or lead.get("email", "") or ""
+    # Strip Apollo/external placeholder emails — they are internal IDs, not real addresses
+    email = raw_email if raw_email and "placeholder" not in raw_email.lower() else ""
+
+    # phone: direct_phone is the DB column; phone is legacy
+    phone = lead.get("direct_phone") or lead.get("phone", "") or ""
+
     payload = {
         "enrichment_data": {
             "lead_id": lead_id,
@@ -122,15 +131,15 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
             "full_name": lead.get("full_name") or lead.get("name", ""),
             "first_name": lead.get("first_name", ""),
             "last_name": lead.get("last_name", ""),
-            "email": lead.get("email", ""),
-            "phone": lead.get("phone", ""),
+            "email": email,
+            "phone": phone,
             "title": lead.get("title", ""),
             "company": lead.get("company", ""),
             "company_domain": lead.get("company_domain", ""),
             "location": lead.get("location", ""),
             "country": lead.get("country", ""),
             "industry": lead.get("industry", ""),
-            "summary": lead.get("summary", ""),
+            "summary": lead.get("about", "") or lead.get("summary", ""),
             "linkedin_enrich": lead.get("linkedin_enrich", {}),
         },
         "sso_id": sso_id,
@@ -523,6 +532,13 @@ async def init_leads_db() -> None:
 
 
 async def _upsert_lead(lead: dict) -> None:
+    # Null out any placeholder emails before persisting (Apollo internal IDs)
+    for email_col in ("work_email", "personal_email", "email"):
+        v = lead.get(email_col)
+        if v and isinstance(v, str) and "placeholder" in v.lower():
+            logger.warning("[DB] Clearing placeholder email in %s: %s", email_col, v)
+            lead[email_col] = None
+
     cols = [k for k in lead if k != "id"]
     placeholders = ", ".join(f":{k}" for k in cols)
     updates = ", ".join(f"{k}=excluded.{k}" for k in cols)
