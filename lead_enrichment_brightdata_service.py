@@ -4743,8 +4743,11 @@ async def enrich_single_stream(
                 "industry": lead.get("industry"),
                 "employee_count": lead.get("employee_count", 0),
             }}
+            _co_email = lead.get("work_email") or ""
+            if "placeholder" in _co_email.lower():
+                _co_email = ""
             yield {"stage": "contact",  "status": "done", "data": {
-                "email": lead.get("work_email"), "phone": lead.get("direct_phone"),
+                "email": _co_email or None, "phone": lead.get("direct_phone"),
                 "email_source": lead.get("email_source"), "email_confidence": lead.get("email_confidence"),
             }}
             yield {"stage": "website",  "status": "done", "data": {
@@ -4825,8 +4828,12 @@ async def enrich_single_stream(
             contact = await find_contact_info(first, last, verified_domain, linkedin_url=url)
             if not contact.get("phone") and activity_phones:
                 contact["phone"] = activity_phones[0]
+        _contact_email = contact.get("email") or ""
+        if "placeholder" in _contact_email.lower():
+            logger.warning("[Stream] Dropping placeholder email from contact stage: %s", _contact_email)
+            _contact_email = ""
         yield {"stage": "contact", "status": "done", "data": {
-            "email":            contact.get("email"),
+            "email":            _contact_email or None,
             "phone":            contact.get("phone"),
             "email_source":     contact.get("source"),
             "email_confidence": contact.get("confidence"),
