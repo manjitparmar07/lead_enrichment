@@ -51,11 +51,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /install /usr/local
 
 # Install only Chromium (smallest browser footprint)
-ENV PLAYWRIGHT_BROWSERS_PATH=/home/appuser/.cache/ms-playwright
+ENV PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
 RUN playwright install chromium --with-deps 2>/dev/null || playwright install chromium
-
-# Non-root user
-RUN useradd -m -u 1000 appuser
 
 # Copy application source
 COPY . .
@@ -63,12 +60,8 @@ COPY . .
 # Seed configs so entrypoint can cp -n (no-overwrite) into the volume mount
 RUN mkdir -p configs && cp -r /app/configs /app/configs_seed
 
-RUN chown -R appuser:appuser /app
-
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
-
-USER appuser
 
 EXPOSE ${PORT:-8020}
 
