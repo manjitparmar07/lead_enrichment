@@ -1487,6 +1487,9 @@ def _normalize_bd_profile(raw: dict) -> dict:
     p["connections"] = _safe_int(p.get("connections"))
 
     # ── Name split ────────────────────────────────────────────────────────────
+    # BD sometimes returns full_name instead of name — normalise here
+    if not p.get("name") and p.get("full_name"):
+        p["name"] = p["full_name"]
     if not p.get("first_name") and p.get("name"):
         parts = p["name"].split()
         p["first_name"] = parts[0] if parts else ""
@@ -1546,7 +1549,13 @@ async def fetch_profile_sync(linkedin_url: str) -> dict:
                 if resp.status_code == 200:
                     data = resp.json()
                     raw = data[0] if isinstance(data, list) and data else data
-                    if isinstance(raw, dict) and raw.get("name"):
+                    if isinstance(raw, dict) and (
+                        raw.get("name") or raw.get("full_name")
+                        or raw.get("first_name") or raw.get("linkedin_url")
+                    ):
+                        # Normalise full_name → name before further processing
+                        if not raw.get("name") and raw.get("full_name"):
+                            raw["name"] = raw["full_name"]
                         profile = _normalize_bd_profile(raw)
                         logger.info("[BrightData] OK — %s | company=%s | avatar=%s | activity=%d",
                                     profile.get("name"),
