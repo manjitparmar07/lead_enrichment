@@ -88,6 +88,40 @@ QUEUE_HIGH   = "wb:leads:queue:high"    # single enrichments
 QUEUE_NORMAL = "wb:leads:queue:normal"  # bulk ≤100
 QUEUE_LOW    = "wb:leads:queue:low"     # bulk >100
 
+# ── Emoji stripping ───────────────────────────────────────────────────────────
+_EMOJI_RE = re.compile(
+    "[\U0001F600-\U0001F64F"   # emoticons
+    "\U0001F300-\U0001F5FF"   # symbols & pictographs
+    "\U0001F680-\U0001F6FF"   # transport & map symbols
+    "\U0001F700-\U0001F77F"   # alchemical symbols
+    "\U0001F780-\U0001F7FF"   # geometric shapes extended
+    "\U0001F800-\U0001F8FF"   # supplemental arrows
+    "\U0001F900-\U0001F9FF"   # supplemental symbols & pictographs
+    "\U0001FA00-\U0001FA6F"   # chess symbols
+    "\U0001FA70-\U0001FAFF"   # symbols & pictographs extended-A
+    "\U00002702-\U000027B0"   # dingbats
+    "\U000024C2-\U0001F251"   # enclosed characters
+    "\U0001F1E0-\U0001F1FF"   # flags
+    "\U00010000-\U0010FFFF"   # supplementary multilingual plane
+    "]+",
+    flags=re.UNICODE,
+)
+
+def _strip_emojis(value: str) -> str:
+    """Remove emoji characters and clean up extra whitespace."""
+    if not value or not isinstance(value, str):
+        return value
+    return _EMOJI_RE.sub("", value).strip()
+
+
+def _clean_lead_strings(lead: dict, fields: list) -> None:
+    """Strip emojis from specified string fields of a lead dict in-place."""
+    for f in fields:
+        v = lead.get(f)
+        if v and isinstance(v, str):
+            lead[f] = _strip_emojis(v)
+
+
 # ── LIO forwarding ────────────────────────────────────────────────────────────
 LIO_RECEIVE_URL = os.getenv("LIO_RECEIVE_URL", "https://api-lio.worksbuddy.ai/api/enrich/receive")
 _lio_client: Optional[httpx.AsyncClient] = None
@@ -125,13 +159,25 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
     phone = lead.get("direct_phone") or lead.get("phone", "") or ""
 
     # enrichment_data = the full linkedin_enrich structured view
-    linkedin_enrich = lead.get("linkedin_enrich") or {}
-    # Ensure email inside linkedin_enrich contact is also clean
-    contact_block = linkedin_enrich.get("contact", {})
-    if contact_block.get("work_email") and "placeholder" in str(contact_block["work_email"]).lower():
-        contact_block["work_email"] = None
-    if contact_block.get("email") and "placeholder" in str(contact_block["email"]).lower():
-        contact_block["email"] = None
+    import copy
+    linkedin_enrich = copy.deepcopy(lead.get("linkedin_enrich") or {})
+
+    # Strip emojis from identity fields
+    identity = linkedin_enrich.get("identity") or {}
+    for f in ("name", "first_name", "last_name", "title", "company", "about", "location"):
+        if identity.get(f):
+            identity[f] = _strip_emojis(identity[f])
+    profile = identity.get("profile") or {}
+    for f in ("full_name", "first_name", "last_name", "current_title"):
+        if profile.get(f):
+            profile[f] = _strip_emojis(profile[f])
+
+    # Clean placeholder + emoji in contact block
+    contact_block = linkedin_enrich.get("contact") or {}
+    for email_key in ("work_email", "email"):
+        v = contact_block.get(email_key)
+        if v and "placeholder" in str(v).lower():
+            contact_block[email_key] = None
 
     payload = {
         "enrichment_data": linkedin_enrich,
@@ -531,6 +577,10 @@ async def _upsert_lead(lead: dict) -> None:
         if v and isinstance(v, str) and "placeholder" in v.lower():
             logger.warning("[DB] Clearing placeholder email in %s: %s", email_col, v)
             lead[email_col] = None
+
+    # Strip emojis from text fields before writing to DB
+    _clean_lead_strings(lead, ["name", "first_name", "last_name", "title", "company",
+                                "about", "location", "city", "country"])
 
     cols = [k for k in lead if k != "id"]
     placeholders = ", ".join(f":{k}" for k in cols)
