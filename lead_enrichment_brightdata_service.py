@@ -1742,7 +1742,7 @@ async def _try_apollo(first: str, last: str, domain: str) -> Optional[dict]:
             phone = p.get("phone") or (p.get("phone_numbers") or [{}])[0].get("sanitized_number")
             photo = p.get("photo_url")
             twitter = p.get("twitter_url") or p.get("twitter")
-            if email and "@" in email:
+            if email and "@" in email and "placeholder" not in email.lower():
                 logger.info("[Apollo] Found: %s", email)
                 return {
                     "email": email,
@@ -1752,6 +1752,8 @@ async def _try_apollo(first: str, last: str, domain: str) -> Optional[dict]:
                     "avatar_url": photo,
                     "twitter": twitter,
                 }
+            if email and "placeholder" in email.lower():
+                logger.warning("[Apollo] Rejected placeholder email: %s", email)
     except Exception as e:
         logger.warning("[Apollo] %s", e)
     return None
@@ -1907,6 +1909,12 @@ async def find_contact_info(
     if not result:
         return {"email": None, "phone": None, "source": None, "confidence": None,
                 "verified": False, "bounce_risk": None}
+
+    # Reject any placeholder emails that slipped through from external services
+    if result.get("email") and "placeholder" in result["email"].lower():
+        logger.warning("[ContactWaterfall] Dropping placeholder email from %s: %s",
+                       result.get("source"), result.get("email"))
+        result["email"] = None
 
     # Step 6 — ZeroBounce verification (always run if email found)
     email = result.get("email")
