@@ -1625,6 +1625,12 @@ async def fetch_profile_sync(linkedin_url: str) -> dict:
                                     len(raw.get("activity") or []))
                         return profile
                     logger.warning("[BrightData] Empty profile, trying OCR fallback")
+                elif resp.status_code in (400, 401, 403, 402, 429):
+                    # Account-level error — do NOT fall back to OCR, abort cleanly
+                    err_text = resp.text[:200]
+                    logger.error("[BrightData] Account/auth error %s: %s — aborting, will not save incomplete data",
+                                 resp.status_code, err_text)
+                    return {"_bd_error": True, "_bd_status": resp.status_code, "_bd_message": err_text}
                 else:
                     logger.warning("[BrightData] %s: %s — trying OCR fallback", resp.status_code, resp.text[:120])
         except Exception as e:
@@ -4287,6 +4293,12 @@ async def enrich_single(
     logger.info("━━━ [Phase A] Person Intelligence — scraping: %s", url)
     profile = await fetch_profile_sync(url)
 
+    # Bright Data account/auth error — abort without saving incomplete data to DB
+    if profile.get("_bd_error"):
+        msg = profile.get("_bd_message", "Bright Data account error")
+        logger.error("[Enrich] Aborting enrichment for %s — BD error: %s", url, msg)
+        return {"error": f"Bright Data account error: {msg}", "linkedin_url": linkedin_url}
+
     name    = profile.get("name", "")
     first, last = _parse_name(name)
     company = profile.get("current_company_name", "")
@@ -4815,6 +4827,13 @@ async def enrich_single_stream(
     yield {"stage": "profile", "status": "loading"}
     try:
         profile = await fetch_profile_sync(url)
+        # Bright Data account/auth error — abort without saving incomplete data
+        if profile.get("_bd_error"):
+            err_msg = profile.get("_bd_message", "Bright Data account error")
+            logger.error("[Stream] Aborting — BD account error: %s", err_msg)
+            yield {"stage": "profile", "status": "error", "error": err_msg}
+            yield {"stage": "complete", "status": "error", "error": f"Bright Data account error: {err_msg}"}
+            return
         name     = profile.get("name", "")
         first, last = _parse_name(name)
         company  = profile.get("current_company_name", "")
