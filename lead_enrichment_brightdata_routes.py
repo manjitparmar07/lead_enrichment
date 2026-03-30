@@ -1833,6 +1833,7 @@ async def outreach_enrichment(body: ViewOutreachRequest):
                     ai_outreach = None
             except Exception as _e:
                 logger.warning("[OutreachView] AI generation failed: %s", _e)
+                ai_outreach = {"_error": str(_e)}  # temporary debug
 
     # When ai_outreach is available (system_prompt provided), override top-level fields
     if ai_outreach:
