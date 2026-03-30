@@ -730,10 +730,13 @@ async def enrich_bulk(request: Request):
     skipped_urls: list[str] = []
 
     # ── skip_existing: filter out URLs already enriched for this org ──────────
+    # Single batch query instead of N individual queries
     if body.skip_existing:
         filtered: list[str] = []
+        existing_map = await svc.check_existing_leads_batch(urls_to_submit, org_id)
         for url in urls_to_submit:
-            existing = await svc.check_existing_lead(url, org_id)
+            lead_id = svc._lead_id(svc._normalize_linkedin_url(url))
+            existing = existing_map.get(lead_id)
             if existing and not existing.get("_stale"):
                 # Check data is complete — has name and enriched status
                 data_complete = bool(
@@ -1308,6 +1311,48 @@ async def delete_note(lead_id: str, note_id: str, request: Request):
 # 3rd parties: always use ?url= — you already have the LinkedIn URL you submitted.
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _extract_outreach_from_prompt(prompt: str) -> dict | None:
+    """
+    If the system_prompt already contains completed outreach copy, extract
+    fields and return a dict. Returns None if no completed copy is detected.
+
+    Handles both formats produced by system_prompt_generator_service:
+      Format A — "Email Subject Line: ..." / "LinkedIn Connection Note: ..."
+      Format B — "Email subject line: ..." / "LinkedIn connection note: ..."
+    """
+    import re as _re
+
+    has_subject  = bool(_re.search(r"Email [Ss]ubject [Ll]ine\s*:", prompt))
+    has_linkedin = bool(_re.search(r"LinkedIn [Cc]onnection [Nn]ote\s*:", prompt))
+    if not (has_subject and has_linkedin):
+        return None
+
+    def _grab(pattern, text, flags=_re.IGNORECASE | _re.DOTALL):
+        m = _re.search(pattern, text, flags)
+        return m.group(1).strip() if m else ""
+
+    subject        = _grab(r"Email [Ss]ubject [Ll]ine\s*:\s*(.+?)(?:\n|$)", prompt)
+    linkedin_note  = _grab(r"LinkedIn [Cc]onnection [Nn]ote\s*:\s*(.+?)(?:\n\n|\Z)", prompt)
+    best_channel   = _grab(r"Best [Cc]hannel\s*:\s*(.+?)(?:\n|$)", prompt)
+    best_time      = _grab(r"Best [Ss]end [Tt]ime\s*:\s*(.+?)(?:\n|$)", prompt)
+    outreach_angle = _grab(r"Primary [Aa]ngle\s*:\s*(.+?)(?:\n|\Z)", prompt)
+
+    # Email body — between "Email:\n\n" or after subject line, up to "LinkedIn connection note"
+    body_match = (
+        _re.search(r"Email\s*:\s*\n+(.+?)(?=LinkedIn [Cc]onnection [Nn]ote)", prompt, _re.DOTALL)
+        or _re.search(r"Email [Ss]ubject [Ll]ine\s*:.+?\n\n(.+?)(?=LinkedIn [Cc]onnection [Nn]ote|Best [Cc]hannel)", prompt, _re.DOTALL)
+    )
+    email_body = body_match.group(1).strip() if body_match else ""
+
+    return {
+        "cold_email":      {"subject": subject, "body": email_body},
+        "linkedin_note":   linkedin_note,
+        "best_channel":    best_channel,
+        "best_time":       best_time,
+        "outreach_angle":  outreach_angle,
+    }
+
+
 async def _quick_llm(system: str, user: str, max_tokens: int = 2000) -> str:
     """Lightweight LLM call for view-endpoint AI generation. WB LLM → Groq fallback."""
     import httpx as _httpx
@@ -1363,8 +1408,19 @@ class ViewOutreachRequest(BaseModel):
 
 
 class ViewCompanyRequest(BaseModel):
-    leadenrich_id: str
+    leadenrich_id: Optional[str] = None          # Lead ID from bulk enrichment results
+    company_linkedin_url: Optional[str] = None   # Direct company LinkedIn URL
     system_prompt: Optional[str] = None
+
+    @field_validator("company_linkedin_url")
+    @classmethod
+    def validate_company_url(cls, v):
+        if v is None:
+            return v
+        v = v.strip()
+        if "/company/" not in v:
+            raise ValueError("company_linkedin_url must be a LinkedIn company URL (must contain /company/)")
+        return v
 
 
 def _parse_json_field(lead: dict, key: str, default):
@@ -1650,22 +1706,26 @@ async def outreach_enrichment(body: ViewOutreachRequest):
     # AI-generated outreach if system_prompt provided
     ai_outreach = None
     if body.system_prompt and lead.get("name"):
-        try:
-            lead_ctx = (
-                f"Name: {lead.get('name')} | Title: {lead.get('title','')} | "
-                f"Company: {lead.get('company','')} | Industry: {lead.get('industry','')} | "
-                f"Location: {lead.get('location','')} | Score: {lead.get('lead_score','')} | "
-                f"Warm signal: {lead.get('warm_signal','')} | Pitch: {lead.get('pitch_intelligence','')}"
-            )
-            ai_outreach = await _quick_llm(
-                body.system_prompt,
-                f"Generate personalised B2B outreach for this lead.\n\n{lead_ctx}\n\n"
-                "Return JSON: {{\"cold_email\": {{\"subject\": \"...\", \"body\": \"...\"}}, "
-                "\"linkedin_note\": \"...\", \"best_channel\": \"...\", \"outreach_angle\": \"...\"}}",
-                max_tokens=2000,
-            )
-        except Exception as _e:
-            logger.warning("[OutreachView] AI generation failed: %s", _e)
+        # If system_prompt already has completed copy, extract it directly (no LLM call needed)
+        ai_outreach = _extract_outreach_from_prompt(body.system_prompt)
+        if not ai_outreach:
+            # Pure instructions prompt — call LLM with real lead data
+            try:
+                lead_ctx = (
+                    f"Name: {lead.get('name')} | Title: {lead.get('title','')} | "
+                    f"Company: {lead.get('company','')} | Industry: {lead.get('industry','')} | "
+                    f"Location: {lead.get('location','')} | Score: {lead.get('lead_score','')} | "
+                    f"Warm signal: {lead.get('warm_signal','')} | Pitch: {lead.get('pitch_intelligence','')}"
+                )
+                ai_outreach = await _quick_llm(
+                    body.system_prompt,
+                    f"Generate personalised B2B outreach for this lead.\n\n{lead_ctx}\n\n"
+                    "Return JSON: {{\"cold_email\": {{\"subject\": \"...\", \"body\": \"...\"}}, "
+                    "\"linkedin_note\": \"...\", \"best_channel\": \"...\", \"outreach_angle\": \"...\"}}",
+                    max_tokens=2000,
+                )
+            except Exception as _e:
+                logger.warning("[OutreachView] AI generation failed: %s", _e)
 
     return {
         "lead_id":      lead.get("id"),
@@ -1731,11 +1791,26 @@ async def company_enrichment(body: ViewCompanyRequest):
     import company_service as cs
     from datetime import datetime, timezone
 
-    lead = await _resolve_lead(body.leadenrich_id)
+    if not body.leadenrich_id and not body.company_linkedin_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either leadenrich_id or company_linkedin_url.",
+        )
 
-    company_linkedin = lead.get("company_linkedin")
-    if not company_linkedin:
-        raise HTTPException(status_code=400, detail="No company LinkedIn URL found for this lead.")
+    # ── Resolve company LinkedIn URL ─────────────────────────────────────────
+    lead: Optional[dict] = None
+    if body.leadenrich_id:
+        # Path 1: look up the lead and pull its company_linkedin field
+        lead = await _resolve_lead(body.leadenrich_id)
+        company_linkedin = lead.get("company_linkedin")
+        if not company_linkedin:
+            raise HTTPException(
+                status_code=400,
+                detail="No company LinkedIn URL found for this lead.",
+            )
+    else:
+        # Path 2: caller supplied the company URL directly
+        company_linkedin = body.company_linkedin_url
 
     # Fetch fresh company data directly from BrightData
     bd_data = await cs._fetch_bd_company_profile(company_linkedin)
@@ -1743,15 +1818,15 @@ async def company_enrichment(body: ViewCompanyRequest):
         raise HTTPException(status_code=502, detail="BrightData did not return company data.")
 
     # Save to DB
-    org_id = lead.get("organization_id", "default")
+    org_id = lead.get("organization_id", "default") if lead else "default"
     try:
         record = {
-            "id":                  cs._company_id(company_linkedin),
+            "id":                   cs._company_id(company_linkedin),
             "company_linkedin_url": company_linkedin,
-            "org_id":              org_id,
-            "raw_data":            json.dumps(bd_data, default=str),
-            "last_enriched_at":    datetime.now(timezone.utc).isoformat(),
-            "updated_at":          datetime.now(timezone.utc).isoformat(),
+            "org_id":               org_id,
+            "raw_data":             json.dumps(bd_data, default=str),
+            "last_enriched_at":     datetime.now(timezone.utc).isoformat(),
+            "updated_at":           datetime.now(timezone.utc).isoformat(),
         }
         cs._map_bd_company_profile(bd_data, record)
         await cs._upsert_company(record)
@@ -1763,8 +1838,8 @@ async def company_enrichment(body: ViewCompanyRequest):
     ai_enrichment = await _enrich_company_with_ai(bd_data)
 
     return {
-        "lead_id":          lead.get("id"),
-        "linkedin_url":     lead.get("linkedin_url"),
+        "lead_id":          lead.get("id") if lead else None,
+        "linkedin_url":     lead.get("linkedin_url") if lead else None,
         "company_linkedin": company_linkedin,
         "brightdata":       bd_data,
         "ai_enrichment":    ai_enrichment,

@@ -639,123 +639,212 @@ def _compact(data: dict, max_chars: int = 4000) -> str:
 # Each function receives raw_data (the scraped profile/website dict) and returns
 # a ready-to-use plain-text system prompt string.
 
-_WRITER_SYSTEM = (
-    "You are a senior prompt engineer specialising in B2B sales AI systems. "
-    "Your job is to write rich, ready-to-use system prompts for an AI assistant. "
-    "The prompts must be written in second person ('You are…'), incorporate the "
-    "specific data provided, be concise and actionable. "
-    "Output ONLY the system prompt text — no preamble, no explanation, no markdown fences."
-)
-
-
 async def prompt_identity(raw: dict) -> str:
+    system = (
+        "You are a professional B2B intelligence writer. "
+        "Your job is to write a clear, accurate identity snapshot of a sales prospect. "
+        "Cover: full name, current title, company, location, years in role, career background, and a "
+        "2–3 sentence professional summary that captures who this person is and why they matter. "
+        "Be factual, specific, and avoid generic filler. "
+        "Output ONLY the system prompt text — no preamble, no explanation, no markdown fences."
+    )
     user = (
-        "Write a system prompt for an AI that will present this lead's professional identity. "
-        "Include their full name, current title, company, location, and a 2–3 sentence professional summary. "
-        "The prompt should instruct the AI to introduce the lead clearly and accurately.\n\n"
+        "Using the profile data below, write a system prompt that instructs an AI to introduce this lead "
+        "with a precise professional identity snapshot. Embed the actual name, title, company, and key "
+        "career facts so the output is specific to this person — not a template.\n\n"
         f"Profile data:\n{_compact(raw)}"
     )
-    return await _call_llm_generate(_WRITER_SYSTEM, user)
+    return await _call_llm_generate(system, user)
 
 
 async def prompt_contact(raw: dict) -> str:
+    system = (
+        "You are a B2B data quality specialist. "
+        "Your job is to present a lead's contact information clearly and with confidence scoring. "
+        "Cover: work email (with verified/guessed/not-found status), personal email, direct phone, "
+        "LinkedIn URL, Twitter/X handle, and any other reachable channels. "
+        "Flag low-confidence data explicitly. Never invent contact details. "
+        "Output ONLY the system prompt text — no preamble, no explanation, no markdown fences."
+    )
     user = (
-        "Write a system prompt for an AI that will present this lead's contact information. "
-        "Include email, phone, LinkedIn URL, Twitter/X handle, and any other relevant contact details. "
-        "The prompt should instruct the AI to present contact data clearly, noting confidence levels.\n\n"
+        "Using the profile data below, write a system prompt that instructs an AI to present this lead's "
+        "contact information. Mention which specific channels are available for this person and how "
+        "confident we are in each. Make the prompt actionable for a sales rep who needs to reach out.\n\n"
         f"Profile data:\n{_compact(raw)}"
     )
-    return await _call_llm_generate(_WRITER_SYSTEM, user)
+    return await _call_llm_generate(system, user)
 
 
 async def prompt_scores(raw: dict) -> str:
+    system = (
+        "You are a B2B lead scoring expert. "
+        "Your job is to score a prospect across four dimensions and explain your reasoning. "
+        "Scoring breakdown: ICP Fit (0–40) — role, seniority, company size, industry match; "
+        "Intent Score (0–30) — hiring activity, funding, job change, tech adoption signals; "
+        "Timing Score (0–20) — recency of signals, urgency indicators; "
+        "Engagement Score (0–10) — LinkedIn activity, content engagement, responsiveness signals. "
+        "Assign a tier: Hot (80–100) / Warm (55–79) / Cool (30–54) / Cold (0–29). "
+        "Be data-driven. Ground every score in observable facts from the profile. "
+        "Output ONLY the system prompt text — no preamble, no explanation, no markdown fences."
+    )
     user = (
-        "Write a system prompt for an AI that will score this lead. "
-        "The AI should compute: ICP Fit Score (0–40), Intent Score (0–30), Timing Score (0–20), "
-        "Engagement Score (0–10), and a Total Score (0–100). It should assign a tier "
-        "(Hot/Warm/Cool/Cold) and write a 2-sentence score explanation. "
-        "Ground the scoring rubric in the specific facts about this lead.\n\n"
+        "Using the profile data below, write a system prompt that instructs an AI to score this specific "
+        "lead. Embed the observable signals from this lead's data (role, company size, hiring signals, "
+        "activity) so the AI produces a score that reflects reality — not a generic rubric.\n\n"
         f"Profile data:\n{_compact(raw)}"
     )
-    return await _call_llm_generate(_WRITER_SYSTEM, user)
+    return await _call_llm_generate(system, user)
 
 
 async def prompt_icp_match(raw: dict) -> str:
+    system = (
+        "You are an ICP (Ideal Customer Profile) analyst for a B2B SaaS company. "
+        "Your job is to assess how well a prospect matches the ideal customer. "
+        "Evaluate: seniority and decision-making authority, company size and growth stage, "
+        "industry and vertical fit, tech stack alignment, budget signals, and geographic fit. "
+        "Assign a match tier: Strong Fit / Moderate Fit / Weak Fit / No Fit. "
+        "List the top 3 fit reasons and top 2 gaps. Be honest about mismatches. "
+        "Output ONLY the system prompt text — no preamble, no explanation, no markdown fences."
+    )
     user = (
-        "Write a system prompt for an AI that will assess this lead's ICP (Ideal Customer Profile) fit. "
-        "The AI should identify fit reasons, gaps, decision-maker likelihood, budget authority, "
-        "and assign an ICP match tier (Strong/Moderate/Weak/No Fit). "
-        "Use specific facts from this lead's profile to make the analysis concrete.\n\n"
+        "Using the profile data below, write a system prompt that instructs an AI to assess this lead's "
+        "ICP fit. Anchor the assessment in this person's actual role, company, and signals — not generic "
+        "criteria. The output should tell a sales rep exactly why to prioritise or deprioritise this lead.\n\n"
         f"Profile data:\n{_compact(raw)}"
     )
-    return await _call_llm_generate(_WRITER_SYSTEM, user)
+    return await _call_llm_generate(system, user)
 
 
 async def prompt_behavioural_signals(raw: dict) -> str:
+    system = (
+        "You are a B2B intent data analyst. "
+        "Your job is to surface buying signals and behavioural triggers that indicate purchase readiness. "
+        "Detect and categorise: funding events (Series A/B/C, grants), hiring surges (roles and departments), "
+        "leadership changes (new CTO/VP/Head), product launches or rebrands, competitor mentions, "
+        "LinkedIn post topics and engagement patterns, news coverage, and technology adoption signals. "
+        "Rate the overall signal strength: Strong / Moderate / Weak. "
+        "Flag the single most actionable signal at the top. "
+        "Output ONLY the system prompt text — no preamble, no explanation, no markdown fences."
+    )
     user = (
-        "Write a system prompt for an AI that will identify behavioural and intent signals for this lead. "
-        "The AI should detect: funding events, hiring surges, job changes, LinkedIn activity, "
-        "news mentions, product launches, competitor usage, and warm signals. "
-        "Anchor the prompt in real signals visible in this lead's data.\n\n"
+        "Using the profile data below, write a system prompt that instructs an AI to identify the real "
+        "behavioural and intent signals present for this specific lead. Reference the actual signals "
+        "visible in their data so the AI output is specific and actionable — not a generic checklist.\n\n"
         f"Profile data:\n{_compact(raw)}"
     )
-    return await _call_llm_generate(_WRITER_SYSTEM, user)
+    return await _call_llm_generate(system, user)
 
 
 async def prompt_pitch_intelligence(raw: dict) -> str:
+    system = (
+        "You are a B2B sales strategist. "
+        "Your job is to build tactical pitch intelligence for a specific prospect. "
+        "Analyse the prospect and produce: "
+        "1. Primary pain point — the #1 business problem they likely face given their role and company stage. "
+        "2. 3 value propositions — each mapped directly to a specific pain, with a one-line ROI/outcome statement. "
+        "3. Best pitch angle — choose one: ROI / Speed to value / Risk reduction / Competitive advantage. "
+        "4. Top 2 likely objections with sharp, specific rebuttals. "
+        "5. 3 conversation starters — questions that open discovery without sounding scripted. "
+        "Be concise, tactical, and sales-ready. No fluff. "
+        "Output ONLY the system prompt text — no preamble, no explanation, no markdown fences."
+    )
     user = (
-        "Write a system prompt for an AI sales coach that will generate pitch intelligence for this lead. "
-        "The AI should identify the primary pain point, 3 personalised value propositions, "
-        "the best pitch angle, likely objections with responses, and 3 conversation starters. "
-        "Make it hyper-personalised to this specific person and their company.\n\n"
+        "Using the profile data below, write a system prompt that instructs an AI to generate pitch "
+        "intelligence for this specific prospect. Embed their actual role, company context, and visible "
+        "signals so every output — pain points, value props, objections — is hyper-personalised.\n\n"
         f"Profile data:\n{_compact(raw)}"
     )
-    return await _call_llm_generate(_WRITER_SYSTEM, user)
+    return await _call_llm_generate(system, user)
 
 
 async def prompt_activity(raw: dict) -> str:
+    system = (
+        "You are a social intelligence analyst for B2B sales. "
+        "Your job is to interpret a prospect's recent professional activity and extract sales-relevant insights. "
+        "Analyse: topics they post or comment about, content they engage with (likes/shares), "
+        "posting frequency and consistency, tone (thought leader / lurker / promoter), "
+        "recent interactions that reveal priorities or pain points, and last active date. "
+        "Conclude with: what this activity tells us about their current focus and the best hook to use. "
+        "Output ONLY the system prompt text — no preamble, no explanation, no markdown fences."
+    )
     user = (
-        "Write a system prompt for an AI that will summarise this lead's recent professional activity. "
-        "The AI should extract recent posts, interactions, activity themes, posting frequency, "
-        "and last active date. Reference the actual activity data available for this lead.\n\n"
+        "Using the profile data below, write a system prompt that instructs an AI to analyse this lead's "
+        "actual activity patterns. Reference their real posts, likes, and interaction themes so the AI "
+        "produces insight relevant to this specific person — not a generic activity template.\n\n"
         f"Profile data:\n{_compact(raw)}"
     )
-    return await _call_llm_generate(_WRITER_SYSTEM, user)
+    return await _call_llm_generate(system, user)
 
 
 async def prompt_tags(raw: dict) -> str:
+    system = (
+        "You are a CRM data architect specialising in B2B lead classification. "
+        "Your job is to generate precise, useful tags that help sales teams filter and segment leads. "
+        "Produce four tag sets: "
+        "auto_tags (5–10 tags: role type, seniority, industry, company stage — e.g. 'VP Engineering', 'Series B', 'SaaS'), "
+        "company_tags (3–5 tags describing the company — e.g. 'Scale-up', 'Remote-first', 'AI-native'), "
+        "persona_tags (3–5 tags describing the person's buyer persona — e.g. 'Technical Buyer', 'Budget Holder'), "
+        "intent_tags (2–4 tags for current intent signals — e.g. 'Hiring Now', 'Recently Funded', 'Switching Stack'). "
+        "Tags must be concise (1–3 words), consistent, and CRM-friendly. "
+        "Output ONLY the system prompt text — no preamble, no explanation, no markdown fences."
+    )
     user = (
-        "Write a system prompt for an AI that will auto-tag this lead for CRM categorisation. "
-        "The AI should generate: auto_tags (5–10 concise tags like 'SaaS', 'Series A', 'VP Engineering'), "
-        "company_tags, persona_tags, and intent_tags. "
-        "Base the tagging logic on this lead's specific profile and company.\n\n"
+        "Using the profile data below, write a system prompt that instructs an AI to generate CRM tags "
+        "for this lead. Ground the tagging logic in their actual role, company size, industry, and "
+        "visible signals — so the tags are accurate and immediately useful for segmentation.\n\n"
         f"Profile data:\n{_compact(raw)}"
     )
-    return await _call_llm_generate(_WRITER_SYSTEM, user)
+    return await _call_llm_generate(system, user)
 
 
 async def prompt_outreach(raw: dict) -> str:
+    system = (
+        "You are a B2B outreach copywriter who specialises in cold email and LinkedIn messaging. "
+        "Your job is to craft hyper-personalised outreach that gets replies. "
+        "Produce: "
+        "1. Email subject line — curiosity-driven, under 8 words, no spam triggers. "
+        "2. Cold email — 3 short paragraphs, under 150 words total: "
+        "   Para 1: specific observation about them or their company (not generic flattery). "
+        "   Para 2: one relevant problem we solve + one concrete outcome (with number if possible). "
+        "   Para 3: low-friction CTA (not 'book a demo'). "
+        "3. LinkedIn connection note — under 300 chars, conversational, no pitch. "
+        "4. Best channel: Email / LinkedIn / Phone. "
+        "5. Best send time (day + time in their timezone). "
+        "6. Primary angle: Pain-based / Insight / Trigger event / Mutual connection. "
+        "Never use buzzwords like 'synergy', 'game-changer', 'innovative solution'. "
+        "Output ONLY the system prompt text — no preamble, no explanation, no markdown fences."
+    )
     user = (
-        "Write a system prompt for an AI copywriter that will generate personalised outreach for this lead. "
-        "The AI should produce: a compelling email subject line, a 3-paragraph cold email (under 150 words), "
-        "a LinkedIn connection note (under 300 chars), the best outreach channel, best send time, "
-        "and the primary outreach angle. "
-        "Make all copy hyper-personalised using this lead's specific signals and background.\n\n"
+        "Using the profile data below, write a system prompt that instructs an AI copywriter to generate "
+        "outreach for this specific lead. Embed their name, company, role, and the strongest signal from "
+        "their data so every piece of copy references something real about them.\n\n"
         f"Profile data:\n{_compact(raw)}"
     )
-    return await _call_llm_generate(_WRITER_SYSTEM, user)
+    return await _call_llm_generate(system, user)
 
 
 async def prompt_person_analysis(raw: dict) -> str:
+    system = (
+        "You are a sales psychologist and B2B buyer profiler. "
+        "Your job is to build a deep person analysis that helps sales reps communicate more effectively. "
+        "Assess: "
+        "1. Communication style — Direct / Analytical / Expressive / Amiable (with evidence from their profile). "
+        "2. Decision-making pattern — Data-driven / Relationship-driven / Speed-driven / Consensus-driven. "
+        "3. Primary motivations — career growth / team impact / cost saving / innovation / risk avoidance. "
+        "4. Likely objections rooted in personality (not just price/timing). "
+        "5. How to build rapport quickly — what topics resonate, what to avoid. "
+        "6. Influence level — final decision-maker / strong influencer / end user / gatekeeper. "
+        "7. Risk appetite — conservative / moderate / aggressive. "
+        "Be specific. Use their actual career history, posts, and company context as evidence. "
+        "Output ONLY the system prompt text — no preamble, no explanation, no markdown fences."
+    )
     user = (
-        "Write a system prompt for an AI that will perform a deep person analysis for sales intelligence. "
-        "The AI should assess: personality type, communication style "
-        "(Direct/Analytical/Expressive/Amiable), motivations, decision-making style, "
-        "professional values, career trajectory, influence level, and risk appetite. "
-        "Tailor the analysis framework to the actual background of this person.\n\n"
+        "Using the profile data below, write a system prompt that instructs an AI to perform a deep person "
+        "analysis for sales intelligence on this specific individual. Anchor every dimension — communication "
+        "style, motivations, decision pattern — in real evidence from their profile and career history.\n\n"
         f"Profile data:\n{_compact(raw)}"
     )
-    return await _call_llm_generate(_WRITER_SYSTEM, user)
+    return await _call_llm_generate(system, user)
 
 
 # ── Section registry ───────────────────────────────────────────────────────────

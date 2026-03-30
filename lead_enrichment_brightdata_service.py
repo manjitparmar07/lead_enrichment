@@ -1019,6 +1019,37 @@ async def check_existing_lead(linkedin_url: str, org_id: str) -> Optional[dict]:
     return lead
 
 
+async def check_existing_leads_batch(linkedin_urls: list[str], org_id: str) -> dict[str, dict]:
+    """
+    Batch version of check_existing_lead — single DB query for N URLs.
+    Returns a dict of {lead_id: lead_row} for all URLs already enriched for this org.
+    Stale flag (_stale) is set per row same as check_existing_lead.
+    """
+    if not linkedin_urls:
+        return {}
+    from datetime import datetime, timezone, timedelta
+    lead_ids = [_lead_id(_normalize_linkedin_url(u)) for u in linkedin_urls]
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM enriched_leads WHERE id = ANY($1) AND organization_id=$2",
+            lead_ids, org_id,
+        )
+    result: dict[str, dict] = {}
+    for row in rows:
+        lead = dict(row)
+        enriched_at = lead.get("enriched_at") or lead.get("created_at", "")
+        stale = False
+        try:
+            ea = datetime.fromisoformat(str(enriched_at).replace("Z", "+00:00"))
+            stale = (datetime.now(timezone.utc) - ea) > timedelta(days=_CACHE_TTL_DAYS)
+        except Exception:
+            pass
+        lead["_cache_hit"] = True
+        lead["_stale"] = stale
+        result[lead["id"]] = lead
+    return result
+
+
 async def get_stale_leads(
     org_id: str,
     older_than_days: int = 90,
