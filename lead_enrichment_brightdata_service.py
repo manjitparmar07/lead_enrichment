@@ -3451,11 +3451,13 @@ async def build_comprehensive_enrichment(
     contact: dict,
     website_intel: dict = None,
     org_id: str = "default",
+    system_prompt_override: Optional[str] = None,
 ) -> dict:
     """
     Main LLM call to produce the full 8-stage enrichment JSON.
     System prompt and model are read from the org's LIO config (workspace_configs).
     Falls back to a rule-based assembly if LLM is unavailable.
+    If system_prompt_override is provided it takes precedence over the config value.
     """
     from enrichment_config_service import get_workspace_config, get_scoring_config
 
@@ -3471,6 +3473,10 @@ async def build_comprehensive_enrichment(
     except Exception:
         system_prompt  = _DEFAULT_SYSTEM
         model_override = None
+
+    # Caller-supplied system prompt takes priority over config
+    if system_prompt_override and system_prompt_override.strip():
+        system_prompt = system_prompt_override.strip()
 
     try:
         scoring_cfg = await get_scoring_config(org_id)
@@ -4338,6 +4344,7 @@ async def enrich_single(
     tools: Optional[dict] = None,
     sso_id: str = "",
     forward_to_lio: bool = False,
+    system_prompt: Optional[str] = None,
 ) -> dict:
     """
     Sequential 8-stage enrichment waterfall:
@@ -4518,7 +4525,7 @@ async def enrich_single(
 
     # Step 7: Comprehensive LLM enrichment → 8-stage JSON + LIO pipeline
     logger.info("[Stage 7] Scoring — LLM enrichment starting")
-    enrichment = await build_comprehensive_enrichment(url, profile, contact, website_intel=website_intel, org_id=org_id)
+    enrichment = await build_comprehensive_enrichment(url, profile, contact, website_intel=website_intel, org_id=org_id, system_prompt_override=system_prompt)
 
     logger.info("[Stage 8] Outreach — generating personalized sequence")
 
@@ -5269,6 +5276,7 @@ async def enrich_bulk(
     org_id: str = "default",
     sso_id: str = "",
     forward_to_lio: bool = False,
+    system_prompt: Optional[str] = None,
 ) -> dict:
     """
     Bulk enrichment pipeline — multi-tenant aware.
@@ -5331,6 +5339,7 @@ async def enrich_bulk(
                     generate_outreach=True,
                     sso_id=sso_id,
                     forward_to_lio=forward_to_lio,
+                    system_prompt=system_prompt,
                 )
                 await _update_job(job_id, status="running")
                 job["status"] = "running"
@@ -5352,7 +5361,7 @@ async def enrich_bulk(
             "[BulkEnrich] Starting in-process batch for %d URLs → %d chunks (org=%s)",
             len(urls), len(url_chunks), org_id,
         )
-        asyncio.create_task(_process_sequential_batch(job_id, url_chunks, sub_job_ids, org_id=org_id, sso_id=sso_id, forward_to_lio=forward_to_lio))
+        asyncio.create_task(_process_sequential_batch(job_id, url_chunks, sub_job_ids, org_id=org_id, sso_id=sso_id, forward_to_lio=forward_to_lio, system_prompt=system_prompt))
 
     return job
 
@@ -5364,6 +5373,7 @@ async def _process_sequential_batch(
     org_id: str = "default",
     sso_id: str = "",
     forward_to_lio: bool = False,
+    system_prompt: Optional[str] = None,
 ) -> None:
     """
     In-process sequential bulk enrichment — fallback when Redis is unavailable.
@@ -5382,7 +5392,7 @@ async def _process_sequential_batch(
         chunk_ok = chunk_fail = 0
         for i, url in enumerate(chunk):
             try:
-                lead = await enrich_single(url, job_id=job_id, org_id=org_id, sso_id=sso_id, forward_to_lio=forward_to_lio)
+                lead = await enrich_single(url, job_id=job_id, org_id=org_id, sso_id=sso_id, forward_to_lio=forward_to_lio, system_prompt=system_prompt)
                 chunk_ok += 1
                 logger.info(
                     "[BulkBatch] Chunk %d/%d · URL %d/%d OK: %s",

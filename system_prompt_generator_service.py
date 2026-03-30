@@ -41,6 +41,7 @@ def _k(name: str, default: str = "") -> str:
 
 def _bd_api_key()         -> str: return _k("BRIGHT_DATA_API_KEY")
 def _bd_profile_dataset() -> str: return _k("BD_PROFILE_DATASET_ID", "gd_l1viktl72bvl7bjuj0")
+def _bd_company_dataset() -> str: return _k("BD_COMPANY_DATASET_ID", "gd_l1vikfnt1wgvvqz95w")
 def _groq_key()           -> str: return _k("GROQ_API_KEY")
 def _groq_gen_model()     -> str: return _k("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")
 def _wb_llm_host()        -> str: return _k("WB_LLM_HOST", "http://ai-llm.worksbuddy.ai")
@@ -76,7 +77,9 @@ def _get_web_client() -> httpx.AsyncClient:
 
 # ── LinkedIn URL normalisation ─────────────────────────────────────────────────
 
-_LI_RE = re.compile(r"linkedin\.com/in/([^/?#\s]+)", re.IGNORECASE)
+_LI_RE         = re.compile(r"linkedin\.com/in/([^/?#\s]+)", re.IGNORECASE)
+_LI_COMPANY_RE = re.compile(r"linkedin\.com/company/([^/?#\s]+)", re.IGNORECASE)
+
 
 def _normalize_linkedin(url: str) -> str:
     m = _LI_RE.search(url)
@@ -85,8 +88,20 @@ def _normalize_linkedin(url: str) -> str:
     return f"https://www.linkedin.com/in/{m.group(1).rstrip('/')}/"
 
 
+def _normalize_linkedin_company(url: str) -> str:
+    m = _LI_COMPANY_RE.search(url)
+    if not m:
+        return url.strip()
+    # Always use www — strips country subdomains (in., nl., fr., etc.)
+    return f"https://www.linkedin.com/company/{m.group(1).rstrip('/')}/"
+
+
 def is_linkedin_url(url: str) -> bool:
     return bool(_LI_RE.search(url))
+
+
+def is_linkedin_company_url(url: str) -> bool:
+    return bool(_LI_COMPANY_RE.search(url))
 
 
 # ── Phase 1: Scrape ────────────────────────────────────────────────────────────
@@ -141,14 +156,114 @@ async def scrape_linkedin_profile(linkedin_url: str) -> dict:
     return profiles[0]
 
 
+async def _poll_bd_snapshot(snapshot_id: str, api_key: str, interval: int = 5, timeout: int = 120) -> list[dict]:
+    """Poll /progress/{snapshot_id} until ready, then fetch /snapshot/{snapshot_id}."""
+    deadline = time.monotonic() + timeout
+    headers  = {"Authorization": f"Bearer {api_key}"}
+    client   = _get_bd_client()
+    while time.monotonic() < deadline:
+        await asyncio.sleep(interval)
+        st = await client.get(f"{BD_BASE}/progress/{snapshot_id}", headers=headers)
+        st.raise_for_status()
+        state = st.json().get("status") or st.json().get("state", "")
+        if state == "ready":
+            res = await client.get(
+                f"{BD_BASE}/snapshot/{snapshot_id}",
+                headers=headers,
+                params={"format": "json"},
+            )
+            res.raise_for_status()
+            data = res.json()
+            return data if isinstance(data, list) else [data]
+        if state in ("failed", "error"):
+            raise RuntimeError(f"BrightData snapshot {snapshot_id} failed: {st.json()}")
+    raise TimeoutError(f"BrightData snapshot {snapshot_id} not ready after {timeout}s")
+
+
+async def scrape_linkedin_company(linkedin_url: str) -> dict:
+    """
+    Fetch company profile from BrightData company dataset.
+
+    Attempt 1 — sync /scrape (immediate data)
+    Attempt 2 — poll snapshot_id returned by /scrape
+    Attempt 3 — /trigger → poll /progress → /snapshot
+    """
+    api_key    = _bd_api_key()
+    dataset_id = _bd_company_dataset()
+    if not api_key:
+        raise RuntimeError("BRIGHT_DATA_API_KEY not configured")
+
+    url_norm = _normalize_linkedin_company(linkedin_url)
+    headers  = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    client   = _get_bd_client()
+
+    logger.info("[SPG Company] Scraping %s (dataset=%s)", url_norm, dataset_id)
+
+    # ── Attempt 1: sync /scrape ────────────────────────────────────────────────
+    snapshot_id = None
+    try:
+        resp = await client.post(
+            f"{BD_BASE}/scrape",
+            params={"dataset_id": dataset_id, "format": "json"},
+            headers=headers,
+            json=[{"url": url_norm}],
+        )
+        if resp.status_code in (200, 202):
+            body = resp.json()
+            rows = body if isinstance(body, list) else [body]
+            companies = [r for r in rows if not r.get("error") and (r.get("name") or r.get("company_name") or r.get("description"))]
+            if companies:
+                logger.info("[SPG Company] Sync /scrape OK for %s", url_norm)
+                return _normalize_company_from_bd(companies[0], url_norm)
+            # Async job started — grab snapshot_id
+            for row in rows:
+                if isinstance(row, dict) and row.get("snapshot_id"):
+                    snapshot_id = row["snapshot_id"]
+                    break
+            if isinstance(body, dict) and body.get("snapshot_id"):
+                snapshot_id = body["snapshot_id"]
+    except Exception as e:
+        logger.warning("[SPG Company] /scrape error: %s", e)
+
+    # ── Attempt 2: poll snapshot from /scrape response ─────────────────────────
+    if snapshot_id:
+        try:
+            rows = await _poll_bd_snapshot(snapshot_id, api_key)
+            companies = [r for r in rows if not r.get("error") and (r.get("name") or r.get("company_name"))]
+            if companies:
+                logger.info("[SPG Company] Async poll OK for %s", url_norm)
+                return _normalize_company_from_bd(companies[0], url_norm)
+        except Exception as e:
+            logger.warning("[SPG Company] Snapshot poll failed: %s", e)
+
+    # ── Attempt 3: /trigger → poll /progress → /snapshot ──────────────────────
+    logger.info("[SPG Company] Falling back to /trigger for %s", url_norm)
+    tr = await client.post(
+        f"{BD_BASE}/trigger",
+        params={"dataset_id": dataset_id, "format": "json", "include_errors": "true"},
+        headers=headers,
+        json=[{"url": url_norm}],
+    )
+    tr.raise_for_status()
+    snap_id = tr.json().get("snapshot_id") or tr.json().get("id")
+    if not snap_id:
+        raise RuntimeError(f"BrightData /trigger returned no snapshot_id: {tr.text[:300]}")
+
+    rows = await _poll_bd_snapshot(snap_id, api_key)
+    companies = [r for r in rows if not r.get("error") and (r.get("name") or r.get("company_name"))]
+    if not companies:
+        raise RuntimeError(f"BrightData returned only errors for {url_norm}: {rows[0] if rows else 'empty'}")
+    return _normalize_company_from_bd(companies[0], url_norm)
+
+
 async def scrape_website(website_url: str) -> dict:
     """Scrape homepage + /about, return structured text dict with LLM-extracted fields."""
     client = _get_web_client()
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; WorksBuddy/1.0)"}
+    http_headers = {"User-Agent": "Mozilla/5.0 (compatible; WorksBuddy/1.0)"}
 
     async def _fetch(url: str) -> tuple[str, str]:
         try:
-            r = await client.get(url, headers=headers)
+            r = await client.get(url, headers=http_headers)
             r.raise_for_status()
             html = r.text
         except Exception as e:
@@ -170,46 +285,242 @@ async def scrape_website(website_url: str) -> dict:
 
     desc = ""
     try:
-        r = await client.get(website_url, headers=headers)
+        r = await client.get(website_url, headers=http_headers)
         m = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']', r.text, re.IGNORECASE)
         desc = m.group(1).strip() if m else ""
     except Exception:
         pass
 
-    raw = {
-        "url": website_url, "title": title,
-        "description": desc, "homepage_text": homepage, "about_text": about,
-    }
-
     # LLM extraction — pull structured fields from the raw page text
     combined_text = f"{homepage}\n\n{about}"[:6000]
     extract_system = (
         "You are a data extraction assistant. Extract structured company information from website text. "
-        "Return ONLY a valid JSON object with these keys (use null if not found, arrays for lists):\n"
-        "company_name, tagline, products (array), services (array), target_audience, industry, "
-        "key_features (array of short phrases), company_size, founded_year, location, social_links (object with keys like linkedin/twitter/facebook)"
+        "Return ONLY a valid JSON object with these exact keys (use null if not found, arrays for lists):\n"
+        "company_name, company_description, company_slogan, industry, hq_location, founded_year, "
+        "employee_count, organization_type, funding_stage, total_funding, "
+        "specialties (array of strings), products (array of strings), services (array of strings), "
+        "target_audience, key_features (array of short phrases), "
+        "company_email, company_phone, company_twitter, crunchbase_url, "
+        "social_links (object with keys: linkedin, twitter, facebook, instagram, youtube)"
     )
     extract_user = (
-        f"Extract company information from this website text:\n\nURL: {website_url}\nTitle: {title}\nMeta description: {desc}\n\n{combined_text}"
+        f"Extract company information from this website text:\n\n"
+        f"URL: {website_url}\nTitle: {title}\nMeta description: {desc}\n\n{combined_text}"
     )
+    extracted: dict = {}
     try:
         llm_raw = await _call_llm(extract_system, extract_user, groq_model="llama-3.1-8b-instant", max_tokens=1500)
-        # Strip markdown fences if present
         llm_clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", llm_raw.strip(), flags=re.MULTILINE)
-        extracted = json.loads(llm_clean)
-        if isinstance(extracted, dict):
-            raw.update({k: v for k, v in extracted.items() if v is not None})
+        parsed_llm = json.loads(llm_clean)
+        if isinstance(parsed_llm, dict):
+            extracted = {k: v for k, v in parsed_llm.items() if v is not None}
     except Exception as e:
         logger.warning("[SPG] LLM extraction failed for %s: %s", website_url, e)
 
-    return raw
+    return _normalize_company_from_website(website_url, title, desc, extracted)
+
+
+# ── Unified company profile normalizers ────────────────────────────────────────
+
+_SOCIAL_DOMAINS = {"linkedin.com", "facebook.com", "twitter.com", "x.com", "instagram.com", "youtube.com"}
+
+
+def _safe_int(v) -> int:
+    try:
+        return int(v) if v else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _normalize_company_from_bd(c: dict, linkedin_url: str = "") -> dict:
+    """Map raw BrightData company record → unified company profile schema."""
+    out: dict = {"source": "linkedin_company"}
+
+    out["company_name"] = c.get("name") or c.get("company_name") or ""
+    out["company_linkedin_url"] = linkedin_url or c.get("url") or c.get("linkedin_url") or ""
+
+    # Website
+    website = (
+        c.get("website") or c.get("website_url") or c.get("company_website")
+        or c.get("homepage") or ""
+    )
+    if website:
+        m = re.search(r"https?://(?:www\.)?([^/?\s]+)", website)
+        if m and not any(m.group(1).lower() == s or m.group(1).lower().endswith("." + s) for s in _SOCIAL_DOMAINS):
+            out["company_website"] = website
+    out.setdefault("company_website", "")
+
+    out["company_logo"] = (
+        c.get("logo") or c.get("logo_url") or c.get("company_logo")
+        or c.get("profile_pic_url") or c.get("image_url") or ""
+    )
+    out["company_description"] = str(
+        c.get("description") or c.get("about") or c.get("company_description")
+        or c.get("summary") or c.get("overview") or ""
+    )[:800]
+    out["company_slogan"] = str(c.get("slogan") or c.get("tagline") or "")[:200]
+
+    # Industry
+    ind = c.get("industry") or c.get("industries") or c.get("category") or ""
+    out["industry"] = ind[0] if isinstance(ind, list) else str(ind)
+
+    # Location
+    hq = c.get("headquarters") or c.get("hq_location") or c.get("location") or ""
+    if isinstance(hq, dict):
+        parts = [hq.get("city", ""), hq.get("region", ""), hq.get("country", "")]
+        out["hq_location"] = ", ".join(p for p in parts if p)
+    else:
+        out["hq_location"] = str(hq)
+
+    out["founded_year"] = str(c.get("founded") or c.get("founded_year") or c.get("founded_on") or "")
+
+    # Employee count
+    emp = 0
+    if isinstance(c.get("employees_in_linkedin"), (int, float)) and c["employees_in_linkedin"] > 0:
+        emp = int(c["employees_in_linkedin"])
+    else:
+        for f in ("employee_count", "staff_count"):
+            n = _safe_int(c.get(f))
+            if n > 0:
+                emp = n
+                break
+        if not emp:
+            size_str = str(c.get("company_size") or "")
+            nums = re.findall(r"\d+", size_str.replace(",", ""))
+            emp = int(nums[-1]) if nums else 0
+    out["employee_count"] = emp
+
+    out["linkedin_followers"] = _safe_int(c.get("followers") or c.get("followers_count"))
+    out["organization_type"]  = str(c.get("organization_type") or c.get("org_type") or c.get("type") or "")
+
+    # Funding
+    funding_obj = c.get("funding") if isinstance(c.get("funding"), dict) else {}
+    out["funding_stage"]    = str(funding_obj.get("last_round_type") or c.get("funding_stage") or "")
+    out["total_funding"]    = str(funding_obj.get("last_round_raised") or c.get("total_funding") or "")
+    last_fd = funding_obj.get("last_round_date") or c.get("last_funding_date") or ""
+    out["last_funding_date"] = str(last_fd)[:10]
+
+    # Specialties → same key as website "specialties"
+    specs = c.get("specialties") or c.get("specializations") or []
+    if isinstance(specs, str):
+        out["specialties"] = [s.strip() for s in specs.split(",") if s.strip()][:15]
+    else:
+        out["specialties"] = list(specs)[:15]
+
+    # Products / services — BD doesn't have these explicitly; derive from specialties
+    out["products"]        = []
+    out["services"]        = out["specialties"][:]
+    out["target_audience"] = ""
+    out["key_features"]    = out["specialties"][:5]
+
+    out["company_email"]   = str(c.get("email") or c.get("company_email") or "")
+    out["company_phone"]   = str(c.get("phone") or c.get("phone_number") or c.get("company_phone") or "")
+    out["company_twitter"] = str(c.get("twitter") or c.get("twitter_url") or "")
+    out["crunchbase_url"]  = str(c.get("crunchbase_url") or c.get("crunchbase") or "")
+
+    # Social links
+    social: dict = {}
+    if out["company_linkedin_url"]:
+        social["linkedin"] = out["company_linkedin_url"]
+    if out["company_twitter"]:
+        social["twitter"] = out["company_twitter"]
+    out["social_links"] = social
+
+    # Similar companies
+    similar = c.get("similar") or c.get("similar_companies") or []
+    out["similar_companies"] = [
+        {
+            "name":     s.get("title", ""),
+            "industry": s.get("subtitle", ""),
+            "location": s.get("location", ""),
+            "linkedin": s.get("Links", ""),
+        }
+        for s in similar[:10] if isinstance(s, dict) and s.get("title")
+    ]
+
+    # LinkedIn posts
+    updates = c.get("updates") or c.get("posts") or []
+    out["linkedin_posts"] = [
+        {
+            "post_id":        u.get("post_id", ""),
+            "date":           u.get("date", ""),
+            "text":           (u.get("text") or "")[:500],
+            "likes_count":    u.get("likes_count", 0),
+            "comments_count": u.get("comments_count", 0),
+            "post_url":       u.get("post_url", ""),
+        }
+        for u in updates[:10] if isinstance(u, dict) and (u.get("text") or u.get("post_id"))
+    ]
+
+    return out
+
+
+def _normalize_company_from_website(url: str, title: str, meta_desc: str, llm: dict) -> dict:
+    """Map website LLM-extracted data → unified company profile schema."""
+    out: dict = {"source": "website"}
+
+    out["company_name"]        = str(llm.get("company_name") or title or "")
+    out["company_linkedin_url"] = str((llm.get("social_links") or {}).get("linkedin") or "")
+    out["company_website"]     = url
+    out["company_logo"]        = ""
+    out["company_description"] = str(llm.get("company_description") or meta_desc or "")[:800]
+    out["company_slogan"]      = str(llm.get("company_slogan") or llm.get("tagline") or "")[:200]
+
+    out["industry"]            = str(llm.get("industry") or "")
+    out["hq_location"]         = str(llm.get("hq_location") or llm.get("location") or "")
+    out["founded_year"]        = str(llm.get("founded_year") or "")
+
+    # employee_count — LLM may return int or "51-200" string
+    emp_raw = llm.get("employee_count") or llm.get("company_size") or 0
+    if isinstance(emp_raw, int):
+        out["employee_count"] = emp_raw
+    else:
+        nums = re.findall(r"\d+", str(emp_raw).replace(",", ""))
+        out["employee_count"] = int(nums[-1]) if nums else 0
+
+    out["linkedin_followers"] = 0
+    out["organization_type"]  = str(llm.get("organization_type") or "")
+    out["funding_stage"]      = str(llm.get("funding_stage") or "")
+    out["total_funding"]      = str(llm.get("total_funding") or "")
+    out["last_funding_date"]  = ""
+
+    def _to_list(v) -> list:
+        if not v:
+            return []
+        if isinstance(v, list):
+            return [str(i) for i in v if i]
+        return [str(v)]
+
+    out["specialties"]     = _to_list(llm.get("specialties"))
+    out["products"]        = _to_list(llm.get("products"))
+    out["services"]        = _to_list(llm.get("services"))
+    out["target_audience"] = str(llm.get("target_audience") or "")
+    out["key_features"]    = _to_list(llm.get("key_features"))
+
+    out["company_email"]   = str(llm.get("company_email") or "")
+    out["company_phone"]   = str(llm.get("company_phone") or "")
+    out["company_twitter"] = str(llm.get("company_twitter") or (llm.get("social_links") or {}).get("twitter") or "")
+    out["crunchbase_url"]  = str(llm.get("crunchbase_url") or "")
+
+    social = llm.get("social_links") or {}
+    if out["company_linkedin_url"]:
+        social.setdefault("linkedin", out["company_linkedin_url"])
+    out["social_links"] = {k: str(v) for k, v in social.items() if v}
+
+    out["similar_companies"] = []
+    out["linkedin_posts"]    = []
+
+    return out
 
 
 async def scrape_url(url: str) -> tuple[str, dict]:
     """
-    Scrape a URL and return (source_type, raw_data).
-    source_type is 'linkedin' or 'website'.
+    Scrape a URL and return (source_type, profile).
+    source_type: 'linkedin' | 'linkedin_company' | 'website'
+    All company sources (linkedin_company, website) return the same unified schema.
     """
+    if is_linkedin_company_url(url):
+        return "linkedin_company", await scrape_linkedin_company(url)
     if is_linkedin_url(url):
         return "linkedin", await scrape_linkedin_profile(url)
     return "website", await scrape_website(url)
@@ -271,27 +582,44 @@ async def _call_llm(
         except Exception as e:
             errors.append(f"HuggingFace: {e}")
 
-    # 3. Groq
+    # 3. Groq — try primary model then fallbacks on 429 rate-limit
     g_key = _groq_key()
-    g_mdl = groq_model or _groq_gen_model()
     if g_key:
-        try:
-            async with httpx.AsyncClient(timeout=90) as c:
-                r = await c.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {g_key}"},
-                    json={"model": g_mdl, "messages": messages,
-                          "temperature": temperature, "max_tokens": max_tokens},
-                )
-                if r.is_success:
-                    return r.json()["choices"][0]["message"]["content"].strip()
-                try:
-                    body_txt = r.json().get("error", {}).get("message") or r.text
-                except Exception:
-                    body_txt = r.text
-                errors.append(f"Groq {g_mdl}: HTTP {r.status_code}: {body_txt}")
-        except Exception as e:
-            errors.append(f"Groq {g_mdl}: {e}")
+        primary = groq_model or _groq_gen_model()
+        # Fallback chain: if primary hits rate-limit, try smaller/alternative models
+        groq_models = [primary] + [
+            m for m in [
+                "llama3-70b-8192",
+                "llama-3.1-8b-instant",
+                "gemma2-9b-it",
+                "mixtral-8x7b-32768",
+            ] if m != primary
+        ]
+        for g_mdl in groq_models:
+            try:
+                async with httpx.AsyncClient(timeout=90) as c:
+                    r = await c.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {g_key}"},
+                        json={"model": g_mdl, "messages": messages,
+                              "temperature": temperature, "max_tokens": max_tokens},
+                    )
+                    if r.is_success:
+                        logger.info("[LLM] Groq success with model: %s", g_mdl)
+                        return r.json()["choices"][0]["message"]["content"].strip()
+                    try:
+                        body_txt = r.json().get("error", {}).get("message") or r.text
+                    except Exception:
+                        body_txt = r.text
+                    if r.status_code == 429:
+                        logger.warning("[LLM] Groq %s rate-limited, trying next model", g_mdl)
+                        errors.append(f"Groq {g_mdl}: rate-limited (429)")
+                        continue
+                    errors.append(f"Groq {g_mdl}: HTTP {r.status_code}: {body_txt}")
+                    break  # non-429 error — stop trying more models
+            except Exception as e:
+                errors.append(f"Groq {g_mdl}: {e}")
+                break
 
     raise RuntimeError(" | ".join(errors) if errors else "No LLM provider configured.")
 

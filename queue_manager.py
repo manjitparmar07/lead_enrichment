@@ -216,6 +216,7 @@ async def push_job(
     generate_outreach: bool = True,
     sso_id: str = "",
     forward_to_lio: bool = False,
+    system_prompt: str = "",
 ) -> int:
     """
     Push pre-split URL chunks to the per-tenant queue.
@@ -241,6 +242,7 @@ async def push_job(
             "generate_outreach": generate_outreach,
             "sso_id":            sso_id,
             "forward_to_lio":    forward_to_lio,
+            "system_prompt":     system_prompt or "",
         }
         pipe.rpush(tenant_key, json.dumps(task))
 
@@ -350,6 +352,7 @@ async def _worker(worker_id: int, r: Any) -> None:
             gen_out        = task.get("generate_outreach", True)
             sso_id         = task.get("sso_id", "")
             forward_to_lio = task.get("forward_to_lio", False)
+            system_prompt  = task.get("system_prompt") or None
 
             if not urls:
                 continue
@@ -376,6 +379,7 @@ async def _worker(worker_id: int, r: Any) -> None:
                         generate_outreach_flag=gen_out,
                         sso_id=sso_id,
                         forward_to_lio=forward_to_lio,
+                        system_prompt=system_prompt,
                     )
                     for url in urls
                 ],

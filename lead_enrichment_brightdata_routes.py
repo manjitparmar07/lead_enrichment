@@ -454,6 +454,7 @@ class BulkEnrichRequest(BaseModel):
     token: Optional[str] = None         # Tenant/org token — echoed back in response + webhook
     skip_existing: bool = True          # skip URLs already enriched (< LEAD_CACHE_TTL_DAYS old)
     forward_to_lio: bool = False        # forward enriched leads to LIO (external API callers only)
+    system_prompt: Optional[str] = None  # optional: custom system prompt used during outreach/AI generation per lead
 
     @field_validator("linkedin_urls")
     @classmethod
@@ -765,6 +766,7 @@ async def enrich_bulk(request: Request):
             org_id=org_id,
             sso_id=sso_id,
             forward_to_lio=body.forward_to_lio,
+            system_prompt=body.system_prompt,
         )
         await svc.audit_log(
             org_id, "bulk_submit", job_id=job["id"],
@@ -1292,6 +1294,65 @@ async def delete_note(lead_id: str, note_id: str, request: Request):
 # 3rd parties: always use ?url= — you already have the LinkedIn URL you submitted.
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def _quick_llm(system: str, user: str, max_tokens: int = 2000) -> str:
+    """Lightweight LLM call for view-endpoint AI generation. WB LLM → Groq fallback."""
+    import httpx as _httpx
+    errors = []
+    wb_host = svc._wb_llm_host()
+    wb_key  = svc._wb_llm_key()
+    if wb_host and wb_key:
+        try:
+            async with _httpx.AsyncClient(timeout=60) as c:
+                r = await c.post(
+                    f"{wb_host.rstrip('/')}/v1/chat/completions",
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {wb_key}"},
+                    json={"model": svc._wb_llm_model(),
+                          "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                          "temperature": 0.35, "max_tokens": max_tokens},
+                )
+                if r.is_success:
+                    return r.json()["choices"][0]["message"]["content"].strip()
+                errors.append(f"WB LLM: HTTP {r.status_code}")
+        except Exception as e:
+            errors.append(f"WB LLM: {e}")
+    g_key = svc._groq_key()
+    if g_key:
+        try:
+            async with _httpx.AsyncClient(timeout=60) as c:
+                r = await c.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {g_key}"},
+                    json={"model": svc._groq_model() if hasattr(svc, "_groq_model") else "llama-3.3-70b-versatile",
+                          "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                          "temperature": 0.35, "max_tokens": max_tokens},
+                )
+                if r.is_success:
+                    return r.json()["choices"][0]["message"]["content"].strip()
+                try:
+                    body_txt = r.json().get("error", {}).get("message") or r.text
+                except Exception:
+                    body_txt = r.text
+                errors.append(f"Groq: HTTP {r.status_code}: {body_txt}")
+        except Exception as e:
+            errors.append(f"Groq: {e}")
+    raise RuntimeError(" | ".join(errors) if errors else "No LLM provider configured.")
+
+
+class ViewEmailRequest(BaseModel):
+    leadenrich_id: str
+    system_prompt: Optional[str] = None
+
+
+class ViewOutreachRequest(BaseModel):
+    leadenrich_id: str
+    system_prompt: Optional[str] = None
+
+
+class ViewCompanyRequest(BaseModel):
+    leadenrich_id: str
+    system_prompt: Optional[str] = None
+
+
 def _parse_json_field(lead: dict, key: str, default):
     """Safely parse a JSON string field from a lead row."""
     raw = lead.get(key)
@@ -1384,12 +1445,17 @@ _email_enrich_router = APIRouter(
 
 _EMAIL_DESC = """
 Returns the email enrichment result fetched via the Apollo → Hunter waterfall.
+If no email is stored, a live Apollo → Hunter lookup runs automatically.
 
 **How to call:**
 ```
-GET /api/leads/view/email?url=https://www.linkedin.com/in/johndoe
-GET /api/leads/view/email?lead_id=abc123def456
+POST /api/leads/view/email
+Content-Type: application/json
+
+{ "leadenrich_id": "abc123def456", "system_prompt": "..." }
 ```
+`system_prompt` is optional — omit it to get stored data only.
+When provided, an AI-generated personalised email template is returned in `ai_generated.email_template`.
 
 **Fields returned:**
 - **work_email** — Best verified work email
@@ -1399,18 +1465,17 @@ GET /api/leads/view/email?lead_id=abc123def456
 - **bounce_risk** — low / medium / high
 - **all_emails** — All emails discovered across providers
 - **activity_emails** — Emails extracted from LinkedIn posts/activity
+- **ai_generated** — Present only when `system_prompt` is supplied
 """
 
 
-@_email_enrich_router.get(
+@_email_enrich_router.post(
     "/view/email",
     summary="Email Enrichment",
     description=_EMAIL_DESC,
 )
-async def email_enrichment(
-    leadenrich_id: str = Query(..., description="Lead ID returned from bulk enrichment job results"),
-):
-    lead = await _resolve_lead(leadenrich_id)
+async def email_enrichment(body: ViewEmailRequest):
+    lead = await _resolve_lead(body.leadenrich_id)
     full = _get_full_data(lead)
     person_profile = full.get("person_profile") or {}
 
@@ -1456,7 +1521,25 @@ async def email_enrichment(
                     lead["enrichment_source"] = contact.get("source")
                     lead["phone"]             = lead.get("phone") or contact.get("phone")
             except Exception as _e:
-                logger.warning("[EmailView] Live lookup failed for %s: %s", leadenrich_id, _e)
+                logger.warning("[EmailView] Live lookup failed for %s: %s", body.leadenrich_id, _e)
+
+    # AI-generated email template if system_prompt provided
+    ai_email = None
+    if body.system_prompt and lead.get("name"):
+        try:
+            lead_summary = (
+                f"Lead: {lead.get('name')} | Title: {lead.get('title','')} | "
+                f"Company: {lead.get('company','')} | Email: {lead.get('work_email') or lead.get('email','N/A')} | "
+                f"Location: {lead.get('location','')} | Industry: {lead.get('industry','')}"
+            )
+            ai_email = await _quick_llm(
+                body.system_prompt,
+                f"Write a personalised outreach email for this lead.\n\n{lead_summary}\n\n"
+                "Return JSON: {{\"subject\": \"...\", \"body\": \"...\"}}",
+                max_tokens=1500,
+            )
+        except Exception as _e:
+            logger.warning("[EmailView] AI generation failed: %s", _e)
 
     return {
         "lead_id":    lead.get("id"),
@@ -1479,6 +1562,8 @@ async def email_enrichment(
         ),
         "activity_emails": full.get("activity_emails", []),
         "activity_phones": full.get("activity_phones", []),
+
+        "ai_generated": {"email_template": ai_email} if ai_email else None,
     }
 
 
@@ -1494,9 +1579,13 @@ Returns AI-generated outreach assets for a lead.
 
 **How to call:**
 ```
-GET /api/leads/view/outreach?url=https://www.linkedin.com/in/johndoe
-GET /api/leads/view/outreach?lead_id=abc123def456
+POST /api/leads/view/outreach
+Content-Type: application/json
+
+{ "leadenrich_id": "abc123def456", "system_prompt": "..." }
 ```
+`system_prompt` is optional — omit it to get stored outreach data only.
+When provided, fresh outreach copy is generated live and returned in `ai_generated.outreach`.
 
 **Fields returned:**
 - **cold_email** — Personalised cold email (subject + body)
@@ -1504,19 +1593,19 @@ GET /api/leads/view/outreach?lead_id=abc123def456
 - **sequence** — Multi-step follow-up sequence
 - **best_time** — Recommended send time based on activity
 - **warm_signal** — Latest warm engagement signal
-- **pitch_intelligence** — Key pitch angles and pain-point hooks
+- **best_channel** — Recommended outreach channel
+- **outreach_angle** — Primary pitch angle
+- **ai_generated** — Present only when `system_prompt` is supplied
 """
 
 
-@_outreach_enrich_router.get(
+@_outreach_enrich_router.post(
     "/view/outreach",
     summary="Outreach Enrichment",
     description=_OUTREACH_DESC,
 )
-async def outreach_enrichment(
-    leadenrich_id: str = Query(..., description="Lead ID returned from bulk enrichment job results"),
-):
-    lead   = await _resolve_lead(leadenrich_id)
+async def outreach_enrichment(body: ViewOutreachRequest):
+    lead   = await _resolve_lead(body.leadenrich_id)
     full   = _get_full_data(lead)
     outreach_data = full.get("outreach") or {}
 
@@ -1533,6 +1622,26 @@ async def outreach_enrichment(
     }
     linkedin_note_val = lead.get("linkedin_note") or outreach_data.get("linkedin_note") or ""
     follow_up_block   = {"day3": "", "day7": ""}
+
+    # AI-generated outreach if system_prompt provided
+    ai_outreach = None
+    if body.system_prompt and lead.get("name"):
+        try:
+            lead_ctx = (
+                f"Name: {lead.get('name')} | Title: {lead.get('title','')} | "
+                f"Company: {lead.get('company','')} | Industry: {lead.get('industry','')} | "
+                f"Location: {lead.get('location','')} | Score: {lead.get('lead_score','')} | "
+                f"Warm signal: {lead.get('warm_signal','')} | Pitch: {lead.get('pitch_intelligence','')}"
+            )
+            ai_outreach = await _quick_llm(
+                body.system_prompt,
+                f"Generate personalised B2B outreach for this lead.\n\n{lead_ctx}\n\n"
+                "Return JSON: {{\"cold_email\": {{\"subject\": \"...\", \"body\": \"...\"}}, "
+                "\"linkedin_note\": \"...\", \"best_channel\": \"...\", \"outreach_angle\": \"...\"}}",
+                max_tokens=2000,
+            )
+        except Exception as _e:
+            logger.warning("[OutreachView] AI generation failed: %s", _e)
 
     return {
         "lead_id":      lead.get("id"),
@@ -1551,6 +1660,8 @@ async def outreach_enrichment(
         "best_channel":       lead.get("best_channel"),
         "outreach_angle":     lead.get("outreach_angle"),
         "warm_signal":        lead.get("warm_signal"),
+
+        "ai_generated": {"outreach": ai_outreach} if ai_outreach else None,
     }
 
 
@@ -1566,9 +1677,14 @@ Returns full company enrichment data scraped from the company website and third-
 
 **How to call:**
 ```
-GET /api/leads/view/company?url=https://www.linkedin.com/in/johndoe
-GET /api/leads/view/company?lead_id=abc123def456
+POST /api/leads/view/company
+Content-Type: application/json
+
+{ "leadenrich_id": "abc123def456", "system_prompt": "..." }
 ```
+`system_prompt` is optional — omit it to get stored company data only.
+When provided, an AI-generated account analysis is returned in `ai_generated.company_analysis`
+with keys: fit_summary, key_pain_points, buying_signals, recommended_approach, icp_score.
 
 **Sections returned:**
 - **identity** — Company name, domain, website, LinkedIn, logo
@@ -1578,18 +1694,17 @@ GET /api/leads/view/company?lead_id=abc123def456
 - **intent_signals** — Funding events, job changes, competitor signals
 - **scores** — Company score, tier, combined person+company score
 - **tags** — Company persona tags, culture signals, account pitch
+- **ai_generated** — Present only when `system_prompt` is supplied
 """
 
 
-@_company_enrich_router.get(
+@_company_enrich_router.post(
     "/view/company",
     summary="Company Enrichment",
     description=_COMPANY_DESC,
 )
-async def company_enrichment(
-    leadenrich_id: str = Query(..., description="Lead ID returned from bulk enrichment job results"),
-):
-    lead = await _resolve_lead(leadenrich_id)
+async def company_enrichment(body: ViewCompanyRequest):
+    lead = await _resolve_lead(body.leadenrich_id)
     full = _get_full_data(lead)
 
     return {
@@ -1636,7 +1751,35 @@ async def company_enrichment(
             "culture_signals": _parse_json_field(lead, "culture_signals", {}),
             "account_pitch":   _parse_json_field(lead, "account_pitch", {}),
         },
+
+        "ai_generated": await _company_ai_analysis(lead, full, body.system_prompt),
     }
+
+
+async def _company_ai_analysis(lead: dict, full: dict, system_prompt: Optional[str]) -> Optional[dict]:
+    """Run LLM company analysis when caller provides a system_prompt."""
+    if not system_prompt or not lead.get("company"):
+        return None
+    try:
+        wi = full.get("website_intelligence") or {}
+        company_ctx = (
+            f"Company: {lead.get('company')} | Domain: {lead.get('company_domain','')} | "
+            f"Industry: {lead.get('industry','')} | Employees: {lead.get('employee_count','')} | "
+            f"Revenue: {lead.get('revenue','')} | Location: {lead.get('location','')} | "
+            f"Tech stack: {_parse_json_field(lead, 'wappalyzer_tech', [])} | "
+            f"Website summary: {str(wi)[:800]}"
+        )
+        result = await _quick_llm(
+            system_prompt,
+            f"Analyse this company as a potential sales prospect.\n\n{company_ctx}\n\n"
+            "Return JSON: {{\"fit_summary\": \"...\", \"key_pain_points\": [...], "
+            "\"buying_signals\": [...], \"recommended_approach\": \"...\", \"icp_score\": 0-100}}",
+            max_tokens=1500,
+        )
+        return {"company_analysis": result}
+    except Exception as _e:
+        logger.warning("[CompanyView] AI analysis failed: %s", _e)
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
