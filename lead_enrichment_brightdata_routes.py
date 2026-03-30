@@ -1829,8 +1829,8 @@ async def outreach_enrichment(body: ViewOutreachRequest):
                 try:
                     cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
                     ai_outreach = json.loads(cleaned)
-                except Exception:
-                    ai_outreach = None
+                except Exception as _je:
+                    ai_outreach = {"_error": f"JSON parse failed: {_je} | raw: {raw[:200]}"}
             except Exception as _e:
                 logger.warning("[OutreachView] AI generation failed: %s", _e)
                 ai_outreach = {"_error": str(_e)}  # temporary debug
