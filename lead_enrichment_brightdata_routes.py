@@ -1818,13 +1818,19 @@ async def outreach_enrichment(body: ViewOutreachRequest):
                     f"Career: {career} | "
                     f"About: {str(lead.get('about',''))[:300]}"
                 )
-                ai_outreach = await _quick_llm(
+                raw = await _quick_llm(
                     body.system_prompt,
                     f"Generate personalised B2B outreach for this lead.\n\n{lead_ctx}\n\n"
                     "Return JSON: {{\"cold_email\": {{\"subject\": \"...\", \"body\": \"...\"}}, "
                     "\"linkedin_note\": \"...\", \"best_channel\": \"...\", \"best_time\": \"...\", \"outreach_angle\": \"...\"}}",
                     max_tokens=2000,
                 )
+                # _quick_llm returns raw string — parse JSON
+                try:
+                    cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                    ai_outreach = json.loads(cleaned)
+                except Exception:
+                    ai_outreach = None
             except Exception as _e:
                 logger.warning("[OutreachView] AI generation failed: %s", _e)
 
