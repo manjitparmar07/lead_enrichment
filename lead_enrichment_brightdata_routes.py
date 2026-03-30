@@ -1403,7 +1403,8 @@ class ViewEmailRequest(BaseModel):
 
 
 class ViewOutreachRequest(BaseModel):
-    leadenrich_id: str
+    leadenrich_id: Optional[str] = None
+    lead_data:     Optional[dict] = None   # Full ai_information object — used when leadenrich_id is absent/not found
     system_prompt: Optional[str] = None
 
 
@@ -1436,6 +1437,77 @@ def _parse_json_field(lead: dict, key: str, default):
 
 def _get_full_data(lead: dict) -> dict:
     return _parse_json_field(lead, "full_data", {})
+
+
+def _lead_from_ai_information(data: dict) -> dict:
+    """
+    Map a full ai_information payload (as returned by the enrichment API)
+    to the flat lead dict format used internally by outreach logic.
+    """
+    identity   = data.get("identity") or {}
+    profile    = identity.get("profile") or {}
+    scores     = data.get("scores") or {}
+    breakdown  = scores.get("breakdown") or {}
+    activity   = data.get("activity") or {}
+    pitch      = data.get("pitch_intelligence") or {}
+    behaviour  = data.get("behavioural_signals") or {}
+    contact    = data.get("contact") or {}
+    tags       = data.get("tags") or []
+
+    # Build location string
+    city    = profile.get("city") or identity.get("location") or ""
+    country = profile.get("country") or identity.get("country") or ""
+    location = ", ".join(filter(None, [city, country]))
+
+    # Summarise recent LinkedIn activity for LLM context
+    feed = activity.get("feed") or []
+    activity_summary = "; ".join(
+        item.get("title", "")[:120] for item in feed[:5] if item.get("title")
+    )
+
+    # Pitch intelligence as a readable string
+    pitch_str = (
+        f"Best angle: {pitch.get('best_angle','')} | "
+        f"Top pain point: {pitch.get('top_pain_point','')} | "
+        f"Best value prop: {pitch.get('best_value_prop','')} | "
+        f"Suggested CTA: {pitch.get('suggested_cta','')} | "
+        f"Do not pitch: {', '.join(pitch.get('do_not_pitch') or [])}"
+    )
+
+    return {
+        "id":                data.get("lead_id") or identity.get("lead_id"),
+        "name":              identity.get("name") or profile.get("full_name"),
+        "title":             identity.get("title") or profile.get("current_title"),
+        "company":           identity.get("company"),
+        "industry":          profile.get("department") or (tags[0] if tags else ""),
+        "location":          location,
+        "linkedin_url":      identity.get("linkedin_url") or data.get("linkedin_url"),
+        "score_tier":        scores.get("score_tier") or breakdown.get("score_tier"),
+        "lead_score":        scores.get("total_score") or scores.get("combined_score"),
+        "warm_signal":       activity.get("warm_signal") or behaviour.get("warm_signal"),
+        "pitch_intelligence": pitch_str,
+        "about":             identity.get("about") or profile.get("about"),
+        "followers":         identity.get("followers"),
+        "connections":       identity.get("connections"),
+        "career_history":    profile.get("career_history") or [],
+        "top_skills":        profile.get("top_skills") or [],
+        "tags":              tags,
+        "behavioural_signals": behaviour,
+        "recent_activity":   activity_summary,
+        "email":             contact.get("work_email") or contact.get("email"),
+        "seniority_level":   profile.get("seniority_level"),
+        "decision_pattern":  behaviour.get("decision_pattern"),
+        "communication_style": behaviour.get("communication_style"),
+        "engages_with":      behaviour.get("engages_with"),
+        # no stored outreach — will be generated from system_prompt
+        "cold_email":        None,
+        "email_subject":     None,
+        "linkedin_note":     None,
+        "best_channel":      None,
+        "outreach_angle":    None,
+        "best_send_time":    None,
+        "outreach_sequence": None,
+    }
 
 
 async def _resolve_lead(leadenrich_id: str) -> dict:
@@ -1685,7 +1757,22 @@ When provided, fresh outreach copy is generated live and returned in `ai_generat
     description=_OUTREACH_DESC,
 )
 async def outreach_enrichment(body: ViewOutreachRequest):
-    lead   = await _resolve_lead(body.leadenrich_id)
+    if not body.leadenrich_id and not body.lead_data:
+        raise HTTPException(400, "Provide either leadenrich_id or lead_data.")
+
+    # Resolve lead — prefer DB lookup, fall back to inline lead_data
+    lead: dict | None = None
+    if body.leadenrich_id:
+        try:
+            lead = await _resolve_lead(body.leadenrich_id)
+        except HTTPException:
+            pass  # not found — will try lead_data below
+
+    if lead is None:
+        if not body.lead_data:
+            raise HTTPException(404, f"Lead not found: {body.leadenrich_id}. Provide lead_data as a fallback.")
+        lead = _lead_from_ai_information(body.lead_data)
+
     full   = _get_full_data(lead)
     outreach_data = full.get("outreach") or {}
 
@@ -1709,19 +1796,33 @@ async def outreach_enrichment(body: ViewOutreachRequest):
         # If system_prompt already has completed copy, extract it directly (no LLM call needed)
         ai_outreach = _extract_outreach_from_prompt(body.system_prompt)
         if not ai_outreach:
-            # Pure instructions prompt — call LLM with real lead data
+            # Pure instructions prompt — call LLM with rich lead context
             try:
+                career = "; ".join(
+                    f"{c.get('title')} at {c.get('company')}"
+                    for c in (lead.get("career_history") or [])[:3]
+                    if c.get("title")
+                )
                 lead_ctx = (
                     f"Name: {lead.get('name')} | Title: {lead.get('title','')} | "
-                    f"Company: {lead.get('company','')} | Industry: {lead.get('industry','')} | "
-                    f"Location: {lead.get('location','')} | Score: {lead.get('lead_score','')} | "
-                    f"Warm signal: {lead.get('warm_signal','')} | Pitch: {lead.get('pitch_intelligence','')}"
+                    f"Company: {lead.get('company','')} | Seniority: {lead.get('seniority_level','')} | "
+                    f"Industry/Tags: {lead.get('industry','')} {', '.join(lead.get('tags') or [])} | "
+                    f"Location: {lead.get('location','')} | Score: {lead.get('lead_score','')} ({lead.get('score_tier','')}) | "
+                    f"Followers: {lead.get('followers','')} | Connections: {lead.get('connections','')} | "
+                    f"Warm signal: {lead.get('warm_signal','')} | "
+                    f"Engages with: {lead.get('engages_with','')} | "
+                    f"Decision pattern: {lead.get('decision_pattern','')} | "
+                    f"Communication style: {lead.get('communication_style','')} | "
+                    f"Pitch: {lead.get('pitch_intelligence','')} | "
+                    f"Recent activity: {lead.get('recent_activity','')} | "
+                    f"Career: {career} | "
+                    f"About: {str(lead.get('about',''))[:300]}"
                 )
                 ai_outreach = await _quick_llm(
                     body.system_prompt,
                     f"Generate personalised B2B outreach for this lead.\n\n{lead_ctx}\n\n"
                     "Return JSON: {{\"cold_email\": {{\"subject\": \"...\", \"body\": \"...\"}}, "
-                    "\"linkedin_note\": \"...\", \"best_channel\": \"...\", \"outreach_angle\": \"...\"}}",
+                    "\"linkedin_note\": \"...\", \"best_channel\": \"...\", \"best_time\": \"...\", \"outreach_angle\": \"...\"}}",
                     max_tokens=2000,
                 )
             except Exception as _e:
