@@ -1761,7 +1761,7 @@ async def outreach_enrichment(body: ViewOutreachRequest):
         raise HTTPException(400, "Provide either leadenrich_id or lead_data.")
 
     # Resolve lead — prefer DB lookup, fall back to inline lead_data
-    lead: dict | None = None
+    lead = None
     if body.leadenrich_id:
         try:
             lead = await _resolve_lead(body.leadenrich_id)
