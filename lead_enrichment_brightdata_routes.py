@@ -1792,9 +1792,13 @@ async def outreach_enrichment(body: ViewOutreachRequest):
 
     # AI-generated outreach if system_prompt provided
     ai_outreach = None
+    _dbg_has_prompt = bool(body.system_prompt)
+    _dbg_has_name   = bool(lead.get("name"))
+    _dbg_extracted  = None
     if body.system_prompt and lead.get("name"):
         # If system_prompt already has completed copy, extract it directly (no LLM call needed)
         ai_outreach = _extract_outreach_from_prompt(body.system_prompt)
+        _dbg_extracted = bool(ai_outreach)
         if not ai_outreach:
             # Pure instructions prompt — call LLM with rich lead context
             try:
@@ -1869,6 +1873,7 @@ async def outreach_enrichment(body: ViewOutreachRequest):
         "warm_signal":        lead.get("warm_signal"),
 
         "ai_generated": {"outreach": ai_outreach} if ai_outreach else None,
+        "_debug": {"has_prompt": _dbg_has_prompt, "has_name": _dbg_has_name, "extracted": _dbg_extracted if _dbg_has_prompt and _dbg_has_name else None, "ai_outreach_type": type(ai_outreach).__name__},
     }
 
 
