@@ -176,3 +176,37 @@ async def save_as_prompt(body: SavePromptRequest, request: Request):
         )
 
     return {"success": True, "id": prompt_id, "key": key}
+
+
+# ── List saved prompts ────────────────────────────────────────────────────────
+
+@router.get("/saved", include_in_schema=False)
+async def list_saved_prompts(request: Request):
+    """Return all spg_* prompts saved for this org."""
+    org_id = _get_org_id(request)
+    from db import get_pool
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, name, key, content, is_active, updated_at
+            FROM system_prompts
+            WHERE org_id=$1 AND key LIKE 'spg_%'
+            ORDER BY updated_at DESC
+            """,
+            org_id,
+        )
+    return {
+        "prompts": [
+            {
+                "id":         str(r["id"]),
+                "name":       r["name"],
+                "key":        r["key"],
+                "section_key": r["key"].removeprefix("spg_"),
+                "content":    r["content"],
+                "is_active":  r["is_active"],
+                "updated_at": str(r["updated_at"]),
+            }
+            for r in rows
+        ]
+    }
