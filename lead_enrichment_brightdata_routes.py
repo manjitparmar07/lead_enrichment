@@ -1727,6 +1727,21 @@ async def outreach_enrichment(body: ViewOutreachRequest):
             except Exception as _e:
                 logger.warning("[OutreachView] AI generation failed: %s", _e)
 
+    # When ai_outreach is available (system_prompt provided), override top-level fields
+    if ai_outreach:
+        ai_email = ai_outreach.get("cold_email") or {}
+        ai_body = ai_email.get("body", "")
+        cold_email_block = {
+            "subject":    ai_email.get("subject", ""),
+            "greeting":   "",
+            "opening":    "",
+            "body":       ai_body,
+            "cta":        "",
+            "sign_off":   "",
+            "full_email": ai_body,
+        }
+        linkedin_note_val = ai_outreach.get("linkedin_note", linkedin_note_val)
+
     return {
         "lead_id":      lead.get("id"),
         "linkedin_url": lead.get("linkedin_url"),
@@ -1740,9 +1755,9 @@ async def outreach_enrichment(body: ViewOutreachRequest):
         "follow_up":          follow_up_block,
 
         "sequence":           _parse_json_field(lead, "outreach_sequence", {}),
-        "best_time":          outreach_data.get("best_time") or lead.get("best_send_time"),
-        "best_channel":       lead.get("best_channel"),
-        "outreach_angle":     lead.get("outreach_angle"),
+        "best_time":          (ai_outreach.get("best_time") if ai_outreach else None) or outreach_data.get("best_time") or lead.get("best_send_time"),
+        "best_channel":       (ai_outreach.get("best_channel") if ai_outreach else None) or lead.get("best_channel"),
+        "outreach_angle":     (ai_outreach.get("outreach_angle") if ai_outreach else None) or lead.get("outreach_angle"),
         "warm_signal":        lead.get("warm_signal"),
 
         "ai_generated": {"outreach": ai_outreach} if ai_outreach else None,
