@@ -80,12 +80,15 @@ app = FastAPI(
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(auth_router,               prefix="/api", include_in_schema=False)
-app.include_router(lead_enrichment_router,    prefix="/api")
-# ── 4 Enrichment View APIs (visible in /docs) ─────────────────────────────────
+# ── 4 Enrichment View APIs registered BEFORE lead_enrichment_router ───────────
+# Must come first — their fixed paths (/view/email, /view/outreach, /view/company)
+# would otherwise be swallowed by lead_enrichment_router's wildcard /{lead_id}/...
 app.include_router(_linkedin_enrich_router,   prefix="/api")
 app.include_router(_email_enrich_router,      prefix="/api")
 app.include_router(_outreach_enrich_router,   prefix="/api")
 app.include_router(_company_enrich_router,    prefix="/api")
+# ─────────────────────────────────────────────────────────────────────────────
+app.include_router(lead_enrichment_router,    prefix="/api")
 # ──────────────────────────────────────────────────────────────────────────────
 app.include_router(keys_router,               prefix="/api", include_in_schema=False)
 app.include_router(ably_router,               prefix="/api", include_in_schema=False)

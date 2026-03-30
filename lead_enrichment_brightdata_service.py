@@ -131,6 +131,133 @@ def _clean_lead_strings(lead: dict, fields: list) -> None:
             lead[f] = _strip_emojis(v)
 
 
+# ── First-person → third-person normalisation ─────────────────────────────────
+
+def _clean_title(title: str) -> str:
+    """
+    Convert first-person LinkedIn headlines into clean professional job titles.
+
+    Examples:
+      "I lead the International Cooperation Division"  → "International Cooperation Division Lead"
+      "I'm a Senior Product Designer at Figma"         → "Senior Product Designer"
+      "I help B2B companies scale their outbound"       → "B2B Growth Specialist"
+      "I am Head of Sales"                              → "Head of Sales"
+    """
+    if not title or not isinstance(title, str):
+        return title
+    t = title.strip()
+
+    # "I am X" / "I'm X" — extract X directly (already a title noun)
+    m = re.match(r"^I(?:'m| am)\s+(?:a\s+|an\s+|the\s+)?(.+)", t, re.IGNORECASE)
+    if m:
+        rest = m.group(1).strip()
+        # Drop trailing "at/with/of Company..." clause
+        rest = re.split(r"\s+(?:at|with|of|@)\s+[A-Z]", rest)[0].strip().rstrip(",–-").strip()
+        # If it still reads like a sentence (has a verb word), skip — handled below
+        if not re.search(r"\b(help|work|lead|run|build|create|drive|grow|focus|speciali)\b", rest, re.IGNORECASE):
+            return rest
+
+    # "I lead/run/head/own/manage/oversee the X" → "X Lead/Manager/..."
+    m = re.match(
+        r"^I\s+(lead|run|head|own|manage|oversee|direct|build|drive|grow)\s+(?:the\s+|a\s+|an\s+)?(.+)",
+        t, re.IGNORECASE,
+    )
+    if m:
+        verb = m.group(1).lower()
+        obj  = m.group(2).strip()
+        obj  = re.split(r"\s+(?:at|with|for|@)\s+", obj)[0].strip().rstrip(".,–-").strip()
+        suffix_map = {
+            "lead": "Lead", "run": "Lead", "head": "Head",
+            "own": "Owner", "manage": "Manager", "oversee": "Manager",
+            "direct": "Director", "build": "Lead", "drive": "Lead", "grow": "Lead",
+        }
+        suffix = suffix_map.get(verb, "Lead")
+        return f"{obj} {suffix}"
+
+    # "I help X do Y" → "X Specialist" (too vague — return sanitised)
+    m = re.match(r"^I\s+help\s+(.+?)\s+(?:to\s+)?\w+", t, re.IGNORECASE)
+    if m:
+        return t  # can't reliably extract a title — leave for LLM enrichment
+
+    # Any other first-person opener — strip the "I [verb] " prefix
+    m = re.match(r"^I\s+\w+\s+(.*)", t, re.IGNORECASE)
+    if m:
+        rest = m.group(1).strip().rstrip(".,–-").strip()
+        if len(rest) > 3:
+            return rest
+
+    return t
+
+
+def _to_third_person(text: str, first_name: str) -> str:
+    """
+    Rewrite a first-person LinkedIn 'about' section into third-person.
+
+    "I lead..."     → "Firstname leads..."
+    "I am / I'm"    → "Firstname is"
+    "I've / I have" → "Firstname has"
+    "I was"         → "Firstname was"
+    "My "           → "Their "
+    "me"            → "them"
+    "we / our"      → "the team / their"
+    """
+    if not text or not isinstance(text, str):
+        return text
+
+    name = (first_name or "").strip() or "They"
+
+    subs = [
+        # Contractions first (order matters)
+        (r"\bI'm\b",            f"{name} is"),
+        (r"\bI've\b",           f"{name} has"),
+        (r"\bI'd\b",            f"{name} would"),
+        (r"\bI'll\b",           f"{name} will"),
+        (r"\bI was\b",          f"{name} was"),
+        (r"\bI have\b",         f"{name} has"),
+        (r"\bI am\b",           f"{name} is"),
+        # "I lead/run/help..." → conjugate verb (add s)
+        (r"\bI (lead|run|help|work|build|drive|grow|focus|head|own|manage|oversee|create|speciali[sz]e)\b",
+         lambda m, n=name: f"{n} {m.group(1)}s"),
+        # Generic "I <verb>" → "Name <verb>s"  (only for simple present verbs)
+        (r"\bI ([a-z]+)\b",     lambda m, n=name: f"{n} {m.group(1)}s"),
+        # Possessive / object
+        (r"\bMy\b",             "Their"),
+        (r"\bmy\b",             "their"),
+        (r"\bMe\b",             "Them"),
+        (r"\bme\b",             "them"),
+        # Plural first-person
+        (r"\bWe\b",             "The team"),
+        (r"\bwe\b",             "the team"),
+        (r"\bOur\b",            "Their"),
+        (r"\iour\b",            "their"),
+    ]
+
+    result = text
+    for pattern, repl in subs:
+        if callable(repl):
+            result = re.sub(pattern, repl, result)
+        else:
+            result = re.sub(pattern, repl, result)
+
+    return result.strip()
+
+
+def _normalise_person_text(lead: dict) -> None:
+    """
+    Apply title cleaning and about→third-person rewrite in-place before DB save.
+    Only modifies fields that start with a first-person pattern.
+    """
+    first_name = (lead.get("first_name") or "").strip()
+
+    title = lead.get("title") or ""
+    if title and re.match(r"^I\b", title.strip(), re.IGNORECASE):
+        lead["title"] = _clean_title(title)
+
+    about = lead.get("about") or ""
+    if about and re.search(r"\bI\b|\bmy\b|\bwe\b", about, re.IGNORECASE):
+        lead["about"] = _to_third_person(about, first_name)
+
+
 # ── Shared persistent HTTP clients (reuse TCP/TLS connections across requests) ─
 # Each external service gets its own client so keep-alive pools don't interfere.
 LIO_RECEIVE_URL = os.getenv("LIO_RECEIVE_URL", "https://api-lio.worksbuddy.ai/api/enrich/receive")
@@ -582,6 +709,9 @@ async def _upsert_lead(lead: dict) -> None:
     _clean_lead_strings(lead, ["name", "first_name", "last_name", "title", "company",
                                 "about", "location", "city", "country"])
 
+    # Rewrite first-person title/about into third-person professional form
+    _normalise_person_text(lead)
+
     cols = [k for k in lead if k != "id"]
     all_keys = ["id"] + cols
     placeholders = ", ".join(f"${i + 1}" for i in range(len(all_keys)))
@@ -672,10 +802,11 @@ def _parse_json_safe(raw, default):
         return default
 
 
-def _format_linkedin_enrich(lead: dict) -> dict:
+def _format_linkedin_enrich(lead: dict, include_contact: bool = True) -> dict:
     """
     Build the structured LinkedIn Enrichment view from a raw DB lead row.
     Shared by enrich_single() (embedded in response) and the /view/linkedin route.
+    Pass include_contact=False for bulk enrichment to omit the contact block entirely.
     """
     full         = _parse_json_safe(lead.get("full_data"), {})
     lead_scoring = full.get("lead_scoring") or {}
@@ -704,7 +835,7 @@ def _format_linkedin_enrich(lead: dict) -> dict:
             "profile":      full.get("person_profile", {}),
         },
 
-        "contact": {
+        **({"contact": {
             "work_email":        lead.get("work_email"),
             "email":             lead.get("email"),
             "phone":             lead.get("phone"),
@@ -713,7 +844,7 @@ def _format_linkedin_enrich(lead: dict) -> dict:
             "email_verified":    bool(lead.get("email_verified")),
             "bounce_risk":       lead.get("bounce_risk"),
             "enrichment_source": lead.get("enrichment_source"),
-        },
+        }} if include_contact else {}),
 
         "scores": {
             "total_score":       lead.get("total_score"),
@@ -1597,6 +1728,20 @@ async def fetch_profile_sync(linkedin_url: str) -> dict:
                 )
                 if resp.status_code == 200:
                     data = resp.json()
+
+                    # BrightData returns snapshot_id when the sync request cannot be
+                    # fulfilled immediately (API tier or profile takes too long).
+                    # Fall through to async poll in that case.
+                    if isinstance(data, dict) and data.get("snapshot_id") and not data.get("name"):
+                        snap_id = data["snapshot_id"]
+                        logger.info("[BrightData] Sync returned snapshot_id=%s — polling async", snap_id)
+                        try:
+                            rows = await poll_snapshot(snap_id, interval=5, timeout=120)
+                            data = rows
+                        except Exception as poll_err:
+                            logger.warning("[BrightData] Snapshot poll failed (%s) — trying OCR fallback", poll_err)
+                            data = []
+
                     raw = data[0] if isinstance(data, list) and data else data
                     if isinstance(raw, dict) and (
                         raw.get("name") or raw.get("full_name")
@@ -4345,6 +4490,7 @@ async def enrich_single(
     sso_id: str = "",
     forward_to_lio: bool = False,
     system_prompt: Optional[str] = None,
+    skip_contact: bool = False,
 ) -> dict:
     """
     Sequential 8-stage enrichment waterfall:
@@ -4380,7 +4526,7 @@ async def enrich_single(
     if cached and cached.get("status") == "enriched":
         logger.info("[Enrich] Cache HIT for %s (lead_id=%s) — skipping Bright Data", url, lead_id)
         cached["_cache_hit"] = True
-        cached["linkedin_enrich"] = _format_linkedin_enrich(cached)
+        cached["linkedin_enrich"] = _format_linkedin_enrich(cached, include_contact=not skip_contact)
         if not forward_to_lio:
             asyncio.create_task(send_to_lio(cached, sso_id=sso_id))
         return cached
@@ -4435,6 +4581,8 @@ async def enrich_single(
     activity_phones = profile.get("_activity_phones") or []
 
     async def _phase_c() -> dict:
+        if skip_contact:
+            return {}
         if activity_emails:
             matched = next((e for e in activity_emails if verified_domain and verified_domain.split(".")[0] in e), None)
             pre_contact = matched or activity_emails[0]
@@ -4851,7 +4999,7 @@ async def enrich_single(
 
     # Embed structured LinkedIn Enrich view for immediate use by caller / LIO
     lead["_cache_hit"] = False
-    lead["linkedin_enrich"] = _format_linkedin_enrich(lead)
+    lead["linkedin_enrich"] = _format_linkedin_enrich(lead, include_contact=not skip_contact)
 
     # Forward to LIO — only if BrightData returned real data (lead has a name)
     if not forward_to_lio and lead.get("name"):
@@ -5388,11 +5536,23 @@ async def _process_sequential_batch(
     )
 
     for chunk_idx, (sub_job_id, chunk) in enumerate(zip(sub_job_ids, url_chunks)):
+        # Check if job was cancelled before each chunk
+        _job_row = await get_job(job_id)
+        if _job_row and _job_row.get("status") == "cancelled":
+            logger.info("[BulkBatch] Job %s cancelled — stopping at chunk %d", job_id, chunk_idx)
+            await _update_sub_job(sub_job_id, status="cancelled")
+            break
+
         await _update_sub_job(sub_job_id, status="running")
         chunk_ok = chunk_fail = 0
         for i, url in enumerate(chunk):
+            # Check cancellation between each URL
+            _job_row = await get_job(job_id)
+            if _job_row and _job_row.get("status") == "cancelled":
+                logger.info("[BulkBatch] Job %s cancelled mid-chunk — stopping", job_id)
+                break
             try:
-                lead = await enrich_single(url, job_id=job_id, org_id=org_id, sso_id=sso_id, forward_to_lio=forward_to_lio, system_prompt=system_prompt)
+                lead = await enrich_single(url, job_id=job_id, org_id=org_id, sso_id=sso_id, forward_to_lio=forward_to_lio, system_prompt=system_prompt, skip_contact=True)
                 chunk_ok += 1
                 logger.info(
                     "[BulkBatch] Chunk %d/%d · URL %d/%d OK: %s",

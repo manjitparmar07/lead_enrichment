@@ -586,15 +586,16 @@ async def _call_llm(
     g_key = _groq_key()
     if g_key:
         primary = groq_model or _groq_gen_model()
-        # Fallback chain: if primary hits rate-limit, try smaller/alternative models
-        groq_models = [primary] + [
-            m for m in [
-                "llama3-70b-8192",
-                "llama-3.1-8b-instant",
-                "gemma2-9b-it",
-                "mixtral-8x7b-32768",
-            ] if m != primary
+        # Fallback chain (only live models — verified 2026-03-30):
+        # llama-3.3-70b-versatile → llama-4-scout → llama-3.1-8b-instant → compound-beta → allam-2-7b
+        _GROQ_LIVE = [
+            "llama-3.3-70b-versatile",
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+            "llama-3.1-8b-instant",
+            "compound-beta",
+            "allam-2-7b",
         ]
+        groq_models = [primary] + [m for m in _GROQ_LIVE if m != primary]
         for g_mdl in groq_models:
             try:
                 async with httpx.AsyncClient(timeout=90) as c:
@@ -611,12 +612,12 @@ async def _call_llm(
                         body_txt = r.json().get("error", {}).get("message") or r.text
                     except Exception:
                         body_txt = r.text
-                    if r.status_code == 429:
-                        logger.warning("[LLM] Groq %s rate-limited, trying next model", g_mdl)
-                        errors.append(f"Groq {g_mdl}: rate-limited (429)")
+                    if r.status_code in (429, 400):
+                        logger.warning("[LLM] Groq %s skipped (%s), trying next model", g_mdl, r.status_code)
+                        errors.append(f"Groq {g_mdl}: HTTP {r.status_code}")
                         continue
                     errors.append(f"Groq {g_mdl}: HTTP {r.status_code}: {body_txt}")
-                    break  # non-429 error — stop trying more models
+                    break  # other errors — stop trying
             except Exception as e:
                 errors.append(f"Groq {g_mdl}: {e}")
                 break

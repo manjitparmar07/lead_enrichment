@@ -20,6 +20,7 @@ Two-phase API:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -97,44 +98,50 @@ async def scrape_url(body: ScrapeRequest):
     return {"source_type": source_type, "profile": profile}
 
 
-# ── Phase 2: Generate prompts (SSE) ───────────────────────────────────────────
+# ── Phase 2: Generate prompts (single JSON) ───────────────────────────────────
 
 @router.post("/generate", include_in_schema=False)
 async def generate_prompts(body: GenerateRequest):
     """
-    Stream system prompt generation for each section as SSE.
+    Generate all section prompts in parallel and return a single JSON object.
 
-    SSE events:
-      {"status": "section_start",  "key": "...", "label": "..."}
-      {"status": "section_done",   "key": "...", "label": "...", "prompt": "..."}
-      {"status": "section_error",  "key": "...", "label": "...", "error": "..."}
-      {"status": "complete", "done": true}
-      {"status": "error",    "error": "...", "done": true}
+    Response:
+      {
+        "prompts": {
+          "identity":            { "label": "Identity",           "prompt": "..." },
+          "contact":             { "label": "Contact",            "prompt": "..." },
+          "scores":              { "label": "Scores",             "prompt": "..." },
+          "icp_match":           { "label": "ICP Match",          "prompt": "..." },
+          "behavioural_signals": { "label": "Behavioural Signal", "prompt": "..." },
+          "pitch_intelligence":  { "label": "Pitch Intelligence", "prompt": "..." },
+          "activity":            { "label": "Activity",           "prompt": "..." },
+          "tags":                { "label": "Tags",               "prompt": "..." },
+          "outreach":            { "label": "Outreach",           "prompt": "..." },
+          "person_analysis":     { "label": "Person Analysis",    "prompt": "..." }
+        }
+      }
     """
-    profile  = body.profile
+    profile   = body.profile
     requested = set(body.sections) if body.sections else None
 
-    async def _stream():
+    sections_to_run = [
+        (key, label, fn)
+        for key, label, fn in spg_svc.SECTIONS
+        if not requested or key in requested
+    ]
+
+    async def _run(key: str, label: str, fn):
         try:
-            for key, label, fn in spg_svc.SECTIONS:
-                if requested and key not in requested:
-                    continue
-
-                yield f"data: {json.dumps({'status': 'section_start', 'key': key, 'label': label})}\n\n"
-                try:
-                    prompt_text = await fn(profile)
-                    yield f"data: {json.dumps({'status': 'section_done', 'key': key, 'label': label, 'prompt': prompt_text})}\n\n"
-                except Exception as e:
-                    logger.error("[SPG generate] section %s: %s", key, e)
-                    yield f"data: {json.dumps({'status': 'section_error', 'key': key, 'label': label, 'error': str(e)})}\n\n"
-
-            yield f"data: {json.dumps({'status': 'complete', 'done': True})}\n\n"
-
+            text = await fn(profile)
+            return key, {"label": label, "prompt": text, "error": None}
         except Exception as e:
-            logger.error("[SPG generate] stream error: %s", e)
-            yield f"data: {json.dumps({'status': 'error', 'error': str(e), 'done': True})}\n\n"
+            logger.error("[SPG generate] section %s: %s", key, e)
+            return key, {"label": label, "prompt": None, "error": str(e)}
 
-    return StreamingResponse(_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+    results = await asyncio.gather(*[_run(k, l, f) for k, l, f in sections_to_run])
+    prompts = {key: val for key, val in results}
+
+    return {"prompts": prompts}
 
 
 # ── Save a prompt ─────────────────────────────────────────────────────────────

@@ -362,6 +362,18 @@ async def _worker(worker_id: int, r: Any) -> None:
                 worker_id, len(urls), job_id or "—", sub_job_id or "—", org_id,
             )
 
+            # ── Check if job was cancelled before starting chunk ─────────────
+            if job_id:
+                try:
+                    job_row = await get_job(job_id)
+                    if job_row and job_row.get("status") == "cancelled":
+                        logger.info("[Worker-%d] Job %s cancelled — skipping chunk", worker_id, job_id)
+                        if sub_job_id:
+                            await _update_sub_job(sub_job_id, status="cancelled")
+                        continue
+                except Exception:
+                    pass
+
             # Mark sub-job as running
             if sub_job_id:
                 try:
@@ -380,6 +392,7 @@ async def _worker(worker_id: int, r: Any) -> None:
                         sso_id=sso_id,
                         forward_to_lio=forward_to_lio,
                         system_prompt=system_prompt,
+                        skip_contact=True,
                     )
                     for url in urls
                 ],

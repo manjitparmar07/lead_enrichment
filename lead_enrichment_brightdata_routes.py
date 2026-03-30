@@ -19,6 +19,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import csv
 import io
@@ -40,19 +41,24 @@ async def _lead_cache_ttl(org_id: str) -> int:
     except Exception:
         return _LEAD_CACHE_TTL
 _lead_redis: Any = None
+_lead_redis_fail_until: float = 0.0  # epoch seconds — don't retry before this time
 
 
 async def _get_lead_redis() -> Any:
-    global _lead_redis
+    global _lead_redis, _lead_redis_fail_until
     if _lead_redis is not None:
         return _lead_redis
+    import time
+    if time.monotonic() < _lead_redis_fail_until:
+        return None  # in backoff window — skip reconnect attempt
     try:
         import redis.asyncio as aioredis
-        client = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
+        client = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True, socket_connect_timeout=2)
         await client.ping()
         _lead_redis = client
     except Exception:
         _lead_redis = None
+        _lead_redis_fail_until = time.monotonic() + 30  # don't retry for 30s
     return _lead_redis
 
 
@@ -840,13 +846,23 @@ async def get_sub_jobs(job_id: str):
 @router.get("/jobs/{job_id}")
 async def get_job(job_id: str):
     """Get status and progress of a specific enrichment job."""
-    job = await svc.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    from db import get_pool
+    async with get_pool().acquire() as conn:
+        job_row = await conn.fetchrow("SELECT * FROM enrichment_jobs WHERE id=$1", job_id)
+        if not job_row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        job = dict(job_row)
+        org_id = job.get("organization_id", "default")
 
-    result = await svc.list_leads(limit=1, offset=0, job_id=job_id)
-    sub_jobs = await svc.list_sub_jobs(job_id, org_id=job.get("organization_id", "default"))
-    return {**job, "leads_count": result["total"], "sub_jobs": sub_jobs}
+        leads_count, sub_rows = await asyncio.gather(
+            conn.fetchval("SELECT COUNT(*) FROM enriched_leads WHERE job_id=$1", job_id),
+            conn.fetch(
+                "SELECT * FROM enrichment_sub_jobs WHERE job_id=$1 AND organization_id=$2 ORDER BY chunk_index",
+                job_id, org_id,
+            ),
+        )
+
+    return {**job, "leads_count": leads_count, "sub_jobs": [dict(r) for r in sub_rows]}
 
 
 @router.post("/jobs/{job_id}/stop", include_in_schema=False)
@@ -1479,8 +1495,9 @@ async def email_enrichment(body: ViewEmailRequest):
     full = _get_full_data(lead)
     person_profile = full.get("person_profile") or {}
 
-    # If no email stored yet — run Apollo → Hunter live lookup
-    if not lead.get("work_email") and not lead.get("email"):
+    # If no email stored yet AND lookup not already attempted — run Apollo → Hunter live lookup
+    _already_attempted = lead.get("email_source") in ("not_found", "lookup_attempted")
+    if not lead.get("work_email") and not lead.get("email") and not _already_attempted:
         first, last = svc._parse_name(lead.get("name") or "")
         domain = ""
         website = lead.get("company_website") or ""
@@ -1493,14 +1510,14 @@ async def email_enrichment(body: ViewEmailRequest):
                 pass
 
         if first and domain:
+            from db import get_pool as _get_pool
             try:
                 contact = await svc.find_contact_info(
                     first=first, last=last, domain=domain,
                     linkedin_url=lead.get("linkedin_url") or "",
                 )
                 if contact.get("email"):
-                    # Persist the found email back to DB
-                    from db import get_pool as _get_pool
+                    # Persist found email back to DB
                     async with _get_pool().acquire() as _conn:
                         await _conn.execute(
                             """UPDATE enriched_leads SET work_email=$1, email_source=$2,
@@ -1520,6 +1537,15 @@ async def email_enrichment(body: ViewEmailRequest):
                     lead["bounce_risk"]       = contact.get("bounce_risk")
                     lead["enrichment_source"] = contact.get("source")
                     lead["phone"]             = lead.get("phone") or contact.get("phone")
+                else:
+                    # No email found — mark so we don't retry Apollo/Hunter on every request
+                    async with _get_pool().acquire() as _conn:
+                        await _conn.execute(
+                            "UPDATE enriched_leads SET email_source='not_found' WHERE id=$1",
+                            lead["id"],
+                        )
+                    lead["email_source"] = "not_found"
+                await _lead_cache_set(lead["id"], lead)  # refresh cache with latest state
             except Exception as _e:
                 logger.warning("[EmailView] Live lookup failed for %s: %s", body.leadenrich_id, _e)
 
