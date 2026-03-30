@@ -219,41 +219,51 @@ def _bd_headers() -> dict:
 # P2  —  LinkedIn Company Posts (Phase 1C)
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _fetch_company_posts(company_linkedin_url: str) -> list[dict]:
+async def _fetch_bd_company_profile(company_linkedin_url: str) -> dict:
     """
-    Fetch 10–15 recent LinkedIn company posts via Bright Data company dataset.
+    Fetch full company profile from Bright Data company dataset.
 
-    Bright Data company profile records typically include a `posts` array with
-    recent company updates.  We extract those and normalise them.
-
-    Returns a list of post dicts: {text, date, likes, comments, url}
+    Returns the raw BD company dict with all fields, or {} on failure.
+    Fields include: name, followers, employees_in_linkedin, about, company_size,
+    organization_type, industries, website, founded, headquarters, logo, image,
+    similar[], updates[], slogan, affiliated[], additional_information, employees[]
     """
     if not _bd_api_key() or not company_linkedin_url:
-        return []
+        return {}
+
+    # Normalize URL: strip tracking params + canonicalize to www.linkedin.com
+    clean_url = re.sub(r"https?://[a-z]{2}\.linkedin\.com", "https://www.linkedin.com", company_linkedin_url)
+    clean_url = clean_url.split("?")[0].rstrip("/")
 
     dataset_id = _bd_company_dataset()
-    logger.info("[CompanyPosts] Fetching posts for: %s", company_linkedin_url)
+    logger.info("[CompanyBD] Fetching company profile for: %s", clean_url)
 
     try:
         async with httpx.AsyncClient(timeout=120) as client:
-            # Request company profile with posts included
             resp = await client.post(
                 f"{BD_BASE}/scrape",
-                params={"dataset_id": dataset_id, "format": "json", "include_errors": "false"},
+                params={
+                    "dataset_id":     dataset_id,
+                    "format":         "json",
+                    "include_errors": "true",
+                    "notify":         "false",
+                },
                 headers=_bd_headers(),
-                json=[{"url": company_linkedin_url, "num_of_posts": 15}],
+                json={"input": [{"url": clean_url}]},
             )
+            logger.info("[CompanyBD] BD response status=%s body=%.300s", resp.status_code, resp.text)
             if resp.status_code not in (200, 202):
-                logger.warning("[CompanyPosts] BD status %s", resp.status_code)
-                return []
+                logger.warning("[CompanyBD] BD error %s: %s", resp.status_code, resp.text[:300])
+                return {}
 
             body = resp.json()
-            if isinstance(body, list) and body:
-                company_data = body[0]
-            elif isinstance(body, dict):
+            data_list = body if isinstance(body, list) else body.get("data") or []
+            if data_list and isinstance(data_list[0], dict):
+                company_data = data_list[0]
+            elif isinstance(body, dict) and body.get("name"):
                 company_data = body
             else:
-                return []
+                company_data = body if isinstance(body, dict) else {}
 
             # Poll if async snapshot
             snap_id = (
@@ -267,11 +277,109 @@ async def _fetch_company_posts(company_linkedin_url: str) -> list[dict]:
                 if polled:
                     company_data = polled[0] if isinstance(polled, list) else polled
 
-            return _normalize_posts(company_data)
+            logger.info("[CompanyBD] Profile fetched for: %s", company_linkedin_url)
+            return company_data if isinstance(company_data, dict) else {}
 
     except Exception as e:
-        logger.warning("[CompanyPosts] Failed: %s", e)
-        return []
+        logger.warning("[CompanyBD] Failed: %s", e)
+        return {}
+
+
+def _map_bd_company_profile(bd: dict, record: dict) -> None:
+    """
+    Map Bright Data company profile fields into the internal record dict in-place.
+
+    BD field          → internal field
+    name              → name
+    about             → description
+    website           → website
+    website_simplified→ domain (fallback)
+    logo              → logo
+    followers         → linkedin_followers
+    employees_in_linkedin → employee_count (if not already set)
+    company_size      → (used to parse employee_count range)
+    industries        → industry
+    founded           → founded_year
+    headquarters      → hq_location
+    organization_type → organization_type
+    slogan            → company_slogan
+    similar[]         → similar_companies
+    updates[]         → posts (via _normalize_posts)
+    """
+    if not bd or not isinstance(bd, dict):
+        return
+
+    if bd.get("name"):
+        record["name"] = bd["name"]
+
+    if bd.get("about"):
+        record["description"] = bd["about"]
+
+    if bd.get("website"):
+        record["website"] = bd["website"]
+
+    # domain from website_simplified or parsed from website
+    if bd.get("website_simplified") and not record.get("domain"):
+        record["domain"] = bd["website_simplified"]
+    elif bd.get("website") and not record.get("domain"):
+        m = re.search(r"https?://(?:www\.)?([^/?\s]+)", bd["website"])
+        if m:
+            record["domain"] = m.group(1)
+
+    if bd.get("logo"):
+        record["logo"] = bd["logo"]
+
+    if bd.get("followers"):
+        record["linkedin_followers"] = int(bd["followers"] or 0)
+
+    # employee_count — prefer followers-based number, parse company_size range
+    if bd.get("employees_in_linkedin") and not record.get("employee_count"):
+        record["employee_count"] = int(bd["employees_in_linkedin"] or 0)
+    if bd.get("company_size") and not record.get("employee_count"):
+        # "51-200 employees" → take upper bound
+        m = re.search(r"(\d[\d,]*)", str(bd["company_size"]))
+        if m:
+            record["employee_count"] = int(m.group(1).replace(",", ""))
+
+    if bd.get("industries"):
+        record["industry"] = bd["industries"]
+
+    if bd.get("founded"):
+        record["founded_year"] = str(bd["founded"])
+
+    if bd.get("headquarters"):
+        record["hq_location"] = bd["headquarters"]
+
+    if bd.get("organization_type"):
+        record["organization_type"] = bd["organization_type"]
+
+    if bd.get("slogan"):
+        record["company_slogan"] = bd["slogan"]
+
+    # similar companies
+    similar_raw = bd.get("similar") or []
+    if similar_raw and isinstance(similar_raw, list):
+        similar_list = [
+            {
+                "title":    s.get("title", ""),
+                "subtitle": s.get("subtitle", ""),
+                "url":      s.get("Links", ""),
+            }
+            for s in similar_raw if isinstance(s, dict)
+        ]
+        record["similar_companies"] = json.dumps(similar_list, default=str)
+
+    logger.info(
+        "[CompanyBD] Mapped fields: name=%s industry=%s employees=%s followers=%s",
+        record.get("name"), record.get("industry"),
+        record.get("employee_count"), record.get("linkedin_followers"),
+    )
+
+
+async def _fetch_company_posts(company_linkedin_url: str) -> list[dict]:
+    """Fetch posts only — thin wrapper over _fetch_bd_company_profile."""
+    bd = await _fetch_bd_company_profile(company_linkedin_url)
+    return _normalize_posts(bd)
 
 
 def _normalize_posts(company_data: dict) -> list[dict]:
@@ -1030,11 +1138,13 @@ async def enrich_company(
             sc = known_data["similar_companies"]
             record["similar_companies"] = json.dumps(sc, default=str) if isinstance(sc, list) else sc
 
-    # ── P2: LinkedIn Company Posts ────────────────────────────────────────────
-    posts = await _fetch_company_posts(company_linkedin_url)
+    # ── P2: LinkedIn Company Profile + Posts from Bright Data ────────────────
+    bd_profile = await _fetch_bd_company_profile(company_linkedin_url)
+    _map_bd_company_profile(bd_profile, record)
+    posts = _normalize_posts(bd_profile)
     record["linkedin_posts"] = json.dumps(posts, default=str)
     record["post_themes"]    = _summarize_post_themes(posts)
-    logger.info("[CompanyEnrich] P2 posts: %d", len(posts))
+    logger.info("[CompanyEnrich] P2 BD profile mapped, posts: %d", len(posts))
 
     # ── P4a: Crunchbase funding signals ───────────────────────────────────────
     cb_data = await _fetch_crunchbase_signals(

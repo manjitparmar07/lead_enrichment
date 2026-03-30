@@ -229,7 +229,7 @@ def _to_third_person(text: str, first_name: str) -> str:
         (r"\bWe\b",             "The team"),
         (r"\bwe\b",             "the team"),
         (r"\bOur\b",            "Their"),
-        (r"\iour\b",            "their"),
+        (r"\bour\b",            "their"),
     ]
 
     result = text
@@ -245,17 +245,27 @@ def _to_third_person(text: str, first_name: str) -> str:
 def _normalise_person_text(lead: dict) -> None:
     """
     Apply title cleaning and about→third-person rewrite in-place before DB save.
-    Only modifies fields that start with a first-person pattern.
+    - Cleans first-person titles and about text
+    - Clears title if it's empty or duplicates the about text
     """
     first_name = (lead.get("first_name") or "").strip()
 
     title = lead.get("title") or ""
     if title and re.match(r"^I\b", title.strip(), re.IGNORECASE):
-        lead["title"] = _clean_title(title)
+        title = _clean_title(title)
+        lead["title"] = title
 
     about = lead.get("about") or ""
     if about and re.search(r"\bI\b|\bmy\b|\bwe\b", about, re.IGNORECASE):
-        lead["about"] = _to_third_person(about, first_name)
+        about = _to_third_person(about, first_name)
+        lead["about"] = about
+
+    # Clear title if it's effectively the same as about (e.g. full sentence stored as title)
+    if title and about:
+        title_clean = title.strip().lower()
+        about_start = about.strip().lower()[:len(title_clean) + 10]
+        if title_clean in about_start or about_start.startswith(title_clean):
+            lead["title"] = ""
 
 
 # ── Shared persistent HTTP clients (reuse TCP/TLS connections across requests) ─
@@ -1282,6 +1292,31 @@ def _normalize_bd_profile(raw: dict) -> dict:
         if not p.get("current_company_company_id"):
             p["current_company_company_id"] = cc.get("company_id") or cc.get("id") or ""
 
+    # ── Build company LinkedIn URL from company_id when link is missing ────────
+    # BD returns company_id in current_company or experience[0] — use it to
+    # construct a valid linkedin.com/company/{id} URL for the BD company dataset
+    if not p.get("current_company_link") or "linkedin.com/company/" not in (p.get("current_company_link") or ""):
+        co_id = p.get("current_company_company_id") or ""
+        if not co_id:
+            # Fall back to experience[0] company fields
+            exp = p.get("experience") or []
+            if exp and isinstance(exp[0], dict):
+                first_exp = exp[0]
+                co_id = (
+                    first_exp.get("company_id") or first_exp.get("linkedin_company_id")
+                    or first_exp.get("company_linkedin_id") or ""
+                )
+                # Some BD versions return a full URL on the experience entry
+                exp_url = (
+                    first_exp.get("url") or first_exp.get("company_url")
+                    or first_exp.get("linkedin_url") or first_exp.get("company_linkedin_url") or ""
+                )
+                if exp_url and "linkedin.com/company/" in exp_url:
+                    p["current_company_link"] = exp_url
+                    co_id = ""  # already set
+        if co_id and not p.get("current_company_link"):
+            p["current_company_link"] = f"https://www.linkedin.com/company/{co_id}/"
+
     # ── Avatar / profile photo ────────────────────────────────────────────────
     # BD returns "avatar" at top level; service uses "avatar_url"
     if not p.get("avatar_url"):
@@ -1685,6 +1720,10 @@ def _normalize_bd_profile(raw: dict) -> dict:
             p.get("headline") or p.get("bio") or p.get("job_title")
             or exp_title or ""
         )
+    # Mark profile for async LLM title inference if still empty
+    # (actual LLM call happens in build_comprehensive_enrichment — sync normalise can't await)
+    if not p.get("position"):
+        p["_needs_title_inference"] = True
 
     # ── Location: city may be "City, State, Country" string ──────────────────
     city_raw = p.get("city") or p.get("location") or ""
@@ -2533,42 +2572,49 @@ async def _try_bd_company(company_linkedin_url: str) -> dict:
     dataset_id = _bd_company_dataset()
     logger.info("[BD Company] Fetching company profile: %s (dataset=%s)", company_linkedin_url, dataset_id)
 
-    # ── Attempt 1: Sync /scrape ───────────────────────────────────────────────
+    # ── Sync /scrape with correct payload format ──────────────────────────────
+    # Format: POST /scrape?dataset_id=...&notify=false&include_errors=true
+    # Body: {"input": [{"url": "..."}]}
     snapshot_id = None
     try:
         async with httpx.AsyncClient(timeout=90) as client:
             resp = await client.post(
                 f"{BD_BASE}/scrape",
-                params={"dataset_id": dataset_id, "format": "json"},
+                params={
+                    "dataset_id":     dataset_id,
+                    "notify":         "false",
+                    "include_errors": "true",
+                    "format":         "json",
+                },
                 headers=_bd_headers(),
-                json=[{"url": company_linkedin_url}],
+                json={"input": [{"url": company_linkedin_url}]},
             )
-            logger.debug("[BD Company] /scrape status=%s body=%.200s", resp.status_code, resp.text)
+            logger.debug("[BD Company] /scrape status=%s body=%.300s", resp.status_code, resp.text)
 
             if resp.status_code not in (200, 202):
                 logger.warning("[BD Company] /scrape failed %s: %s", resp.status_code, resp.text[:200])
             else:
                 body = resp.json()
                 # Case A: Immediate data — list of company records
-                if isinstance(body, list) and body and isinstance(body[0], dict):
-                    c = body[0]
-                    # Make sure it's not a snapshot_id wrapper
+                data_list = body if isinstance(body, list) else body.get("data") or []
+                if data_list and isinstance(data_list[0], dict):
+                    c = data_list[0]
                     if c.get("name") or c.get("description") or c.get("website") or c.get("logo"):
                         result = _normalize_bd_company(c)
                         if result:
                             logger.info("[BD Company] Sync OK — %d fields from %s", len(result), company_linkedin_url)
                             return result
-                # Case B: Async job started — body is {"snapshot_id": "s_xxx"} or list with it
+                # Case B: Async job — snapshot_id returned
                 if isinstance(body, dict):
                     snapshot_id = body.get("snapshot_id")
-                elif isinstance(body, list) and body and isinstance(body[0], dict):
-                    snapshot_id = body[0].get("snapshot_id")
+                if not snapshot_id and data_list and isinstance(data_list[0], dict):
+                    snapshot_id = data_list[0].get("snapshot_id")
                 if snapshot_id:
                     logger.info("[BD Company] Async job started — snapshot_id=%s", snapshot_id)
     except Exception as e:
         logger.warning("[BD Company] /scrape error: %s", e)
 
-    # ── Attempt 2: Poll existing snapshot_id ─────────────────────────────────
+    # ── Poll snapshot if async job was started ────────────────────────────────
     if snapshot_id:
         try:
             data = await poll_snapshot(snapshot_id, interval=5, timeout=120)
@@ -2581,152 +2627,74 @@ async def _try_bd_company(company_linkedin_url: str) -> dict:
         except Exception as e:
             logger.warning("[BD Company] Snapshot poll failed for %s: %s", snapshot_id, e)
 
-    # ── Attempt 3: /trigger → /progress → /snapshot (company dataset) ────────
-    logger.info("[BD Company] Trying /trigger pattern for %s", company_linkedin_url)
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            tr = await client.post(
-                f"{BD_BASE}/trigger",
-                params={"dataset_id": dataset_id, "format": "json", "include_errors": "true"},
-                headers=_bd_headers(),
-                json=[{"url": company_linkedin_url}],
-            )
-            tr.raise_for_status()
-            snap_id = tr.json().get("snapshot_id") or tr.json().get("id")
-        if snap_id:
-            data = await poll_snapshot(snap_id, interval=5, timeout=120)
-            if data:
-                c = data[0] if isinstance(data, list) else data
-                result = _normalize_bd_company(c)
-                if result:
-                    logger.info("[BD Company] Trigger/poll OK — %d fields from %s", len(result), company_linkedin_url)
-                    return result
-    except Exception as e:
-        logger.warning("[BD Company] /trigger pattern failed for %s: %s", company_linkedin_url, e)
-
     logger.warning("[BD Company] All methods failed for %s — continuing waterfall", company_linkedin_url)
     return {}
 
 
 async def enrich_company_waterfall(company_name: str, domain: str, profile: dict) -> tuple[dict, list[dict]]:
     """
-    Company data waterfall:
-      0. Bright Data LinkedIn Company dataset (company LinkedIn URL)
-      1. Bright Data profile fields (company_link, image fields)
-      2. Apollo.io organization enrichment
-      3. Hunter.io domain search (company emails + info)
-      4. Clearbit Logo API (free fallback for logo)
+    Company data waterfall — BrightData only:
+      0. Bright Data LinkedIn Company dataset (company LinkedIn URL from person profile)
+      1. Bright Data person profile fields (logo, industry, employee count, etc.)
+      2. Clearbit Logo API (free, logo-only fallback when BD returns no logo)
     Returns (company_data dict, waterfall_log list)
     """
     log: list[dict] = []
     result: dict = {}
 
-    # ── Company LinkedIn URL (separate from website) ───────────────────────────
+    # ── Extract company LinkedIn URL from person profile ───────────────────────
     raw_link = profile.get("current_company_link") or profile.get("current_company_url") or ""
     company_linkedin_url = raw_link if "linkedin.com/company/" in raw_link else ""
-    # Actual company website (must NOT be a social URL)
+
+    # ── Actual company website from profile (not a social URL) ────────────────
     raw_website = profile.get("current_company_link") or ""
     m = re.search(r"https?://(?:www\.)?([^/?\s]+)", raw_website)
-    actual_website = raw_website if (m and not any(m.group(1).lower() == s or m.group(1).lower().endswith("." + s) for s in _SOCIAL_DOMAINS)) else ""
+    actual_website = raw_website if (m and not any(
+        m.group(1).lower() == s or m.group(1).lower().endswith("." + s)
+        for s in _SOCIAL_DOMAINS
+    )) else ""
 
-    # Step 0: Bright Data LinkedIn Company dataset
+    # Step 0: BrightData LinkedIn Company dataset (primary source)
     if company_linkedin_url:
         bd_co = await _try_bd_company(company_linkedin_url)
         if bd_co:
             result.update(bd_co)
-            log.append({"step": 0, "source": "Bright Data Company", "fields_found": list(bd_co.keys()), "note": company_linkedin_url})
-            # If BD company returned a real website, use that for domain lookup downstream
+            log.append({
+                "step": 0, "source": "Bright Data Company",
+                "fields_found": list(bd_co.keys()), "note": company_linkedin_url,
+            })
+            # BD returned a real website — use it as verified domain
             if bd_co.get("company_website"):
                 actual_website = bd_co["company_website"]
                 m2 = re.search(r"https?://(?:www\.)?([^/?\s]+)", actual_website)
                 if m2:
                     domain = m2.group(1).lower()
+    else:
+        logger.info("[CompanyWaterfall] No company LinkedIn URL in profile — skipping BD company scrape for %s", company_name)
 
-    # Step 1: Extract from Bright Data profile directly
-    bd_company = {
-        "company_logo": profile.get("current_company_logo") or profile.get("company_logo") or profile.get("logo"),
-        "company_linkedin": company_linkedin_url or None,
-        "company_website": actual_website or None,
+    # Step 1: Person profile fields (fill any gaps BD didn't cover)
+    profile_fields = {
+        "company_logo":        profile.get("current_company_logo") or profile.get("company_logo") or profile.get("logo"),
+        "company_linkedin":    company_linkedin_url or None,
+        "company_website":     actual_website or None,
         "company_description": profile.get("current_company_description"),
-        "employee_count": _safe_int(profile.get("current_company_employees_count")),
-        "industry": profile.get("current_company_industry"),
-        "founded_year": str(profile.get("current_company_founded") or ""),
+        "employee_count":      _safe_int(profile.get("current_company_employees_count")),
+        "industry":            profile.get("current_company_industry"),
+        "founded_year":        str(profile.get("current_company_founded") or ""),
     }
-    bd_filled = [k for k, v in bd_company.items() if v]
-    if bd_filled:
-        result.update({k: v for k, v in bd_company.items() if v and (k not in result or not result[k])})
-        log.append({"step": 1, "source": "Bright Data", "fields_found": bd_filled, "note": "LinkedIn profile fields"})
+    filled = [k for k, v in profile_fields.items() if v and (k not in result or not result[k])]
+    if filled:
+        result.update({k: profile_fields[k] for k in filled})
+        log.append({"step": 1, "source": "Bright Data (profile)", "fields_found": filled, "note": "person profile fields"})
 
-    # ── Resolve real company domain ────────────────────────────────────────────
-    # Priority: BD company result > guessed domain from name
-    # The guessed domain (e.g. "lbm.com") may belong to a completely different company.
-    # We validate by checking if Apollo confirms the name matches.
-    verified_domain = domain  # start with guessed domain
-    apollo_confirmed = False
-
-    # Step 2a: Apollo org by guessed domain — verify name matches
-    if verified_domain and company_name:
-        apollo_data = await _try_apollo_org(verified_domain)
-        if apollo_data:
-            # Check Apollo's returned name roughly matches our company name
-            # (prevents using "lbm.com → LBM Group" when we want "LBM Solutions")
-            apollo_new = []
-            for k, v in apollo_data.items():
-                if v and (k not in result or not result[k]):
-                    result[k] = v
-                    apollo_new.append(k)
-            if apollo_new:
-                apollo_confirmed = True
-                # If Apollo returned a real website, upgrade domain to that
-                if apollo_data.get("company_website"):
-                    m3 = re.search(r"https?://(?:www\.)?([^/?\s]+)", apollo_data["company_website"])
-                    if m3 and m3.group(1).lower() not in _SOCIAL_DOMAINS:
-                        verified_domain = m3.group(1).lower()
-                log.append({"step": 2, "source": "Apollo.io Org (domain)", "fields_found": apollo_new, "note": f"domain={verified_domain}"})
-
-    # Step 2b: Apollo company NAME search — if domain lookup failed or domain was unverified
-    # This is the key fix: search by company name to find the real website
-    if not apollo_confirmed and company_name:
-        logger.info("[CompanyWaterfall] Domain lookup inconclusive — searching Apollo by name: %s", company_name)
-        apollo_search = await _try_apollo_company_search(company_name)
-        if apollo_search:
-            search_new = []
-            for k, v in apollo_search.items():
-                if v and (k not in result or not result[k]):
-                    result[k] = v
-                    search_new.append(k)
-            if search_new:
-                # Apollo name search found the real company — update domain
-                if apollo_search.get("company_website"):
-                    m4 = re.search(r"https?://(?:www\.)?([^/?\s]+)", apollo_search["company_website"])
-                    if m4 and m4.group(1).lower() not in _SOCIAL_DOMAINS:
-                        verified_domain = m4.group(1).lower()
-                        apollo_confirmed = True
-                log.append({"step": 2, "source": "Apollo.io Name Search", "fields_found": search_new, "note": f"name={company_name}"})
-
-    # Use the verified domain for all downstream lookups
-    domain = verified_domain
-
-    # Step 3: Hunter domain search (with verified domain)
-    if domain:
-        hunter_data = await _try_hunter_domain(domain)
-        if hunter_data:
-            hunter_new = []
-            for k, v in hunter_data.items():
-                if v and (k not in result or not result[k]):
-                    result[k] = v
-                    hunter_new.append(k)
-            if hunter_new:
-                log.append({"step": 3, "source": "Hunter.io Domain", "fields_found": hunter_new, "note": f"domain={domain}"})
-
-    # Step 4: Clearbit logo fallback
+    # Step 2: Clearbit logo — free, no quota cost, logo only
     if not result.get("company_logo") and domain:
         logo = await _try_clearbit_logo(domain)
         if logo:
             result["company_logo"] = logo
-            log.append({"step": 4, "source": "Clearbit Logo API", "fields_found": ["company_logo"], "note": "free logo API"})
+            log.append({"step": 2, "source": "Clearbit Logo", "fields_found": ["company_logo"], "note": domain})
 
-    # Expose final verified domain so caller can update scraping target
+    # Expose final verified domain so caller can target the right website
     result["_verified_domain"] = domain
 
     return result, log
@@ -3607,6 +3575,36 @@ async def build_comprehensive_enrichment(
     from enrichment_config_service import get_workspace_config, get_scoring_config
 
     now    = datetime.now(timezone.utc).isoformat()
+
+    # ── LLM title inference — only when no title could be extracted ───────────
+    if profile.get("_needs_title_inference"):
+        name    = profile.get("name") or ""
+        company = profile.get("current_company_name") or ""
+        about   = (profile.get("about") or "")[:400]
+        exp     = profile.get("experience") or []
+        exp_ctx = ""
+        if exp and isinstance(exp, list) and isinstance(exp[0], dict):
+            e0 = exp[0]
+            exp_ctx = f"{e0.get('title','')} at {e0.get('company','')}".strip(" at")
+        try:
+            inferred = await _call_llm(
+                [
+                    {"role": "system", "content": "You extract professional job titles. Reply with ONLY the job title — 2-6 words, no punctuation, no first-person language."},
+                    {"role": "user", "content": (
+                        f"Person: {name}\nCompany: {company}\nRecent role: {exp_ctx}\nAbout: {about}\n\n"
+                        "What is this person's professional job title? Reply with the title only."
+                    )},
+                ],
+                max_tokens=20,
+                temperature=0.1,
+            )
+            if inferred and len(inferred.strip()) > 2:
+                profile = dict(profile)  # don't mutate caller's dict
+                profile["position"] = inferred.strip().strip('"').strip("'")
+                logger.info("[TitleInfer] Generated title for %s: %s", name, profile["position"])
+        except Exception as _tie:
+            logger.debug("[TitleInfer] Failed: %s", _tie)
+
     prompt = _build_comprehensive_prompt(linkedin_url, profile, contact, now, website_intel=website_intel)
 
     # Read system prompt + model from LIO config; fall back to hardcoded defaults

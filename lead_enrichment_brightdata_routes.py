@@ -854,12 +854,10 @@ async def get_job(job_id: str):
         job = dict(job_row)
         org_id = job.get("organization_id", "default")
 
-        leads_count, sub_rows = await asyncio.gather(
-            conn.fetchval("SELECT COUNT(*) FROM enriched_leads WHERE job_id=$1", job_id),
-            conn.fetch(
-                "SELECT * FROM enrichment_sub_jobs WHERE job_id=$1 AND organization_id=$2 ORDER BY chunk_index",
-                job_id, org_id,
-            ),
+        leads_count = await conn.fetchval("SELECT COUNT(*) FROM enriched_leads WHERE job_id=$1", job_id)
+        sub_rows = await conn.fetch(
+            "SELECT * FROM enrichment_sub_jobs WHERE job_id=$1 AND organization_id=$2 ORDER BY chunk_index",
+            job_id, org_id,
         )
 
     return {**job, "leads_count": leads_count, "sub_jobs": [dict(r) for r in sub_rows]}
@@ -1730,56 +1728,136 @@ with keys: fit_summary, key_pain_points, buying_signals, recommended_approach, i
     description=_COMPANY_DESC,
 )
 async def company_enrichment(body: ViewCompanyRequest):
+    import company_service as cs
+    from datetime import datetime, timezone
+
     lead = await _resolve_lead(body.leadenrich_id)
-    full = _get_full_data(lead)
+
+    company_linkedin = lead.get("company_linkedin")
+    if not company_linkedin:
+        raise HTTPException(status_code=400, detail="No company LinkedIn URL found for this lead.")
+
+    # Fetch fresh company data directly from BrightData
+    bd_data = await cs._fetch_bd_company_profile(company_linkedin)
+    if not bd_data:
+        raise HTTPException(status_code=502, detail="BrightData did not return company data.")
+
+    # Save to DB
+    org_id = lead.get("organization_id", "default")
+    try:
+        record = {
+            "id":                  cs._company_id(company_linkedin),
+            "company_linkedin_url": company_linkedin,
+            "org_id":              org_id,
+            "raw_data":            json.dumps(bd_data, default=str),
+            "last_enriched_at":    datetime.now(timezone.utc).isoformat(),
+            "updated_at":          datetime.now(timezone.utc).isoformat(),
+        }
+        cs._map_bd_company_profile(bd_data, record)
+        await cs._upsert_company(record)
+        logger.info("[ViewCompany] Saved company to DB: %s", company_linkedin)
+    except Exception as _e:
+        logger.warning("[ViewCompany] DB save failed: %s", _e)
+
+    # AI enrichment from BrightData company data
+    ai_enrichment = await _enrich_company_with_ai(bd_data)
 
     return {
-        "lead_id":     lead.get("id"),
-        "linkedin_url": lead.get("linkedin_url"),
-        "company_id":  lead.get("company_id"),
-
-        "identity": {
-            "name":         lead.get("company"),
-            "domain":       lead.get("company_domain"),
-            "website":      lead.get("company_website"),
-            "linkedin_url": lead.get("company_linkedin"),
-            "logo":         lead.get("company_logo"),
-            "detail":       full.get("company_identity", {}),
-        },
-
-        "profile": {
-            "industry":       lead.get("industry"),
-            "employee_count": lead.get("employee_count"),
-            "revenue":        lead.get("revenue"),
-            "tech_stack":     _parse_json_field(lead, "wappalyzer_tech", []),
-            "detail":         full.get("company_profile", {}),
-        },
-
-        "website_intelligence": full.get("website_intelligence", {}),
-
-        "market_signals": {
-            "news_mentions":  _parse_json_field(lead, "news_mentions", []),
-            "crunchbase":     _parse_json_field(lead, "crunchbase_data", {}),
-            "hiring_signals": full.get("hiring_signals", []),
-            "detail":         full.get("company_intelligence", {}),
-        },
-
-        "intent_signals": full.get("intent_signals", {}),
-
-        "scores": {
-            "company_score":      lead.get("company_score"),
-            "company_score_tier": lead.get("company_score_tier"),
-            "combined_score":     lead.get("combined_score"),
-        },
-
-        "tags": {
-            "company_tags":    _parse_json_field(lead, "company_tags", []),
-            "culture_signals": _parse_json_field(lead, "culture_signals", {}),
-            "account_pitch":   _parse_json_field(lead, "account_pitch", {}),
-        },
-
-        "ai_generated": await _company_ai_analysis(lead, full, body.system_prompt),
+        "lead_id":          lead.get("id"),
+        "linkedin_url":     lead.get("linkedin_url"),
+        "company_linkedin": company_linkedin,
+        "brightdata":       bd_data,
+        "ai_enrichment":    ai_enrichment,
     }
+
+
+async def _enrich_company_with_ai(bd: dict) -> dict:
+    """
+    Pass raw BrightData company data to the LLM and generate lead-enrichment insights:
+    company summary, ICP fit, pain points, buying signals, intent signals, outreach angle.
+    """
+    now_iso = __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Build compact context from BD fields
+    posts_text = " | ".join(
+        p.get("text", "")[:200]
+        for p in (bd.get("updates") or bd.get("posts") or [])[:5]
+        if p.get("text")
+    )
+    similar = ", ".join(
+        s.get("title", "") for s in (bd.get("similar") or [])[:5] if s.get("title")
+    )
+    employees_sample = ", ".join(
+        e.get("title", "") for e in (bd.get("employees") or [])[:4] if e.get("title")
+    )
+    additional_info = str(bd.get("additional_information") or "")[:400]
+
+    context = f"""
+Company Name: {bd.get("name", "")}
+LinkedIn URL: {bd.get("url", "")}
+Industry: {bd.get("industries", "")}
+Organization Type: {bd.get("organization_type", "")}
+Company Size: {bd.get("company_size", "")}
+Employees on LinkedIn: {bd.get("employees_in_linkedin", "")}
+Headquarters: {bd.get("headquarters", "")}
+Founded: {bd.get("founded", "")}
+Website: {bd.get("website", "")}
+Followers: {bd.get("followers", "")}
+Slogan: {bd.get("slogan", "")}
+About: {str(bd.get("about") or bd.get("description") or "")[:600]}
+Recent Posts (sample): {posts_text[:600]}
+Similar Companies: {similar}
+Notable Employees: {employees_sample}
+Additional Info: {additional_info}
+""".strip()
+
+    system_prompt = (
+        "You are a B2B lead enrichment AI. Given raw LinkedIn company data from BrightData, "
+        "generate structured sales intelligence in JSON. Be concise and data-driven. "
+        "Return only valid JSON — no markdown, no explanation."
+    )
+
+    user_prompt = f"""Analyse this company as a B2B sales prospect and return JSON with these exact keys:
+
+{{
+  "company_summary": "2-3 sentence summary of what the company does and its market position",
+  "icp_fit": {{
+    "score": 0-100,
+    "tier": "HOT | WARM | COOL | COLD",
+    "explanation": "why this score"
+  }},
+  "pain_points": ["pain point 1", "pain point 2", "pain point 3"],
+  "buying_signals": ["signal 1", "signal 2"],
+  "intent_signals": {{
+    "hiring_activity": "what roles they are hiring — from additional_info/posts",
+    "recent_news": "any notable events from posts",
+    "growth_stage": "early / scaling / enterprise / government"
+  }},
+  "outreach": {{
+    "recommended_angle": "the best angle to approach this company",
+    "cold_email_subject": "subject line",
+    "cold_email_body": "max 100 words, personalised to their context",
+    "linkedin_note": "max 300 chars connection note"
+  }},
+  "tags": ["tag1", "tag2", "tag3", "tag4"],
+  "account_pitch": "one sentence pitch for this account"
+}}
+
+Company data:
+{context}
+
+Enrichment date: {now_iso}"""
+
+    try:
+        raw = await _quick_llm(system_prompt, user_prompt, max_tokens=2000)
+        # Parse JSON from response
+        m = __import__("re").search(r"\{.*\}", raw, __import__("re").DOTALL)
+        if m:
+            return json.loads(m.group())
+        return {"raw": raw}
+    except Exception as _e:
+        logger.warning("[ViewCompany] AI enrichment failed: %s", _e)
+        return {"error": str(_e)}
 
 
 async def _company_ai_analysis(lead: dict, full: dict, system_prompt: Optional[str]) -> Optional[dict]:
