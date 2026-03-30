@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/import", tags=["import"])
 
-MAX_FILE_SIZE = 200 * 1024 * 1024  # 200 MB
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -44,7 +44,7 @@ async def preview_file(file: UploadFile = File(...)):
     """
     contents = await file.read()
     if len(contents) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="File exceeds 200 MB limit")
+        raise HTTPException(status_code=413, detail="File exceeds 500 MB limit")
     try:
         result = parse_preview(contents, file.filename or "upload")
     except ValueError as exc:
@@ -77,7 +77,7 @@ async def start_import(
     """
     contents = await file.read()
     if len(contents) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="File exceeds 200 MB limit")
+        raise HTTPException(status_code=413, detail="File exceeds 500 MB limit")
 
     try:
         mapping_dict: dict[str, str] = json.loads(mapping)

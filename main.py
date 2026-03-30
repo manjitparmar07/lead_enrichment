@@ -35,6 +35,9 @@ from ai_enrichment_routes import router as ai_enrichment_router
 from analytics_routes import router as analytics_router
 from import_routes import router as import_router
 from storage_routes import router as storage_router
+from system_prompt_routes import router as system_prompt_router
+from system_prompt_generator_routes import router as spg_router
+from email_enrichment_routes import router as email_enrichment_router
 from security import SecurityMiddleware
 import keys_service
 import lead_enrichment_worker as worker
@@ -44,6 +47,7 @@ from lead_enrichment_brightdata_service import init_leads_db
 from workspace_service import init_workspace_db
 from enrichment_config_service import init_config_db
 from company_service import init_company_db
+from system_prompt_service import init_system_prompts_db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,8 +94,11 @@ app.include_router(enrichment_config_router,  prefix="/api", include_in_schema=F
 app.include_router(company_router,            prefix="/api", include_in_schema=False)
 app.include_router(ai_enrichment_router,      prefix="/api")
 app.include_router(analytics_router,          prefix="/api")
+app.include_router(system_prompt_router,      prefix="/api")
+app.include_router(spg_router,               prefix="/api", include_in_schema=False)
 app.include_router(import_router)
 app.include_router(storage_router)
+app.include_router(email_enrichment_router,   prefix="/api")
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 # Production requests go through nginx which owns CORS headers.
@@ -115,6 +122,7 @@ app.add_middleware(
 )
 
 # ── Startup / Shutdown ────────────────────────────────────────────────────────
+
 @app.on_event("startup")
 async def startup():
     keys_service.reload()
@@ -123,14 +131,9 @@ async def startup():
     await init_workspace_db()
     await init_config_db()
     await init_company_db()
+    await init_system_prompts_db()
     await worker.start_workers()
     await _import_worker.start_import_workers()
-    # Migrate import schema (add new columns if they don't exist yet)
-    from import_service import _ensure_schema as _ensure_import_schema
-    await _ensure_import_schema()
-    from storage_routes import _ensure_unmapped_table
-    async with _db.get_pool().acquire() as _conn:
-        await _ensure_unmapped_table(_conn)
     logger.info("Lead Enrichment API started — http://0.0.0.0:%s", os.getenv("PORT", "8020"))
 
 
@@ -149,4 +152,4 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8020")), reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "4064")), reload=True)

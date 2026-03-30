@@ -21,5 +21,5 @@ if [ ! -f ".env" ]; then
   echo "Created .env from .env.example — fill in your API keys"
 fi
 
-echo "Starting Lead Enrichment API on port ${PORT:-8020}..."
-uvicorn main:app --host 0.0.0.0 --port "${PORT:-8020}" --reload
+echo "Starting Lead Enrichment API on port ${PORT:-4064}..."
+uvicorn main:app --host 0.0.0.0 --port "${PORT:-4064}" --reload

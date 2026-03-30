@@ -160,3 +160,58 @@ async def all_credit_usage(request: Request):
 async def tool_registry():
     """Static tool definitions (available to all orgs)."""
     return cfg.TOOL_REGISTRY
+
+
+# ── Scoring config ─────────────────────────────────────────────────────────────
+
+class ScoringConfigBody(BaseModel):
+    hot:                    Optional[int] = None
+    warm:                   Optional[int] = None
+    cool:                   Optional[int] = None
+    outreach_threshold:     Optional[int] = None
+    lead_cache_ttl:         Optional[int] = None
+    company_cache_ttl_days: Optional[int] = None
+
+
+@router.get("/scoring")
+async def get_scoring(request: Request):
+    """Return scoring thresholds + cache TTLs for the org."""
+    return await cfg.get_scoring_config(_org(request))
+
+
+@router.put("/scoring")
+async def save_scoring(body: ScoringConfigBody, request: Request):
+    """Update scoring thresholds + cache TTLs for the org."""
+    data = {k: v for k, v in body.model_dump().items() if v is not None}
+    return await cfg.save_scoring_config(_org(request), data)
+
+
+# ── LLM models ─────────────────────────────────────────────────────────────────
+
+class LlmModelBody(BaseModel):
+    label:      str
+    note:       Optional[str] = ""
+    tier:       str = "fast"
+    is_active:  bool = True
+    sort_order: int = 99
+
+
+@router.get("/llm-models")
+async def list_llm_models():
+    """Return all active LLM models (used by frontend dropdowns)."""
+    return await cfg.get_llm_models()
+
+
+@router.put("/llm-models/{model_id}")
+async def upsert_llm_model(model_id: str, body: LlmModelBody):
+    """Admin: add or update an LLM model entry."""
+    return await cfg.upsert_llm_model(model_id, body.model_dump())
+
+
+@router.delete("/llm-models/{model_id}")
+async def disable_llm_model(model_id: str):
+    """Admin: soft-delete (deactivate) an LLM model."""
+    from db import get_pool
+    async with get_pool().acquire() as conn:
+        await conn.execute("UPDATE llm_models SET is_active=FALSE WHERE id=$1", model_id)
+    return {"ok": True}

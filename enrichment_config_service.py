@@ -127,6 +127,38 @@ async def init_config_db() -> None:
         """)
         for col in ["lio_system_prompt", "lio_model", "lio_prompts_json", "workspace_context_json", "ai_prompts_json"]:
             await conn.execute(f"ALTER TABLE workspace_configs ADD COLUMN IF NOT EXISTS {col} TEXT DEFAULT ''")
+        for col, typedef in [
+            ("score_hot_threshold",      "INTEGER DEFAULT 80"),
+            ("score_warm_threshold",     "INTEGER DEFAULT 55"),
+            ("score_cool_threshold",     "INTEGER DEFAULT 30"),
+            ("outreach_threshold",       "INTEGER DEFAULT 50"),
+            ("lead_cache_ttl",           "INTEGER DEFAULT 1800"),
+            ("company_cache_ttl_days",   "INTEGER DEFAULT 7"),
+        ]:
+            await conn.execute(f"ALTER TABLE workspace_configs ADD COLUMN IF NOT EXISTS {col} {typedef}")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS llm_models (
+                id         TEXT    PRIMARY KEY,
+                label      TEXT    NOT NULL,
+                note       TEXT,
+                tier       TEXT    NOT NULL DEFAULT 'fast',
+                is_active  BOOLEAN NOT NULL DEFAULT TRUE,
+                sort_order INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        # Seed default models (idempotent)
+        for mid, label, note, tier, order in [
+            ("llama-3.1-8b-instant",          "Llama 3.1 8B Instant",    "Fastest · ~1000 tok/s · cheapest",  "fast",    1),
+            ("llama-3.2-11b-text-preview",    "Llama 3.2 11B",           "Better reasoning, still fast",       "fast",    2),
+            ("llama-3.3-70b-versatile",       "Llama 3.3 70B Versatile", "Best on Groq ⭐ recommended",        "quality", 3),
+            ("llama-3.1-70b-versatile",       "Llama 3.1 70B (128k)",    "Fallback if quota exceeded",         "quality", 4),
+            ("mixtral-8x7b-32768",            "Mixtral 8x7B (32k ctx)",  "Long context, multilingual",         "quality", 5),
+            ("deepseek-r1-distill-llama-70b", "DeepSeek R1 70B",         "Chain-of-thought reasoning",         "quality", 6),
+        ]:
+            await conn.execute(
+                "INSERT INTO llm_models (id,label,note,tier,sort_order) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(id) DO NOTHING",
+                mid, label, note, tier, order,
+            )
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_tool_cfg_org  ON enrichment_tool_configs(org_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_credits_org   ON enrichment_tool_credits(org_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_log_org ON enrichment_credit_usage_log(org_id, tool_name)")
@@ -974,3 +1006,100 @@ async def get_ai_module_prompts(org_id: str) -> List[dict]:
 async def save_ai_module_prompts(org_id: str, prompts: List[dict]) -> None:
     """Persist the 10 AI module prompt configs for this org."""
     await save_workspace_config(org_id, {"ai_prompts_json": json.dumps(prompts)})
+
+
+# ── Scoring config ─────────────────────────────────────────────────────────────
+
+_SCORING_DEFAULTS = {
+    "hot":                   80,
+    "warm":                  55,
+    "cool":                  30,
+    "outreach_threshold":    50,
+    "lead_cache_ttl":        1800,
+    "company_cache_ttl_days": 7,
+}
+
+
+async def get_scoring_config(org_id: str) -> dict:
+    """Return scoring thresholds + cache TTLs for the org (falls back to defaults)."""
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT score_hot_threshold, score_warm_threshold, score_cool_threshold,
+                      outreach_threshold, lead_cache_ttl, company_cache_ttl_days
+               FROM workspace_configs WHERE org_id=$1""",
+            org_id,
+        )
+    if row:
+        return {
+            "hot":                   row["score_hot_threshold"]     or _SCORING_DEFAULTS["hot"],
+            "warm":                  row["score_warm_threshold"]    or _SCORING_DEFAULTS["warm"],
+            "cool":                  row["score_cool_threshold"]    or _SCORING_DEFAULTS["cool"],
+            "outreach_threshold":    row["outreach_threshold"]      or _SCORING_DEFAULTS["outreach_threshold"],
+            "lead_cache_ttl":        row["lead_cache_ttl"]          or _SCORING_DEFAULTS["lead_cache_ttl"],
+            "company_cache_ttl_days":row["company_cache_ttl_days"]  or _SCORING_DEFAULTS["company_cache_ttl_days"],
+        }
+    return dict(_SCORING_DEFAULTS)
+
+
+async def save_scoring_config(org_id: str, data: dict) -> dict:
+    """Persist scoring thresholds + cache TTLs for the org."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            """INSERT INTO workspace_configs
+                   (org_id, score_hot_threshold, score_warm_threshold, score_cool_threshold,
+                    outreach_threshold, lead_cache_ttl, company_cache_ttl_days, updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+               ON CONFLICT(org_id) DO UPDATE SET
+                   score_hot_threshold      = EXCLUDED.score_hot_threshold,
+                   score_warm_threshold     = EXCLUDED.score_warm_threshold,
+                   score_cool_threshold     = EXCLUDED.score_cool_threshold,
+                   outreach_threshold       = EXCLUDED.outreach_threshold,
+                   lead_cache_ttl           = EXCLUDED.lead_cache_ttl,
+                   company_cache_ttl_days   = EXCLUDED.company_cache_ttl_days,
+                   updated_at               = EXCLUDED.updated_at""",
+            org_id,
+            data.get("hot",                   _SCORING_DEFAULTS["hot"]),
+            data.get("warm",                  _SCORING_DEFAULTS["warm"]),
+            data.get("cool",                  _SCORING_DEFAULTS["cool"]),
+            data.get("outreach_threshold",    _SCORING_DEFAULTS["outreach_threshold"]),
+            data.get("lead_cache_ttl",        _SCORING_DEFAULTS["lead_cache_ttl"]),
+            data.get("company_cache_ttl_days",_SCORING_DEFAULTS["company_cache_ttl_days"]),
+            now,
+        )
+    return await get_scoring_config(org_id)
+
+
+# ── LLM models (admin-editable, seeded in DB) ──────────────────────────────────
+
+async def get_llm_models() -> list:
+    """Return active LLM models from DB, ordered by sort_order."""
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, label, note, tier, sort_order FROM llm_models WHERE is_active=TRUE ORDER BY sort_order"
+        )
+    return [dict(r) for r in rows]
+
+
+async def upsert_llm_model(model_id: str, data: dict) -> dict:
+    """Insert or update an LLM model entry."""
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            """INSERT INTO llm_models (id, label, note, tier, is_active, sort_order)
+               VALUES ($1,$2,$3,$4,$5,$6)
+               ON CONFLICT(id) DO UPDATE SET
+                   label      = EXCLUDED.label,
+                   note       = EXCLUDED.note,
+                   tier       = EXCLUDED.tier,
+                   is_active  = EXCLUDED.is_active,
+                   sort_order = EXCLUDED.sort_order""",
+            model_id,
+            data.get("label", model_id),
+            data.get("note", ""),
+            data.get("tier", "fast"),
+            data.get("is_active", True),
+            data.get("sort_order", 99),
+        )
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM llm_models WHERE id=$1", model_id)
+    return dict(row)

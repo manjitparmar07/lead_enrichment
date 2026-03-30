@@ -46,8 +46,18 @@ from db import get_pool, named_args
 
 logger = logging.getLogger(__name__)
 
-# ── Cache TTL ─────────────────────────────────────────────────────────────────
+# ── Cache TTL — default; per-org value read from workspace_configs via get_company_cache_ttl() ──
 CACHE_TTL_DAYS = 7
+
+
+async def get_company_cache_ttl(org_id: str) -> int:
+    """Return company cache TTL in days for the org (falls back to 7)."""
+    try:
+        from enrichment_config_service import get_scoring_config
+        sc = await get_scoring_config(org_id)
+        return int(sc.get("company_cache_ttl_days", CACHE_TTL_DAYS))
+    except Exception:
+        return CACHE_TTL_DAYS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -107,11 +117,24 @@ async def init_company_db() -> None:
             await conn.execute(idx)
 
         for col, col_type in [
-            ("company_id",     "TEXT"),
-            ("combined_score", "INTEGER DEFAULT 0"),
-            ("company_score",  "INTEGER DEFAULT 0"),
+            ("company_id",          "TEXT"),
+            ("combined_score",      "INTEGER DEFAULT 0"),
+            ("company_score",       "INTEGER DEFAULT 0"),
         ]:
             await conn.execute(f"ALTER TABLE enriched_leads ADD COLUMN IF NOT EXISTS {col} {col_type}")
+
+        # New company_enrichments columns from richer BD company dataset
+        for col, col_type in [
+            ("linkedin_followers",  "INTEGER DEFAULT 0"),
+            ("company_slogan",      "TEXT"),
+            ("similar_companies",   "TEXT DEFAULT '[]'"),
+            ("organization_type",   "TEXT"),
+        ]:
+            await conn.execute(f"ALTER TABLE company_enrichments ADD COLUMN IF NOT EXISTS {col} {col_type}")
+        # Mirror linkedin_followers onto enriched_leads too
+        await conn.execute(
+            "ALTER TABLE enriched_leads ADD COLUMN IF NOT EXISTS linkedin_followers INTEGER DEFAULT 0"
+        )
 
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_leads_company ON enriched_leads(company_id)"
@@ -986,6 +1009,11 @@ async def enrich_company(
         "last_enriched_at":    now.isoformat(),
         "cache_expires_at":    (now + timedelta(days=CACHE_TTL_DAYS)).isoformat(),
         "updated_at":          now.isoformat(),
+        # New fields from richer BD company dataset
+        "linkedin_followers":  0,
+        "company_slogan":      "",
+        "similar_companies":   "[]",
+        "organization_type":   "",
     }
 
     # Merge in data already extracted from person profile
@@ -993,9 +1021,14 @@ async def enrich_company(
         for field in ("name", "domain", "website", "logo", "description",
                       "industry", "employee_count", "hq_location", "founded_year",
                       "funding_stage", "total_funding", "last_funding_date",
-                      "lead_investor", "company_twitter", "company_email", "company_phone"):
+                      "lead_investor", "company_twitter", "company_email", "company_phone",
+                      "linkedin_followers", "company_slogan", "organization_type"):
             if known_data.get(field):
                 record[field] = known_data[field]
+        # similar_companies comes in as a list — serialise to JSON string
+        if known_data.get("similar_companies"):
+            sc = known_data["similar_companies"]
+            record["similar_companies"] = json.dumps(sc, default=str) if isinstance(sc, list) else sc
 
     # ── P2: LinkedIn Company Posts ────────────────────────────────────────────
     posts = await _fetch_company_posts(company_linkedin_url)

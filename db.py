@@ -36,10 +36,9 @@ async def init_pool() -> None:
     global _pool
     _pool = await asyncpg.create_pool(
         os.environ["DATABASE_URL"],
-        min_size=1,
-        max_size=10,
+        min_size=3,
+        max_size=25,
         command_timeout=300,  # 5 min — needed for bulk COPY to remote DB
-        statement_cache_size=0,  # required for Neon / PgBouncer compatibility
     )
 
 

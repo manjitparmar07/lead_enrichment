@@ -66,6 +66,16 @@ def _outreach_threshold() -> int:
     try: return int(_k("LEAD_OUTREACH_THRESHOLD", "50"))
     except ValueError: return 50
 
+
+async def _outreach_threshold_for_org(org_id: str) -> int:
+    """Read outreach threshold from workspace_configs for org; fall back to env/default."""
+    try:
+        from enrichment_config_service import get_scoring_config
+        sc = await get_scoring_config(org_id)
+        return int(sc.get("outreach_threshold", 50))
+    except Exception:
+        return _outreach_threshold()
+
 # Backward-compat module-level names (read once at import; services use _fn() at call time)
 BD_API_KEY         = ""  # use _bd_api_key() inside functions
 BD_PROFILE_DATASET = ""  # use _bd_profile_dataset() inside functions
@@ -121,19 +131,48 @@ def _clean_lead_strings(lead: dict, fields: list) -> None:
             lead[f] = _strip_emojis(v)
 
 
-# ── LIO forwarding ────────────────────────────────────────────────────────────
+# ── Shared persistent HTTP clients (reuse TCP/TLS connections across requests) ─
+# Each external service gets its own client so keep-alive pools don't interfere.
 LIO_RECEIVE_URL = os.getenv("LIO_RECEIVE_URL", "https://api-lio.worksbuddy.ai/api/enrich/receive")
 _lio_client: Optional[httpx.AsyncClient] = None
+_api_client: Optional[httpx.AsyncClient] = None   # Hunter / Apollo / Dropcontact / PDL / ZeroBounce
+_bd_client: Optional[httpx.AsyncClient] = None    # Bright Data
+_web_client: Optional[httpx.AsyncClient] = None   # Website scraping (follow redirects)
+
+_HTTP_LIMITS = httpx.Limits(max_connections=40, max_keepalive_connections=20)
 
 
 def _get_lio_client() -> httpx.AsyncClient:
     global _lio_client
     if _lio_client is None or _lio_client.is_closed:
-        _lio_client = httpx.AsyncClient(
-            timeout=30.0,
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-        )
+        _lio_client = httpx.AsyncClient(timeout=30.0, limits=_HTTP_LIMITS)
     return _lio_client
+
+
+def _get_api_client() -> httpx.AsyncClient:
+    """Shared client for Hunter, Apollo, Dropcontact, PDL, ZeroBounce."""
+    global _api_client
+    if _api_client is None or _api_client.is_closed:
+        _api_client = httpx.AsyncClient(timeout=25.0, limits=_HTTP_LIMITS)
+    return _api_client
+
+
+def _get_bd_client() -> httpx.AsyncClient:
+    """Shared client for Bright Data API calls."""
+    global _bd_client
+    if _bd_client is None or _bd_client.is_closed:
+        _bd_client = httpx.AsyncClient(timeout=90.0, limits=_HTTP_LIMITS)
+    return _bd_client
+
+
+def _get_web_client() -> httpx.AsyncClient:
+    """Shared client for website scraping (follow redirects)."""
+    global _web_client
+    if _web_client is None or _web_client.is_closed:
+        _web_client = httpx.AsyncClient(
+            timeout=30.0, limits=_HTTP_LIMITS, follow_redirects=True,
+        )
+    return _web_client
 
 
 async def send_to_lio(lead: dict, sso_id: str = "") -> None:
@@ -480,8 +519,13 @@ async def init_leads_db() -> None:
             await conn.execute(f"ALTER TABLE enriched_leads ADD COLUMN IF NOT EXISTS {col} {col_type}")
         await conn.execute("ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS organization_id TEXT DEFAULT 'default'")
         for idx_sql in [
-            "CREATE INDEX IF NOT EXISTS idx_leads_org ON enriched_leads(organization_id, total_score DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_jobs_org  ON enrichment_jobs(organization_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_leads_org        ON enriched_leads(organization_id, total_score DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_jobs_org         ON enrichment_jobs(organization_id, created_at DESC)",
+            # Performance indexes — analytics + filtered list queries
+            "CREATE INDEX IF NOT EXISTS idx_leads_org_date   ON enriched_leads(organization_id, enriched_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_leads_org_tier   ON enriched_leads(organization_id, score_tier)",
+            "CREATE INDEX IF NOT EXISTS idx_leads_org_email  ON enriched_leads(organization_id) WHERE work_email IS NOT NULL AND work_email != ''",
+            "CREATE INDEX IF NOT EXISTS idx_jobs_org_status  ON enrichment_jobs(organization_id, status, created_at DESC)",
         ]:
             await conn.execute(idx_sql)
         # ── processed_snapshots — webhook idempotency ─────────────────────────
@@ -550,12 +594,19 @@ async def _upsert_lead(lead: dict) -> None:
     args = [lead[k] for k in all_keys]
     async with get_pool().acquire() as conn:
         await conn.execute(sql, *args)
+    # Bust cached lead row so next read gets fresh data
+    lead_id = lead.get("id")
+    if lead_id and _redis_pool:
+        try:
+            await _redis_pool.delete(f"lead:row:{lead_id}")
+        except Exception:
+            pass
 
 
 async def _update_job(job_id: str, **kwargs) -> None:
     if not kwargs:
         return
-    kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
+    kwargs["updated_at"] = datetime.now(timezone.utc)
     keys = list(kwargs.keys())
     sets = ", ".join(f"{k}=${i + 1}" for i, k in enumerate(keys))
     args = [kwargs[k] for k in keys] + [job_id]
@@ -566,7 +617,7 @@ async def _update_job(job_id: str, **kwargs) -> None:
 async def _create_sub_job(
     sub_job_id: str, job_id: str, chunk_index: int, total_urls: int, org_id: str
 ) -> None:
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
     async with get_pool().acquire() as conn:
         await conn.execute(
             """INSERT INTO enrichment_sub_jobs
@@ -580,7 +631,7 @@ async def _create_sub_job(
 async def _update_sub_job(sub_job_id: str, **kwargs) -> None:
     if not kwargs:
         return
-    kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
+    kwargs["updated_at"] = datetime.now(timezone.utc)
     keys = list(kwargs.keys())
     sets = ", ".join(f"{k}=${i + 1}" for i, k in enumerate(keys))
     args = [kwargs[k] for k in keys] + [sub_job_id]
@@ -1718,14 +1769,14 @@ async def _try_hunter(first: str, last: str, domain: str) -> Optional[dict]:
     if not _hunter_api_key() or not domain:
         return None
     try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get("https://api.hunter.io/v2/email-finder", params={
-                "domain": domain, "first_name": first, "last_name": last, "api_key": _hunter_api_key(),
-            })
-            d = r.json().get("data", {})
-            if d.get("email") and d.get("score", 0) >= 50:
-                logger.info("[Hunter] Found: %s (score=%s)", d["email"], d["score"])
-                return {"email": d["email"], "source": "hunter", "confidence": "high" if d["score"] >= 80 else "medium"}
+        c = _get_api_client()
+        r = await c.get("https://api.hunter.io/v2/email-finder", params={
+            "domain": domain, "first_name": first, "last_name": last, "api_key": _hunter_api_key(),
+        })
+        d = r.json().get("data", {})
+        if d.get("email") and d.get("score", 0) >= 50:
+            logger.info("[Hunter] Found: %s (score=%s)", d["email"], d["score"])
+            return {"email": d["email"], "source": "hunter", "confidence": "high" if d["score"] >= 80 else "medium"}
     except Exception as e:
         logger.warning("[Hunter] %s", e)
     return None
@@ -1735,29 +1786,29 @@ async def _try_apollo(first: str, last: str, domain: str) -> Optional[dict]:
     if not _apollo_api_key() or not domain:
         return None
     try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.post("https://api.apollo.io/v1/people/match",
-                headers={"Content-Type": "application/json"},
-                json={"api_key": _apollo_api_key(), "first_name": first, "last_name": last,
-                      "domain": domain, "reveal_personal_emails": True},
-            )
-            p = r.json().get("person") or {}
-            email = p.get("email")
-            phone = p.get("phone") or (p.get("phone_numbers") or [{}])[0].get("sanitized_number")
-            photo = p.get("photo_url")
-            twitter = p.get("twitter_url") or p.get("twitter")
-            if email and "@" in email and "placeholder" not in email.lower():
-                logger.info("[Apollo] Found: %s", email)
-                return {
-                    "email": email,
-                    "phone": phone,
-                    "source": "apollo",
-                    "confidence": "high",
-                    "avatar_url": photo,
-                    "twitter": twitter,
-                }
-            if email and "placeholder" in email.lower():
-                logger.warning("[Apollo] Rejected placeholder email: %s", email)
+        c = _get_api_client()
+        r = await c.post("https://api.apollo.io/v1/people/match",
+            headers={"Content-Type": "application/json", "X-Api-Key": _apollo_api_key()},
+            json={"first_name": first, "last_name": last,
+                  "domain": domain, "reveal_personal_emails": True},
+        )
+        p = r.json().get("person") or {}
+        email = p.get("email")
+        phone = p.get("phone") or (p.get("phone_numbers") or [{}])[0].get("sanitized_number")
+        photo = p.get("photo_url")
+        twitter = p.get("twitter_url") or p.get("twitter")
+        if email and "@" in email and "placeholder" not in email.lower():
+            logger.info("[Apollo] Found: %s", email)
+            return {
+                "email": email,
+                "phone": phone,
+                "source": "apollo",
+                "confidence": "high",
+                "avatar_url": photo,
+                "twitter": twitter,
+            }
+        if email and "placeholder" in email.lower():
+            logger.warning("[Apollo] Rejected placeholder email: %s", email)
     except Exception as e:
         logger.warning("[Apollo] %s", e)
     return None
@@ -1771,9 +1822,9 @@ async def _try_dropcontact(linkedin_url: str, first: str, last: str, domain: str
     try:
         payload = {"data": [{"linkedin": linkedin_url or "", "first_name": first, "last_name": last, "website": domain}],
                    "siren": False, "language": "en"}
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.post("https://api.dropcontact.com/batch",
-                             json=payload, headers={"X-Access-Token": key, "Content-Type": "application/json"})
+        c = _get_api_client()
+        r = await c.post("https://api.dropcontact.com/batch",
+                         json=payload, headers={"X-Access-Token": key, "Content-Type": "application/json"})
         if r.status_code == 200:
             d = r.json()
             for item in (d.get("data") or []):
@@ -1801,8 +1852,8 @@ async def _try_pdl(first: str, last: str, linkedin_url: str, domain: str) -> Opt
             params["company"]    = domain
         else:
             return None
-        async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get("https://api.peopledatalabs.com/v5/person/enrich", params=params)
+        c = _get_api_client()
+        r = await c.get("https://api.peopledatalabs.com/v5/person/enrich", params=params)
         if r.status_code == 200:
             d = r.json()
             emails = d.get("data", {}).get("emails") or []
@@ -1826,9 +1877,9 @@ async def _try_zerobounce(email: str) -> dict:
     if not key or not email:
         return {"email": email, "verified": False, "bounce_risk": None}
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get("https://api.zerobounce.net/v2/validate",
-                            params={"api_key": key, "email": email, "ip_address": ""})
+        c = _get_api_client()
+        r = await c.get("https://api.zerobounce.net/v2/validate",
+                        params={"api_key": key, "email": email, "ip_address": ""})
         if r.status_code == 200:
             d = r.json()
             status = d.get("status", "")
@@ -1871,21 +1922,29 @@ async def find_contact_info(
     """
     result: Optional[dict] = None
 
-    # Step 1 — Hunter
-    if not skip_hunter:
-        result = await _try_hunter(first, last, domain)
-        if result:
-            logger.info("[ContactWaterfall] Step 1 Hunter hit: %s", result.get("email"))
-    else:
-        logger.info("[ContactWaterfall] Step 1 Hunter skipped (disabled/no credits)")
+    # Steps 1 + 2 — Hunter and Apollo in parallel (saves 2-4s vs sequential)
+    run_hunter = not skip_hunter and bool(_hunter_api_key()) and bool(domain)
+    run_apollo = not skip_apollo and bool(_apollo_api_key()) and bool(domain)
 
-    # Step 2 — Apollo
-    if not result and not skip_apollo:
-        result = await _try_apollo(first, last, domain)
-        if result:
+    async def _noop() -> None:
+        return None
+
+    if run_hunter or run_apollo:
+        hunter_coro = _try_hunter(first, last, domain) if run_hunter else _noop()
+        apollo_coro = _try_apollo(first, last, domain) if run_apollo else _noop()
+        hunter_res, apollo_res = await asyncio.gather(hunter_coro, apollo_coro, return_exceptions=True)
+
+        if isinstance(hunter_res, dict) and hunter_res.get("email"):
+            result = hunter_res
+            logger.info("[ContactWaterfall] Step 1 Hunter hit: %s", result.get("email"))
+        elif isinstance(apollo_res, dict) and apollo_res.get("email"):
+            result = apollo_res
             logger.info("[ContactWaterfall] Step 2 Apollo hit: %s", result.get("email"))
-    elif not result and skip_apollo:
-        logger.info("[ContactWaterfall] Step 2 Apollo skipped (disabled/no credits)")
+        else:
+            if not run_hunter:
+                logger.info("[ContactWaterfall] Step 1 Hunter skipped (disabled/no credits)")
+            if not run_apollo:
+                logger.info("[ContactWaterfall] Step 2 Apollo skipped (disabled/no credits)")
 
     # Step 3 — Dropcontact
     if not result:
@@ -1983,8 +2042,8 @@ async def _try_apollo_org(domain: str) -> dict:
         async with httpx.AsyncClient(timeout=25) as c:
             r = await c.post(
                 "https://api.apollo.io/v1/organizations/enrich",
-                headers={"Content-Type": "application/json"},
-                json={"api_key": _apollo_api_key(), "domain": domain},
+                headers={"Content-Type": "application/json", "X-Api-Key": _apollo_api_key()},
+                json={"domain": domain},
             )
             if r.status_code != 200:
                 return {}
@@ -2164,13 +2223,34 @@ def _normalize_bd_company(c: dict) -> dict:
         result["company_description"] = str(desc)[:800]
 
     # ── Employee count ────────────────────────────────────────────────────────
-    emp = (
-        c.get("employees") or c.get("employee_count") or c.get("company_size")
-        or c.get("staff_count") or c.get("followers_count") or 0
-    )
-    n = _safe_int(emp)
-    if n > 0:
-        result["employee_count"] = n
+    # BD returns employees_in_linkedin (int) as the headcount.
+    # The "employees" field is a list of employee profile objects — NOT a count.
+    # Fallback: parse "company_size" string e.g. "51-200 employees" → take upper bound.
+    emp_count = 0
+    employees_in_linkedin = c.get("employees_in_linkedin")
+    if isinstance(employees_in_linkedin, (int, float)) and employees_in_linkedin > 0:
+        emp_count = int(employees_in_linkedin)
+    else:
+        # Try direct integer fields
+        for field in ("employee_count", "staff_count"):
+            n = _safe_int(c.get(field))
+            if n > 0:
+                emp_count = n
+                break
+        if not emp_count:
+            # Parse "51-200 employees" → 200, "1001-5000 employees" → 5000
+            size_str = str(c.get("company_size") or "")
+            m_size = re.search(r"(\d[\d,]*)\s*(?:employees|$)", size_str.replace(",", ""))
+            if m_size:
+                nums = re.findall(r"\d+", size_str.replace(",", ""))
+                emp_count = int(nums[-1]) if nums else 0
+    if emp_count > 0:
+        result["employee_count"] = emp_count
+
+    # ── LinkedIn followers ────────────────────────────────────────────────────
+    followers = _safe_int(c.get("followers") or c.get("followers_count"))
+    if followers > 0:
+        result["linkedin_followers"] = followers
 
     # ── Industry ─────────────────────────────────────────────────────────────
     ind = c.get("industry") or c.get("industries") or c.get("category")
@@ -2194,12 +2274,81 @@ def _normalize_bd_company(c: dict) -> dict:
     # ── Specialties / Tech stack ──────────────────────────────────────────────
     specs = c.get("specialties") or c.get("specializations") or []
     if specs:
-        result["tech_stack"] = specs[:10] if isinstance(specs, list) else [str(specs)]
+        if isinstance(specs, str):
+            # BD returns as comma-separated string: "CRM Software, E-Commerce Software , ..."
+            result["tech_stack"] = [s.strip() for s in specs.split(",") if s.strip()][:10]
+        else:
+            result["tech_stack"] = specs[:10]
 
-    # ── Funding / Company type ────────────────────────────────────────────────
-    funding = c.get("funding_stage") or c.get("company_type") or c.get("type")
-    if funding:
-        result["funding_stage"] = str(funding)
+    # ── Funding ───────────────────────────────────────────────────────────────
+    # BD returns a structured funding object: {last_round_type, last_round_raised, rounds, last_round_date}
+    funding_obj = c.get("funding") if isinstance(c.get("funding"), dict) else {}
+    last_round_type = (
+        funding_obj.get("last_round_type")
+        or c.get("funding_stage") or c.get("company_type") or c.get("type")
+    )
+    if last_round_type:
+        result["funding_stage"] = str(last_round_type)
+
+    last_round_raised = funding_obj.get("last_round_raised") or c.get("total_funding")
+    if last_round_raised:
+        result["total_funding"] = str(last_round_raised)
+
+    last_round_date = funding_obj.get("last_round_date") or c.get("last_funding_date")
+    if last_round_date:
+        # Strip time component if present: "2021-08-10T00:00:00.000Z" → "2021-08-10"
+        result["last_funding_date"] = str(last_round_date)[:10]
+
+    # ── Organization type (Privately Held, Public, etc.) ─────────────────────
+    org_type = c.get("organization_type") or c.get("org_type") or c.get("type")
+    if org_type:
+        result["organization_type"] = str(org_type)
+
+    # ── Company slogan ───────────────────────────────────────────────────────
+    slogan = c.get("slogan") or c.get("tagline")
+    if slogan:
+        result["company_slogan"] = str(slogan)[:200]
+
+    # ── Similar / Competitor companies ───────────────────────────────────────
+    similar = c.get("similar") or c.get("similar_companies") or []
+    if similar and isinstance(similar, list):
+        # Extract just name + industry + location for each similar company
+        similar_clean = [
+            {
+                "name": s.get("title", ""),
+                "industry": s.get("subtitle", ""),
+                "location": s.get("location", ""),
+                "linkedin": s.get("Links", ""),
+            }
+            for s in similar[:10] if isinstance(s, dict) and s.get("title")
+        ]
+        if similar_clean:
+            result["similar_companies"] = similar_clean
+
+    # ── LinkedIn posts (updates feed) ─────────────────────────────────────────
+    updates = c.get("updates") or c.get("posts") or []
+    if updates and isinstance(updates, list):
+        posts_clean = []
+        for u in updates[:10]:
+            if not isinstance(u, dict):
+                continue
+            post = {
+                "post_id": u.get("post_id", ""),
+                "date": u.get("date", ""),
+                "text": (u.get("text") or "")[:500],
+                "likes_count": u.get("likes_count", 0),
+                "comments_count": u.get("comments_count", 0),
+                "post_url": u.get("post_url", ""),
+            }
+            if post["text"] or post["post_id"]:
+                posts_clean.append(post)
+        if posts_clean:
+            result["linkedin_posts"] = posts_clean
+
+    # ── Crunchbase ────────────────────────────────────────────────────────────
+    crunchbase_url = c.get("crunchbase_url") or c.get("crunchbase")
+    if crunchbase_url:
+        result["crunchbase_data"] = {"url": str(crunchbase_url)}
 
     # ── Phone ─────────────────────────────────────────────────────────────────
     phone = c.get("phone") or c.get("phone_number") or c.get("company_phone")
@@ -3308,7 +3457,7 @@ async def build_comprehensive_enrichment(
     System prompt and model are read from the org's LIO config (workspace_configs).
     Falls back to a rule-based assembly if LLM is unavailable.
     """
-    from enrichment_config_service import get_workspace_config
+    from enrichment_config_service import get_workspace_config, get_scoring_config
 
     now    = datetime.now(timezone.utc).isoformat()
     prompt = _build_comprehensive_prompt(linkedin_url, profile, contact, now, website_intel=website_intel)
@@ -3322,6 +3471,11 @@ async def build_comprehensive_enrichment(
     except Exception:
         system_prompt  = _DEFAULT_SYSTEM
         model_override = None
+
+    try:
+        scoring_cfg = await get_scoring_config(org_id)
+    except Exception:
+        scoring_cfg = None
 
     logger.debug(
         "[Enrichment] org=%s  system_prompt_source=%s  model=%s",
@@ -3342,12 +3496,13 @@ async def build_comprehensive_enrichment(
             return data
 
     logger.warning("[Enrichment] LLM unavailable or unusable — using rule-based fallback")
-    return _rule_based_enrichment(linkedin_url, profile, contact, now, website_intel=website_intel)
+    return _rule_based_enrichment(linkedin_url, profile, contact, now, website_intel=website_intel, scoring_cfg=scoring_cfg)
 
 
 def _rule_based_enrichment(
     linkedin_url: str, profile: dict, contact: dict, now: str,
     website_intel: dict = None,
+    scoring_cfg: dict = None,
 ) -> dict:
     """Produce the 8-stage structure from raw data without LLM."""
     name    = profile.get("name", "")
@@ -3467,11 +3622,15 @@ def _rule_based_enrichment(
     dc_score = min(dc_score, 10)
 
     total = icp + intent + timing + dc_score
-    if total >= 80:
+    _sc = scoring_cfg or {}
+    _hot  = _sc.get("hot",  80)
+    _warm = _sc.get("warm", 55)
+    _cool = _sc.get("cool", 30)
+    if total >= _hot:
         tier, stage, score_tier_str = "Tier 1 — Hot", "MQL → Ready for outreach", "HOT"
-    elif total >= 55:
+    elif total >= _warm:
         tier, stage, score_tier_str = "Tier 2 — Warm", "Nurture sequence", "WARM"
-    elif total >= 30:
+    elif total >= _cool:
         tier, stage, score_tier_str = "Tier 3 — Cool", "Awareness / Monitor", "COOL"
     else:
         tier, stage, score_tier_str = "Tier 4 — Cold", "Disqualify or low priority", "COLD"
@@ -4161,7 +4320,7 @@ async def enrich_company_url(
         "✓ Company enriched: %s | score=%d (%s) | email=%s | website=%s",
         final_name, total_score, score_tier, company_email or "—", website or "—",
     )
-    if not forward_to_lio:
+    if not forward_to_lio and lead.get("name"):
         asyncio.create_task(send_to_lio(lead))
     return lead
 
@@ -4262,83 +4421,82 @@ async def enrich_single(
     logger.info("[Phase B] Verified domain: %s  website: %s  logo: %s",
                 verified_domain, real_website, "✓" if company_extras.get("company_logo") else "✗")
 
-    # ── Phase C: Person Contact Waterfall (using VERIFIED domain) ─────────────
-    logger.info("━━━ [Phase C] Person Contact Waterfall — email/phone for %s @ %s", name, verified_domain)
+    # ── Phases C + 1C + D in parallel (all independent once verified_domain is known) ──
+    logger.info("━━━ [Phase C+1C+D] Running contact / company / website in parallel")
 
-    # Activity emails extracted from LinkedIn posts (e.g. "Send CV to hr@company.com")
-    # These are direct, first-party email signals — use as highest-priority source
     activity_emails = profile.get("_activity_emails") or []
     activity_phones = profile.get("_activity_phones") or []
-    if activity_emails:
-        # Prefer email that matches the verified domain
-        matched = next((e for e in activity_emails if verified_domain and verified_domain.split(".")[0] in e), None)
-        pre_contact = matched or activity_emails[0]
-        logger.info("[Phase C] Activity email found: %s (from LinkedIn posts)", pre_contact)
-        contact = {"email": pre_contact, "source": "linkedin_activity", "confidence": "high"}
-        # Also attach any phone found in activity posts
-        if activity_phones and not contact.get("phone"):
-            contact["phone"] = activity_phones[0]
-            logger.info("[Phase C] Activity phone found: %s (from LinkedIn posts)", activity_phones[0])
-    else:
-        contact = await find_contact_info(
+
+    async def _phase_c() -> dict:
+        if activity_emails:
+            matched = next((e for e in activity_emails if verified_domain and verified_domain.split(".")[0] in e), None)
+            pre_contact = matched or activity_emails[0]
+            result = {"email": pre_contact, "source": "linkedin_activity", "confidence": "high"}
+            if activity_phones:
+                result["phone"] = activity_phones[0]
+            return result
+        c = await find_contact_info(
             first, last, verified_domain, linkedin_url=url,
             skip_hunter=not _hunter_ok,
             skip_apollo=not _apollo_ok,
         )
-        # If Hunter/Apollo found no phone, check activity posts
-        if not contact.get("phone") and activity_phones:
-            contact["phone"] = activity_phones[0]
-            logger.info("[Phase C] Fallback to activity phone: %s", activity_phones[0])
+        if not c.get("phone") and activity_phones:
+            c["phone"] = activity_phones[0]
+        return c
 
-    logger.info("[Phase C] Contact: email=%s  source=%s  phone=%s",
-                contact.get("email") or "not found",
-                contact.get("source") or "—",
-                contact.get("phone") or "none")
-
-    # ── Phase 1C: Company Enrichment (shared cache, all 6 priorities) ──────────
-    logger.info("━━━ [Phase 1C] Company Intelligence — enriching: %s", raw_link or "none")
-    _company_record: dict = {}
-    _company_id_val: str  = ""
-    _company_score:  int  = 0
-    _combined_score: int  = 0
-    if raw_link and "linkedin.com/company/" in raw_link:
+    async def _phase_1c() -> tuple[dict, str, int]:
+        if not (raw_link and "linkedin.com/company/" in raw_link):
+            return {}, "", 0
         try:
             import company_service as _cs
             import workspace_service as _ws_svc
             _ws_cfg = await _ws_svc.get_workspace_config(org_id)
             _known = {
-                "name":           company or company_extras.get("company_name") or "",
-                "domain":         verified_domain,
-                "website":        real_website,
-                "logo":           company_extras.get("company_logo") or "",
-                "description":    company_extras.get("company_description") or "",
-                "industry":       company_extras.get("industry") or "",
-                "employee_count": company_extras.get("employee_count") or 0,
-                "hq_location":    company_extras.get("hq_location") or "",
-                "founded_year":   company_extras.get("founded_year") or "",
-                "funding_stage":  company_extras.get("funding_stage") or "",
-                "total_funding":  company_extras.get("total_funding") or "",
-                "lead_investor":  company_extras.get("lead_investor") or "",
-                "company_twitter": company_extras.get("company_twitter") or "",
-                "company_email":  company_extras.get("company_email") or "",
-                "company_phone":  company_extras.get("company_phone") or "",
+                "name":              company or company_extras.get("company_name") or "",
+                "domain":            verified_domain,
+                "website":           real_website,
+                "logo":              company_extras.get("company_logo") or "",
+                "description":       company_extras.get("company_description") or "",
+                "industry":          company_extras.get("industry") or "",
+                "employee_count":    company_extras.get("employee_count") or 0,
+                "hq_location":       company_extras.get("hq_location") or "",
+                "founded_year":      company_extras.get("founded_year") or "",
+                "funding_stage":     company_extras.get("funding_stage") or "",
+                "total_funding":     company_extras.get("total_funding") or "",
+                "last_funding_date": company_extras.get("last_funding_date") or "",
+                "lead_investor":     company_extras.get("lead_investor") or "",
+                "company_twitter":   company_extras.get("company_twitter") or "",
+                "company_email":     company_extras.get("company_email") or "",
+                "company_phone":     company_extras.get("company_phone") or "",
+                "linkedin_followers": company_extras.get("linkedin_followers") or 0,
+                "company_slogan":    company_extras.get("company_slogan") or "",
+                "organization_type": company_extras.get("organization_type") or "",
             }
-            _company_record = await _cs.enrich_company(
+            rec = await _cs.enrich_company(
                 company_linkedin_url=raw_link,
                 org_id=org_id,
                 ws_config=_ws_cfg,
                 known_data=_known,
             )
-            _company_id_val = _company_record.get("id") or ""
-            _company_score  = int(_company_record.get("company_score") or 0)
-            logger.info("[Phase 1C] Company done: score=%d tier=%s",
-                        _company_score, _company_record.get("company_score_tier", "?"))
+            return rec, rec.get("id") or "", int(rec.get("company_score") or 0)
         except Exception as _ce:
             logger.warning("[Phase 1C] Company enrichment failed: %s", _ce)
+            return {}, "", 0
 
-    # ── Phase D: Website Intelligence ─────────────────────────────────────────
-    logger.info("━━━ [Phase D] Website Intelligence — scraping: %s", real_website or "none")
-    website_intel = await scrape_website_intelligence(real_website)
+    (contact, (_company_record, _company_id_val, _company_score), website_intel) = await asyncio.gather(
+        _phase_c(),
+        _phase_1c(),
+        scrape_website_intelligence(real_website),
+    )
+    _combined_score: int = 0
+
+    logger.info("[Phase C] Contact: email=%s  source=%s  phone=%s",
+                contact.get("email") or "not found",
+                contact.get("source") or "—",
+                contact.get("phone") or "none")
+    if _company_record:
+        logger.info("[Phase 1C] Company done: score=%d tier=%s",
+                    _company_score, _company_record.get("company_score_tier", "?"))
     if website_intel:
         logger.info("[Phase D] Scraped %d pages, category=%s, biz_model=%s",
                     len(website_intel.get("pages_scraped", [])),
@@ -4688,8 +4846,8 @@ async def enrich_single(
     lead["_cache_hit"] = False
     lead["linkedin_enrich"] = _format_linkedin_enrich(lead)
 
-    # Forward to LIO — fire-and-forget, does not block return
-    if not forward_to_lio:
+    # Forward to LIO — only if BrightData returned real data (lead has a name)
+    if not forward_to_lio and lead.get("name"):
         asyncio.create_task(send_to_lio(lead, sso_id=sso_id))
 
     return lead
@@ -5121,7 +5279,7 @@ async def enrich_bulk(
     - Otherwise → in-process sequential asyncio task (guaranteed progress, single-server only)
     """
     job_id = str(uuid.uuid4())
-    now    = datetime.now(timezone.utc).isoformat()
+    now    = datetime.now(timezone.utc)
     snapshot_id = None
     status = "pending"
     error_msg = None

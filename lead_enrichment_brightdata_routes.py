@@ -28,6 +28,63 @@ import os
 from typing import Any, Dict, Optional
 
 import jwt
+
+# ── Lead row Redis cache — TTL read from workspace_configs (default 1800s) ───
+_LEAD_CACHE_TTL = 1800  # module-level default; overridden per-org via get_scoring_config()
+
+
+async def _lead_cache_ttl(org_id: str) -> int:
+    try:
+        sc = await cfg_svc.get_scoring_config(org_id)
+        return int(sc.get("lead_cache_ttl", 1800))
+    except Exception:
+        return _LEAD_CACHE_TTL
+_lead_redis: Any = None
+
+
+async def _get_lead_redis() -> Any:
+    global _lead_redis
+    if _lead_redis is not None:
+        return _lead_redis
+    try:
+        import redis.asyncio as aioredis
+        client = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
+        await client.ping()
+        _lead_redis = client
+    except Exception:
+        _lead_redis = None
+    return _lead_redis
+
+
+async def _lead_cache_get(lead_id: str) -> Optional[dict]:
+    r = await _get_lead_redis()
+    if not r:
+        return None
+    try:
+        raw = await r.get(f"lead:row:{lead_id}")
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+async def _lead_cache_set(lead_id: str, lead: dict) -> None:
+    r = await _get_lead_redis()
+    if not r:
+        return
+    try:
+        await r.setex(f"lead:row:{lead_id}", _LEAD_CACHE_TTL, json.dumps(lead, default=str))
+    except Exception:
+        pass
+
+
+async def _lead_cache_delete(lead_id: str) -> None:
+    r = await _get_lead_redis()
+    if not r:
+        return
+    try:
+        await r.delete(f"lead:row:{lead_id}")
+    except Exception:
+        pass
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, HttpUrl, field_validator
@@ -741,7 +798,7 @@ async def enrich_bulk(request: Request):
 async def list_jobs(
     status: str = Query(""),
     q: str = Query(""),
-    limit: int = Query(100, ge=1, le=500),
+    limit: int = Query(20, ge=1, le=200),
 ):
     """List enrichment jobs."""
     jobs = await svc.list_jobs(limit=limit)
@@ -750,13 +807,22 @@ async def list_jobs(
     if q:
         q_lower = q.lower()
         jobs = [j for j in jobs if q_lower in j.get("id", "").lower()]
-    import asyncio as _asyncio
-    sub_job_lists = await _asyncio.gather(
-        *[svc.list_sub_jobs(j["id"], org_id=j.get("organization_id", "default")) for j in jobs],
-        return_exceptions=True,
-    )
-    for job, sub_jobs in zip(jobs, sub_job_lists):
-        job["sub_jobs"] = sub_jobs if not isinstance(sub_jobs, Exception) else []
+
+    # Fetch all sub_jobs for these jobs in a single query instead of N parallel queries
+    if jobs:
+        job_ids = [j["id"] for j in jobs]
+        from db import get_pool
+        async with get_pool().acquire() as conn:
+            placeholders = ",".join(f"${i+1}" for i in range(len(job_ids)))
+            sub_rows = await conn.fetch(
+                f"SELECT * FROM enrichment_sub_jobs WHERE job_id IN ({placeholders}) ORDER BY chunk_index",
+                *job_ids,
+            )
+        sub_map: dict[str, list] = {j["id"]: [] for j in jobs}
+        for row in sub_rows:
+            sub_map[row["job_id"]].append(dict(row))
+        for job in jobs:
+            job["sub_jobs"] = sub_map.get(job["id"], [])
     return {"jobs": jobs, "total": len(jobs)}
 
 
@@ -1171,6 +1237,7 @@ async def delete_lead(lead_id: str, request: Request, background_tasks: Backgrou
     deleted = await svc.delete_lead(lead_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Lead not found")
+    await _lead_cache_delete(lead_id)
     background_tasks.add_task(
         svc.audit_log, org_id, "delete",
         lead_id=lead_id, linkedin_url=lead.get("linkedin_url"),
@@ -1243,6 +1310,7 @@ def _get_full_data(lead: dict) -> dict:
 async def _resolve_lead(leadenrich_id: str) -> dict:
     """
     Resolve a lead by its leadenrich_id (returned from bulk job results / Ably events).
+    Checks Redis cache (30 min TTL) before hitting the DB.
     Raises 400 if id is missing, 404 if not found in DB.
     """
     if not leadenrich_id:
@@ -1250,12 +1318,16 @@ async def _resolve_lead(leadenrich_id: str) -> dict:
             status_code=400,
             detail="leadenrich_id is required. Get it from bulk job results or real-time Ably events.",
         )
+    cached = await _lead_cache_get(leadenrich_id)
+    if cached:
+        return cached
     lead = await svc.get_lead(leadenrich_id)
     if not lead:
         raise HTTPException(
             status_code=404,
             detail=f"Lead not found: {leadenrich_id}. Make sure bulk enrichment has completed for this lead.",
         )
+    await _lead_cache_set(leadenrich_id, lead)
     return lead
 
 
@@ -1342,14 +1414,58 @@ async def email_enrichment(
     full = _get_full_data(lead)
     person_profile = full.get("person_profile") or {}
 
+    # If no email stored yet — run Apollo → Hunter live lookup
+    if not lead.get("work_email") and not lead.get("email"):
+        first, last = svc._parse_name(lead.get("name") or "")
+        domain = ""
+        website = lead.get("company_website") or ""
+        if website:
+            try:
+                from urllib.parse import urlparse as _urlparse
+                netloc = _urlparse(website if website.startswith("http") else f"https://{website}").netloc
+                domain = netloc.replace("www.", "").split(":")[0].lower()
+            except Exception:
+                pass
+
+        if first and domain:
+            try:
+                contact = await svc.find_contact_info(
+                    first=first, last=last, domain=domain,
+                    linkedin_url=lead.get("linkedin_url") or "",
+                )
+                if contact.get("email"):
+                    # Persist the found email back to DB
+                    from db import get_pool as _get_pool
+                    async with _get_pool().acquire() as _conn:
+                        await _conn.execute(
+                            """UPDATE enriched_leads SET work_email=$1, email_source=$2,
+                               email_confidence=$3, bounce_risk=$4, enrichment_source=$5
+                               WHERE id=$6""",
+                            contact["email"],
+                            contact.get("source"),
+                            str(contact.get("confidence", "")) or None,
+                            contact.get("bounce_risk"),
+                            contact.get("source"),
+                            lead["id"],
+                        )
+                    lead["work_email"]        = contact["email"]
+                    lead["email_source"]      = contact.get("source")
+                    lead["email_confidence"]  = contact.get("confidence")
+                    lead["email_verified"]    = contact.get("verified", False)
+                    lead["bounce_risk"]       = contact.get("bounce_risk")
+                    lead["enrichment_source"] = contact.get("source")
+                    lead["phone"]             = lead.get("phone") or contact.get("phone")
+            except Exception as _e:
+                logger.warning("[EmailView] Live lookup failed for %s: %s", leadenrich_id, _e)
+
     return {
         "lead_id":    lead.get("id"),
         "linkedin_url": lead.get("linkedin_url"),
         "name":       lead.get("name"),
         "company":    lead.get("company"),
 
-        "work_email":        lead.get("work_email"),
-        "email":             lead.get("email"),
+        "work_email":        lead.get("work_email") or None,
+        "email":             lead.get("email") or lead.get("work_email") or None,
         "source":            lead.get("email_source"),
         "confidence":        lead.get("email_confidence"),
         "verified":          bool(lead.get("email_verified")),
@@ -1665,6 +1781,30 @@ async def get_lio_results(lead_id: str, request: Request):
 
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
+_STAGE_MODEL_DEFAULTS = {
+    0: "llama-3.1-8b-instant",   # Company Intelligence
+    1: "llama-3.1-8b-instant",   # Auto Tags
+    2: "llama-3.1-8b-instant",   # Behavioural Signals
+    3: "llama-3.1-8b-instant",   # Buying Signals
+    4: "llama-3.3-70b-versatile",# Pitch Intelligence
+    5: "llama-3.3-70b-versatile",# Outreach Generator
+    6: "llama-3.1-8b-instant",   # Lead Score
+}
+
+
+async def _lio_stage_model(org_id: str, stage_idx: int) -> str:
+    """Read the model for a specific LIO stage from DB; fall back to hardcoded default."""
+    try:
+        prompts = await cfg_svc.get_lio_prompts(org_id)
+        if 0 <= stage_idx < len(prompts):
+            db_model = prompts[stage_idx].get("model", "").strip()
+            if db_model:
+                return db_model
+    except Exception:
+        pass
+    return _STAGE_MODEL_DEFAULTS.get(stage_idx, "llama-3.1-8b-instant")
+
+
 def _lio_stream_resp(lead_id: str, body: LioContextBody, keys: tuple, model: str):
     groq_key, wb_key, wb_host, wb_model = keys
     return StreamingResponse(
@@ -1677,50 +1817,57 @@ def _lio_stream_resp(lead_id: str, body: LioContextBody, keys: tuple, model: str
 @router.post("/{lead_id}/lio/company-intelligence", include_in_schema=False)
 async def lio_company_intelligence(lead_id: str, body: LioContextBody, request: Request):
     """Stage 0 — Company Intelligence."""
+    org_id = _get_org_id(request)
     keys = await _lio_llm_keys(request)
-    return _lio_stream_resp(lead_id, body, keys, "llama-3.1-8b-instant")
+    return _lio_stream_resp(lead_id, body, keys, await _lio_stage_model(org_id, 0))
 
 
 @router.post("/{lead_id}/lio/auto-tags", include_in_schema=False)
 async def lio_auto_tags(lead_id: str, body: LioContextBody, request: Request):
     """Stage 1 — Auto Tags."""
+    org_id = _get_org_id(request)
     keys = await _lio_llm_keys(request)
-    return _lio_stream_resp(lead_id, body, keys, "llama-3.1-8b-instant")
+    return _lio_stream_resp(lead_id, body, keys, await _lio_stage_model(org_id, 1))
 
 
 @router.post("/{lead_id}/lio/behavioural-signals", include_in_schema=False)
 async def lio_behavioural_signals(lead_id: str, body: LioContextBody, request: Request):
     """Stage 2 — Behavioural Signals."""
+    org_id = _get_org_id(request)
     keys = await _lio_llm_keys(request)
-    return _lio_stream_resp(lead_id, body, keys, "llama-3.1-8b-instant")
+    return _lio_stream_resp(lead_id, body, keys, await _lio_stage_model(org_id, 2))
 
 
 @router.post("/{lead_id}/lio/buying-signals", include_in_schema=False)
 async def lio_buying_signals(lead_id: str, body: LioContextBody, request: Request):
     """Stage 3 — Buying Signals."""
+    org_id = _get_org_id(request)
     keys = await _lio_llm_keys(request)
-    return _lio_stream_resp(lead_id, body, keys, "llama-3.1-8b-instant")
+    return _lio_stream_resp(lead_id, body, keys, await _lio_stage_model(org_id, 3))
 
 
 @router.post("/{lead_id}/lio/pitch-intelligence", include_in_schema=False)
 async def lio_pitch_intelligence(lead_id: str, body: LioContextBody, request: Request):
     """Stage 4 — Pitch Intelligence."""
+    org_id = _get_org_id(request)
     keys = await _lio_llm_keys(request)
-    return _lio_stream_resp(lead_id, body, keys, "llama-3.3-70b-versatile")
+    return _lio_stream_resp(lead_id, body, keys, await _lio_stage_model(org_id, 4))
 
 
 @router.post("/{lead_id}/lio/outreach", include_in_schema=False)
 async def lio_outreach(lead_id: str, body: LioContextBody, request: Request):
     """Stage 5 — Outreach Generator."""
+    org_id = _get_org_id(request)
     keys = await _lio_llm_keys(request)
-    return _lio_stream_resp(lead_id, body, keys, "llama-3.3-70b-versatile")
+    return _lio_stream_resp(lead_id, body, keys, await _lio_stage_model(org_id, 5))
 
 
 @router.post("/{lead_id}/lio/lead-score", include_in_schema=False)
 async def lio_lead_score(lead_id: str, body: LioContextBody, request: Request):
     """Stage 6 — Lead Score."""
+    org_id = _get_org_id(request)
     keys = await _lio_llm_keys(request)
-    return _lio_stream_resp(lead_id, body, keys, "llama-3.1-8b-instant")
+    return _lio_stream_resp(lead_id, body, keys, await _lio_stage_model(org_id, 6))
 
 
 @router.post("/lio/analyze/{lead_id}/stage", include_in_schema=False)

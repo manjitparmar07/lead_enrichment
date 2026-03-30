@@ -23,6 +23,59 @@ from typing import Any, Optional
 
 from db import get_pool
 
+# ── Redis cache (optional — silently disabled if Redis unavailable) ────────────
+_REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+_redis_client: Any = None
+
+
+async def _redis() -> Any:
+    """Lazy-init Redis client. Returns None if unavailable."""
+    global _redis_client
+    if _redis_client is not None:
+        return _redis_client
+    try:
+        import redis.asyncio as aioredis
+        client = aioredis.from_url(_REDIS_URL, decode_responses=True)
+        await client.ping()
+        _redis_client = client
+    except Exception:
+        _redis_client = None
+    return _redis_client
+
+
+async def _cache_get(key: str) -> Any:
+    r = await _redis()
+    if not r:
+        return None
+    try:
+        raw = await r.get(key)
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+async def _cache_set(key: str, value: Any, ttl: int = 300) -> None:
+    r = await _redis()
+    if not r:
+        return
+    try:
+        await r.setex(key, ttl, json.dumps(value, default=str))
+    except Exception:
+        pass
+
+
+async def invalidate_analytics_cache(org_id: str) -> None:
+    """Call this after enriching/deleting leads to bust stale analytics."""
+    r = await _redis()
+    if not r:
+        return
+    try:
+        keys = await r.keys(f"analytics:{org_id}:*")
+        if keys:
+            await r.delete(*keys)
+    except Exception:
+        pass
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,47 +101,47 @@ def _safe_avg(value: Any) -> float:
 async def get_summary(org_id: str) -> dict:
     """
     High-level counts: total leads, recent enrichments, avg score, email rate.
+    Single query with conditional aggregates — was 5 round-trips.
     """
+    cache_key = f"analytics:{org_id}:summary"
+    cached = await _cache_get(cache_key)
+    if cached:
+        return cached
+
     now = datetime.now(timezone.utc)
     cutoff_7d  = (now - timedelta(days=7)).isoformat()
     cutoff_30d = (now - timedelta(days=30)).isoformat()
 
     async with get_pool().acquire() as conn:
         row = dict(await conn.fetchrow(
-            "SELECT COUNT(*) total, AVG(total_score) avg_score, AVG(data_completeness_score) avg_dc "
-            "FROM enriched_leads WHERE organization_id=$1",
-            org_id,
+            """SELECT
+                COUNT(*)                                                                    AS total,
+                COUNT(*) FILTER (WHERE enriched_at >= $2)                                  AS last_7d,
+                COUNT(*) FILTER (WHERE enriched_at >= $3)                                  AS last_30d,
+                COUNT(*) FILTER (WHERE work_email IS NOT NULL AND work_email != '')         AS with_email,
+                COUNT(*) FILTER (WHERE email_verified = 1)                                 AS verified,
+                AVG(total_score)             AS avg_score,
+                AVG(data_completeness_score) AS avg_dc
+            FROM enriched_leads WHERE organization_id=$1""",
+            org_id, cutoff_7d, cutoff_30d,
         ))
-        last_7d = await conn.fetchval(
-            "SELECT COUNT(*) FROM enriched_leads WHERE organization_id=$1 AND enriched_at>=$2",
-            org_id, cutoff_7d,
-        )
-        last_30d = await conn.fetchval(
-            "SELECT COUNT(*) FROM enriched_leads WHERE organization_id=$1 AND enriched_at>=$2",
-            org_id, cutoff_30d,
-        )
-        with_email = await conn.fetchval(
-            "SELECT COUNT(*) FROM enriched_leads WHERE organization_id=$1 AND work_email IS NOT NULL AND work_email!=''",
-            org_id,
-        )
-        verified_emails = await conn.fetchval(
-            "SELECT COUNT(*) FROM enriched_leads WHERE organization_id=$1 AND email_verified=1",
-            org_id,
-        )
 
-    total = int(row["total"] or 0)
+    total      = int(row["total"] or 0)
+    with_email = int(row["with_email"] or 0)
     email_rate = round(with_email / total, 3) if total else 0.0
 
-    return {
-        "total_leads": total,
-        "enriched_last_7d": int(last_7d),
-        "enriched_last_30d": int(last_30d),
-        "avg_total_score": _safe_avg(row["avg_score"]),
+    result = {
+        "total_leads":           total,
+        "enriched_last_7d":      int(row["last_7d"] or 0),
+        "enriched_last_30d":     int(row["last_30d"] or 0),
+        "avg_total_score":       _safe_avg(row["avg_score"]),
         "avg_data_completeness": _safe_avg(row["avg_dc"]),
-        "email_discovery_rate": email_rate,
-        "email_discovery_pct": round(email_rate * 100, 1),
-        "verified_email_count": int(verified_emails),
+        "email_discovery_rate":  email_rate,
+        "email_discovery_pct":   round(email_rate * 100, 1),
+        "verified_email_count":  int(row["verified"] or 0),
     }
+    await _cache_set(cache_key, result, ttl=300)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -299,23 +352,23 @@ async def get_job_stats(org_id: str) -> dict:
 async def get_score_distribution(org_id: str) -> list[dict]:
     """
     Buckets: 0-19, 20-39, 40-59, 60-79, 80-100
+    Single query with FILTER aggregates — was 5 round-trips.
     """
-    buckets = [
-        ("0-19",   0,  19),
-        ("20-39",  20, 39),
-        ("40-59",  40, 59),
-        ("60-79",  60, 79),
-        ("80-100", 80, 100),
-    ]
-    result = []
     async with get_pool().acquire() as conn:
-        for label, lo, hi in buckets:
-            cnt = await conn.fetchval(
-                "SELECT COUNT(*) FROM enriched_leads WHERE organization_id=$1 AND total_score>=$2 AND total_score<=$3",
-                org_id, lo, hi,
-            )
-            result.append({"range": label, "count": int(cnt)})
-    return result
+        row = dict(await conn.fetchrow(
+            """SELECT
+                COUNT(*) FILTER (WHERE total_score BETWEEN  0 AND  19) AS b0,
+                COUNT(*) FILTER (WHERE total_score BETWEEN 20 AND  39) AS b1,
+                COUNT(*) FILTER (WHERE total_score BETWEEN 40 AND  59) AS b2,
+                COUNT(*) FILTER (WHERE total_score BETWEEN 60 AND  79) AS b3,
+                COUNT(*) FILTER (WHERE total_score BETWEEN 80 AND 100) AS b4
+            FROM enriched_leads WHERE organization_id=$1""",
+            org_id,
+        ))
+    return [
+        {"range": label, "count": int(row[f"b{i}"] or 0)}
+        for i, label in enumerate(["0-19", "20-39", "40-59", "60-79", "80-100"])
+    ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -325,7 +378,13 @@ async def get_score_distribution(org_id: str) -> list[dict]:
 async def get_full_analytics(org_id: str, trend_days: int = 30) -> dict:
     """
     Aggregate all analytics into one response for the dashboard.
+    Cached in Redis for 5 minutes per org.
     """
+    cache_key = f"analytics:{org_id}:full:{trend_days}"
+    cached = await _cache_get(cache_key)
+    if cached:
+        return cached
+
     (
         summary,
         tier_dist,
@@ -350,7 +409,7 @@ async def get_full_analytics(org_id: str, trend_days: int = 30) -> dict:
         get_score_distribution(org_id),
     )
 
-    return {
+    result = {
         "summary":             summary,
         "tier_distribution":   tier_dist,
         "score_breakdown":     score_bk,
@@ -362,6 +421,8 @@ async def get_full_analytics(org_id: str, trend_days: int = 30) -> dict:
         "seniority_breakdown": seniority,
         "job_stats":           job_stats,
     }
+    await _cache_set(cache_key, result, ttl=300)
+    return result
 
 
 async def _gather(*coros):
