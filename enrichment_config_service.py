@@ -8,10 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-import aiosqlite
-
-_DB_DIR  = os.path.join(os.path.dirname(__file__), "configs")
-LEADS_DB = os.path.join(_DB_DIR, "leads_enrichment.db")
+from db import get_pool
 
 # ── Tool Registry ──────────────────────────────────────────────────────────────
 
@@ -81,8 +78,8 @@ TOOL_REGISTRY: Dict[str, Dict] = {
 # ── DB Init ────────────────────────────────────────────────────────────────────
 
 async def init_config_db() -> None:
-    async with aiosqlite.connect(LEADS_DB) as db:
-        await db.execute("""
+    async with get_pool().acquire() as conn:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS enrichment_tool_configs (
                 id           TEXT PRIMARY KEY,
                 org_id       TEXT NOT NULL,
@@ -90,12 +87,12 @@ async def init_config_db() -> None:
                 is_enabled   INTEGER NOT NULL DEFAULT 1,
                 api_key      TEXT,
                 extra_config TEXT,
-                created_at   TEXT NOT NULL,
-                updated_at   TEXT NOT NULL,
+                created_at   TEXT NOT NULL DEFAULT '',
+                updated_at   TEXT NOT NULL DEFAULT '',
                 UNIQUE(org_id, tool_name)
             )
         """)
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS enrichment_tool_credits (
                 id            TEXT PRIMARY KEY,
                 org_id        TEXT NOT NULL,
@@ -103,12 +100,12 @@ async def init_config_db() -> None:
                 total_credits INTEGER NOT NULL DEFAULT 0,
                 used_credits  INTEGER NOT NULL DEFAULT 0,
                 reset_at      TEXT,
-                created_at    TEXT NOT NULL,
-                updated_at    TEXT NOT NULL,
+                created_at    TEXT NOT NULL DEFAULT '',
+                updated_at    TEXT NOT NULL DEFAULT '',
                 UNIQUE(org_id, tool_name)
             )
         """)
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS enrichment_credit_usage_log (
                 id               TEXT PRIMARY KEY,
                 org_id           TEXT NOT NULL,
@@ -117,10 +114,10 @@ async def init_config_db() -> None:
                 lead_id          TEXT,
                 job_id           TEXT,
                 reason           TEXT,
-                created_at       TEXT NOT NULL
+                created_at       TEXT NOT NULL DEFAULT ''
             )
         """)
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS workspace_configs (
                 org_id            TEXT PRIMARY KEY,
                 lio_system_prompt TEXT DEFAULT '',
@@ -128,20 +125,11 @@ async def init_config_db() -> None:
                 updated_at        TEXT NOT NULL DEFAULT ''
             )
         """)
-        # Migrate existing DBs that may be missing new columns
-        for col, default in [
-            ("lio_system_prompt", "''"), ("lio_model", "''"),
-            ("lio_prompts_json", "''"), ("workspace_context_json", "''"),
-            ("ai_prompts_json", "''"),
-        ]:
-            try:
-                await db.execute(f"ALTER TABLE workspace_configs ADD COLUMN {col} TEXT DEFAULT {default}")
-            except Exception:
-                pass  # Column already exists — ignore
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_tool_cfg_org  ON enrichment_tool_configs(org_id)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_credits_org   ON enrichment_tool_credits(org_id)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_usage_log_org ON enrichment_credit_usage_log(org_id, tool_name)")
-        await db.commit()
+        for col in ["lio_system_prompt", "lio_model", "lio_prompts_json", "workspace_context_json", "ai_prompts_json"]:
+            await conn.execute(f"ALTER TABLE workspace_configs ADD COLUMN IF NOT EXISTS {col} TEXT DEFAULT ''")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tool_cfg_org  ON enrichment_tool_configs(org_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_credits_org   ON enrichment_tool_credits(org_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_log_org ON enrichment_credit_usage_log(org_id, tool_name)")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -161,24 +149,21 @@ def _mask(value: str) -> str:
 # ── Tool Config CRUD ───────────────────────────────────────────────────────────
 
 async def get_tool_row(org_id: str, tool_name: str) -> Optional[dict]:
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM enrichment_tool_configs WHERE org_id=? AND tool_name=?",
-            (org_id, tool_name),
-        ) as cur:
-            row = await cur.fetchone()
-            return dict(row) if row else None
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM enrichment_tool_configs WHERE org_id=$1 AND tool_name=$2",
+            org_id, tool_name,
+        )
+        return dict(row) if row else None
 
 
 async def list_tool_rows(org_id: str) -> List[dict]:
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM enrichment_tool_configs WHERE org_id=? ORDER BY tool_name",
-            (org_id,),
-        ) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM enrichment_tool_configs WHERE org_id=$1 ORDER BY tool_name",
+            org_id,
+        )
+        return [dict(r) for r in rows]
 
 
 async def upsert_tool_config(
@@ -197,18 +182,17 @@ async def upsert_tool_config(
         existing["extra_config"] if existing else None
     )
 
-    async with aiosqlite.connect(LEADS_DB) as db:
-        await db.execute("""
+    async with get_pool().acquire() as conn:
+        await conn.execute("""
             INSERT INTO enrichment_tool_configs
                 (id, org_id, tool_name, is_enabled, api_key, extra_config, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT(org_id, tool_name) DO UPDATE SET
-                is_enabled   = excluded.is_enabled,
-                api_key      = excluded.api_key,
-                extra_config = excluded.extra_config,
-                updated_at   = excluded.updated_at
-        """, (row_id, org_id, tool_name, 1 if is_enabled else 0, final_key, final_extra, now, now))
-        await db.commit()
+                is_enabled   = EXCLUDED.is_enabled,
+                api_key      = EXCLUDED.api_key,
+                extra_config = EXCLUDED.extra_config,
+                updated_at   = EXCLUDED.updated_at
+        """, row_id, org_id, tool_name, 1 if is_enabled else 0, final_key, final_extra, now, now)
 
     # Sync known keys to keys_service so ai_enrichment_service picks them up
     _TOOL_KEY_MAP = {
@@ -245,24 +229,21 @@ async def upsert_tool_config(
 # ── Credits CRUD ───────────────────────────────────────────────────────────────
 
 async def get_credit_row(org_id: str, tool_name: str) -> Optional[dict]:
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM enrichment_tool_credits WHERE org_id=? AND tool_name=?",
-            (org_id, tool_name),
-        ) as cur:
-            row = await cur.fetchone()
-            return dict(row) if row else None
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM enrichment_tool_credits WHERE org_id=$1 AND tool_name=$2",
+            org_id, tool_name,
+        )
+        return dict(row) if row else None
 
 
 async def list_credit_rows(org_id: str) -> List[dict]:
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM enrichment_tool_credits WHERE org_id=? ORDER BY tool_name",
-            (org_id,),
-        ) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM enrichment_tool_credits WHERE org_id=$1 ORDER BY tool_name",
+            org_id,
+        )
+        return [dict(r) for r in rows]
 
 
 async def set_credits(org_id: str, tool_name: str, total: int, reset_used: bool = False) -> None:
@@ -271,18 +252,17 @@ async def set_credits(org_id: str, tool_name: str, total: int, reset_used: bool 
     row_id   = existing["id"] if existing else str(uuid.uuid4())
     used     = 0 if reset_used else (existing["used_credits"] if existing else 0)
 
-    async with aiosqlite.connect(LEADS_DB) as db:
-        await db.execute("""
+    async with get_pool().acquire() as conn:
+        await conn.execute("""
             INSERT INTO enrichment_tool_credits
                 (id, org_id, tool_name, total_credits, used_credits, reset_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT(org_id, tool_name) DO UPDATE SET
-                total_credits = excluded.total_credits,
-                used_credits  = excluded.used_credits,
-                reset_at      = excluded.reset_at,
-                updated_at    = excluded.updated_at
-        """, (row_id, org_id, tool_name, total, used, now if reset_used else None, now, now))
-        await db.commit()
+                total_credits = EXCLUDED.total_credits,
+                used_credits  = EXCLUDED.used_credits,
+                reset_at      = EXCLUDED.reset_at,
+                updated_at    = EXCLUDED.updated_at
+        """, row_id, org_id, tool_name, total, used, now if reset_used else None, now, now)
 
 
 async def add_credits(org_id: str, tool_name: str, amount: int) -> None:
@@ -290,12 +270,11 @@ async def add_credits(org_id: str, tool_name: str, amount: int) -> None:
     if not existing:
         await set_credits(org_id, tool_name, amount)
         return
-    async with aiosqlite.connect(LEADS_DB) as db:
-        await db.execute(
-            "UPDATE enrichment_tool_credits SET total_credits=total_credits+?, updated_at=? WHERE org_id=? AND tool_name=?",
-            (amount, _now(), org_id, tool_name),
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            "UPDATE enrichment_tool_credits SET total_credits=total_credits+$1, updated_at=$2 WHERE org_id=$3 AND tool_name=$4",
+            amount, _now(), org_id, tool_name,
         )
-        await db.commit()
 
 
 async def deduct_credit(
@@ -316,18 +295,17 @@ async def deduct_credit(
         return False
 
     now = _now()
-    async with aiosqlite.connect(LEADS_DB) as db:
-        await db.execute(
-            "UPDATE enrichment_tool_credits SET used_credits=used_credits+?, updated_at=? WHERE org_id=? AND tool_name=?",
-            (amount, now, org_id, tool_name),
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            "UPDATE enrichment_tool_credits SET used_credits=used_credits+$1, updated_at=$2 WHERE org_id=$3 AND tool_name=$4",
+            amount, now, org_id, tool_name,
         )
-        await db.execute(
+        await conn.execute(
             """INSERT INTO enrichment_credit_usage_log
                (id, org_id, tool_name, credits_deducted, lead_id, job_id, reason, created_at)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (str(uuid.uuid4()), org_id, tool_name, amount, lead_id, job_id, reason, now),
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)""",
+            str(uuid.uuid4()), org_id, tool_name, amount, lead_id, job_id, reason, now,
         )
-        await db.commit()
     return True
 
 
@@ -355,16 +333,18 @@ async def get_available_tools(org_id: str) -> Dict[str, bool]:
 async def get_usage_log(
     org_id: str, tool_name: Optional[str] = None, limit: int = 50
 ) -> List[dict]:
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
+    async with get_pool().acquire() as conn:
         if tool_name:
-            sql    = "SELECT * FROM enrichment_credit_usage_log WHERE org_id=? AND tool_name=? ORDER BY created_at DESC LIMIT ?"
-            params = (org_id, tool_name, limit)
+            rows = await conn.fetch(
+                "SELECT * FROM enrichment_credit_usage_log WHERE org_id=$1 AND tool_name=$2 ORDER BY created_at DESC LIMIT $3",
+                org_id, tool_name, limit,
+            )
         else:
-            sql    = "SELECT * FROM enrichment_credit_usage_log WHERE org_id=? ORDER BY created_at DESC LIMIT ?"
-            params = (org_id, limit)
-        async with db.execute(sql, params) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+            rows = await conn.fetch(
+                "SELECT * FROM enrichment_credit_usage_log WHERE org_id=$1 ORDER BY created_at DESC LIMIT $2",
+                org_id, limit,
+            )
+        return [dict(r) for r in rows]
 
 
 # ── Combined Full Config View ──────────────────────────────────────────────────
@@ -681,48 +661,45 @@ WORKSPACE_CONTEXT_DEFAULTS = {
 
 async def get_workspace_config(org_id: str) -> dict:
     """Return workspace config dict for the org."""
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT lio_system_prompt, lio_model, lio_prompts_json, workspace_context_json, ai_prompts_json FROM workspace_configs WHERE org_id=?",
-            (org_id,),
-        ) as cur:
-            row = await cur.fetchone()
-            if not row:
-                return {}
-            return {
-                "lio_system_prompt":      row["lio_system_prompt"] or "",
-                "lio_model":              row["lio_model"] or "",
-                "lio_prompts_json":       row["lio_prompts_json"] or "",
-                "workspace_context_json": row["workspace_context_json"] or "",
-                "ai_prompts_json":        row["ai_prompts_json"] or "",
-            }
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT lio_system_prompt, lio_model, lio_prompts_json, workspace_context_json, ai_prompts_json FROM workspace_configs WHERE org_id=$1",
+            org_id,
+        )
+        if not row:
+            return {}
+        return {
+            "lio_system_prompt":      row["lio_system_prompt"] or "",
+            "lio_model":              row["lio_model"] or "",
+            "lio_prompts_json":       row["lio_prompts_json"] or "",
+            "workspace_context_json": row["workspace_context_json"] or "",
+            "ai_prompts_json":        row["ai_prompts_json"] or "",
+        }
 
 
 async def save_workspace_config(org_id: str, updates: dict) -> dict:
     """Persist workspace config updates for the org (merges with existing)."""
     now      = datetime.now(timezone.utc).isoformat()
     existing = await get_workspace_config(org_id)
-    lio_prompt           = updates.get("lio_system_prompt",      existing.get("lio_system_prompt", ""))
-    lio_model            = updates.get("lio_model",              existing.get("lio_model", ""))
-    lio_prompts_json     = updates.get("lio_prompts_json",       existing.get("lio_prompts_json", ""))
-    workspace_ctx_json   = updates.get("workspace_context_json", existing.get("workspace_context_json", ""))
-    ai_prompts_json      = updates.get("ai_prompts_json",        existing.get("ai_prompts_json", ""))
-    async with aiosqlite.connect(LEADS_DB) as db:
-        await db.execute(
+    lio_prompt         = updates.get("lio_system_prompt",      existing.get("lio_system_prompt", ""))
+    lio_model          = updates.get("lio_model",              existing.get("lio_model", ""))
+    lio_prompts_json   = updates.get("lio_prompts_json",       existing.get("lio_prompts_json", ""))
+    workspace_ctx_json = updates.get("workspace_context_json", existing.get("workspace_context_json", ""))
+    ai_prompts_json    = updates.get("ai_prompts_json",        existing.get("ai_prompts_json", ""))
+    async with get_pool().acquire() as conn:
+        await conn.execute(
             """INSERT INTO workspace_configs
                    (org_id, lio_system_prompt, lio_model, lio_prompts_json, workspace_context_json, ai_prompts_json, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
                ON CONFLICT(org_id) DO UPDATE SET
-                 lio_system_prompt      = excluded.lio_system_prompt,
-                 lio_model              = excluded.lio_model,
-                 lio_prompts_json       = excluded.lio_prompts_json,
-                 workspace_context_json = excluded.workspace_context_json,
-                 ai_prompts_json        = excluded.ai_prompts_json,
-                 updated_at             = excluded.updated_at""",
-            (org_id, lio_prompt, lio_model, lio_prompts_json, workspace_ctx_json, ai_prompts_json, now),
+                 lio_system_prompt      = EXCLUDED.lio_system_prompt,
+                 lio_model              = EXCLUDED.lio_model,
+                 lio_prompts_json       = EXCLUDED.lio_prompts_json,
+                 workspace_context_json = EXCLUDED.workspace_context_json,
+                 ai_prompts_json        = EXCLUDED.ai_prompts_json,
+                 updated_at             = EXCLUDED.updated_at""",
+            org_id, lio_prompt, lio_model, lio_prompts_json, workspace_ctx_json, ai_prompts_json, now,
         )
-        await db.commit()
     return {"lio_system_prompt": lio_prompt, "lio_model": lio_model}
 
 

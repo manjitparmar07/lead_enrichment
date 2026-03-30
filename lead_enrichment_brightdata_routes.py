@@ -381,6 +381,7 @@ class SingleEnrichRequest(BaseModel):
     generate_outreach: bool = True
     engagement_data: Optional[dict] = None
     force_refresh: bool = False   # bypass duplicate cache and re-enrich
+    forward_to_lio: bool = False  # suppress LIO forwarding (frontend sets true)
 
     @field_validator("linkedin_url")
     @classmethod
@@ -395,6 +396,7 @@ class BulkEnrichRequest(BaseModel):
     webhook_auth: Optional[str] = None  # Auth header value for your webhook
     token: Optional[str] = None         # Tenant/org token — echoed back in response + webhook
     skip_existing: bool = True          # skip URLs already enriched (< LEAD_CACHE_TTL_DAYS old)
+    forward_to_lio: bool = False        # forward enriched leads to LIO (external API callers only)
 
     @field_validator("linkedin_urls")
     @classmethod
@@ -506,6 +508,7 @@ async def enrich_single(body: SingleEnrichRequest, request: Request, background_
             generate_outreach_flag=body.generate_outreach,
             org_id=org_id,
             tools=tools_available,
+            forward_to_lio=body.forward_to_lio,
         )
         # Deduct credits for tools that were actually used
         if lead and not lead.get("error"):
@@ -633,7 +636,7 @@ async def enrich_single_public(body: SingleEnrichPublicRequest):
 
 
 @router.post("/enrich/bulk")
-async def enrich_bulk(body: BulkEnrichRequest, request: Request):
+async def enrich_bulk(request: Request):
     """
     Enrich multiple LinkedIn profile URLs asynchronously.
 
@@ -648,6 +651,15 @@ async def enrich_bulk(body: BulkEnrichRequest, request: Request):
     }
     ```
     """
+    try:
+        raw = await request.json()
+        # Handle double-encoded JSON (body sent as a string instead of object)
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        body = BulkEnrichRequest(**raw)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid request body: {e}")
+
     org_id, sso_id = _validate_token(body.token)
 
     urls_to_submit = body.linkedin_urls
@@ -665,10 +677,11 @@ async def enrich_bulk(body: BulkEnrichRequest, request: Request):
                     and existing.get("enriched_at")
                 )
                 if data_complete:
-                    # Data is good — forward to LIO and skip re-enrichment
-                    existing["linkedin_enrich"] = svc._format_linkedin_enrich(existing)
-                    import asyncio as _asyncio
-                    _asyncio.create_task(svc.send_to_lio(existing, sso_id=sso_id))
+                    # Data is good — forward to LIO unless caller suppressed it
+                    if not body.forward_to_lio:
+                        existing["linkedin_enrich"] = svc._format_linkedin_enrich(existing)
+                        import asyncio as _asyncio
+                        _asyncio.create_task(svc.send_to_lio(existing, sso_id=sso_id))
                     skipped_urls.append(url)
                 else:
                     # Data incomplete — re-enrich to fetch missing fields
@@ -694,6 +707,7 @@ async def enrich_bulk(body: BulkEnrichRequest, request: Request):
             webhook_auth=body.webhook_auth,
             org_id=org_id,
             sso_id=sso_id,
+            forward_to_lio=body.forward_to_lio,
         )
         await svc.audit_log(
             org_id, "bulk_submit", job_id=job["id"],
@@ -724,9 +738,18 @@ async def enrich_bulk(body: BulkEnrichRequest, request: Request):
 # ── Job management ─────────────────────────────────────────────────────────
 
 @router.get("/jobs")
-async def list_jobs():
-    """List all enrichment jobs (most recent first), each with its sub-jobs."""
-    jobs = await svc.list_jobs(limit=50)
+async def list_jobs(
+    status: str = Query(""),
+    q: str = Query(""),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """List enrichment jobs."""
+    jobs = await svc.list_jobs(limit=limit)
+    if status:
+        jobs = [j for j in jobs if j.get("status") == status]
+    if q:
+        q_lower = q.lower()
+        jobs = [j for j in jobs if q_lower in j.get("id", "").lower()]
     import asyncio as _asyncio
     sub_job_lists = await _asyncio.gather(
         *[svc.list_sub_jobs(j["id"], org_id=j.get("organization_id", "default")) for j in jobs],
@@ -756,6 +779,40 @@ async def get_job(job_id: str):
     result = await svc.list_leads(limit=1, offset=0, job_id=job_id)
     sub_jobs = await svc.list_sub_jobs(job_id, org_id=job.get("organization_id", "default"))
     return {**job, "leads_count": result["total"], "sub_jobs": sub_jobs}
+
+
+@router.post("/jobs/{job_id}/stop", include_in_schema=False)
+async def stop_job(job_id: str):
+    """Mark a running/pending job as cancelled."""
+    from db import get_pool
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow("SELECT status FROM enrichment_jobs WHERE id=$1", job_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if row["status"] not in ("running", "pending", "fallback"):
+            raise HTTPException(status_code=400, detail=f"Job is already {row['status']}")
+        await conn.execute(
+            "UPDATE enrichment_jobs SET status='cancelled', error='Stopped by user' WHERE id=$1",
+            job_id,
+        )
+        await conn.execute(
+            "UPDATE enrichment_sub_jobs SET status='cancelled' WHERE job_id=$1 AND status IN ('pending','running')",
+            job_id,
+        )
+    return {"job_id": job_id, "status": "cancelled"}
+
+
+@router.delete("/jobs/{job_id}", include_in_schema=False)
+async def delete_job(job_id: str):
+    """Delete a job and all its sub-jobs from the database."""
+    from db import get_pool
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow("SELECT id FROM enrichment_jobs WHERE id=$1", job_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        await conn.execute("DELETE FROM enrichment_sub_jobs WHERE job_id=$1", job_id)
+        await conn.execute("DELETE FROM enrichment_jobs WHERE id=$1", job_id)
+    return {"job_id": job_id, "deleted": True}
 
 
 # ── Webhooks ───────────────────────────────────────────────────────────────
@@ -866,7 +923,7 @@ async def list_leads(
     min_score: Optional[int] = Query(None, ge=0, le=100),
     tier: Optional[str] = Query(None, pattern="^(hot|warm|cool|cold)$"),
 ):
-    """List enriched leads with optional filters."""
+    """List all enriched leads."""
     result = await svc.list_leads(
         limit=limit, offset=offset,
         job_id=job_id, min_score=min_score, tier=tier,

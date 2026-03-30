@@ -215,6 +215,7 @@ async def push_job(
     r: Any,
     generate_outreach: bool = True,
     sso_id: str = "",
+    forward_to_lio: bool = False,
 ) -> int:
     """
     Push pre-split URL chunks to the per-tenant queue.
@@ -239,6 +240,7 @@ async def push_job(
             "sub_job_id":        sub_job_id,
             "generate_outreach": generate_outreach,
             "sso_id":            sso_id,
+            "forward_to_lio":    forward_to_lio,
         }
         pipe.rpush(tenant_key, json.dumps(task))
 
@@ -341,12 +343,13 @@ async def _worker(worker_id: int, r: Any) -> None:
                 logger.warning("[Worker-%d] Invalid JSON task — discarded", worker_id)
                 continue
 
-            job_id     = task.get("job_id", "")
-            org_id     = task.get("org_id", "default")
-            urls       = task.get("urls", [])
-            sub_job_id = task.get("sub_job_id")
-            gen_out    = task.get("generate_outreach", True)
-            sso_id     = task.get("sso_id", "")
+            job_id         = task.get("job_id", "")
+            org_id         = task.get("org_id", "default")
+            urls           = task.get("urls", [])
+            sub_job_id     = task.get("sub_job_id")
+            gen_out        = task.get("generate_outreach", True)
+            sso_id         = task.get("sso_id", "")
+            forward_to_lio = task.get("forward_to_lio", False)
 
             if not urls:
                 continue
@@ -372,6 +375,7 @@ async def _worker(worker_id: int, r: Any) -> None:
                         org_id=org_id,
                         generate_outreach_flag=gen_out,
                         sso_id=sso_id,
+                        forward_to_lio=forward_to_lio,
                     )
                     for url in urls
                 ],

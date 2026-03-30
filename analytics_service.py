@@ -21,12 +21,9 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-import aiosqlite
+from db import get_pool
 
 logger = logging.getLogger(__name__)
-
-_DB_DIR  = os.path.join(os.path.dirname(__file__), "configs")
-LEADS_DB = os.path.join(_DB_DIR, "leads_enrichment.db")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -56,41 +53,28 @@ async def get_summary(org_id: str) -> dict:
     cutoff_7d  = (now - timedelta(days=7)).isoformat()
     cutoff_30d = (now - timedelta(days=30)).isoformat()
 
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
-
-        async with db.execute(
+    async with get_pool().acquire() as conn:
+        row = dict(await conn.fetchrow(
             "SELECT COUNT(*) total, AVG(total_score) avg_score, AVG(data_completeness_score) avg_dc "
-            "FROM enriched_leads WHERE organization_id=?",
-            (org_id,),
-        ) as cur:
-            row = dict(await cur.fetchone())
-
-        async with db.execute(
-            "SELECT COUNT(*) FROM enriched_leads WHERE organization_id=? AND enriched_at>=?",
-            (org_id, cutoff_7d),
-        ) as cur:
-            last_7d = (await cur.fetchone())[0]
-
-        async with db.execute(
-            "SELECT COUNT(*) FROM enriched_leads WHERE organization_id=? AND enriched_at>=?",
-            (org_id, cutoff_30d),
-        ) as cur:
-            last_30d = (await cur.fetchone())[0]
-
-        # Email discovery rate = leads with non-empty work_email / total
-        async with db.execute(
-            "SELECT COUNT(*) FROM enriched_leads WHERE organization_id=? AND work_email IS NOT NULL AND work_email!=''",
-            (org_id,),
-        ) as cur:
-            with_email = (await cur.fetchone())[0]
-
-        # Verified email count
-        async with db.execute(
-            "SELECT COUNT(*) FROM enriched_leads WHERE organization_id=? AND email_verified=1",
-            (org_id,),
-        ) as cur:
-            verified_emails = (await cur.fetchone())[0]
+            "FROM enriched_leads WHERE organization_id=$1",
+            org_id,
+        ))
+        last_7d = await conn.fetchval(
+            "SELECT COUNT(*) FROM enriched_leads WHERE organization_id=$1 AND enriched_at>=$2",
+            org_id, cutoff_7d,
+        )
+        last_30d = await conn.fetchval(
+            "SELECT COUNT(*) FROM enriched_leads WHERE organization_id=$1 AND enriched_at>=$2",
+            org_id, cutoff_30d,
+        )
+        with_email = await conn.fetchval(
+            "SELECT COUNT(*) FROM enriched_leads WHERE organization_id=$1 AND work_email IS NOT NULL AND work_email!=''",
+            org_id,
+        )
+        verified_emails = await conn.fetchval(
+            "SELECT COUNT(*) FROM enriched_leads WHERE organization_id=$1 AND email_verified=1",
+            org_id,
+        )
 
     total = int(row["total"] or 0)
     email_rate = round(with_email / total, 3) if total else 0.0
@@ -115,13 +99,12 @@ async def get_tier_distribution(org_id: str) -> dict:
     """
     Counts + percentages for hot / warm / cool / cold leads.
     """
-    async with aiosqlite.connect(LEADS_DB) as db:
-        async with db.execute(
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
             "SELECT score_tier, COUNT(*) cnt FROM enriched_leads "
-            "WHERE organization_id=? GROUP BY score_tier",
-            (org_id,),
-        ) as cur:
-            rows = await cur.fetchall()
+            "WHERE organization_id=$1 GROUP BY score_tier",
+            org_id,
+        )
 
     counts: dict[str, int] = {t: 0 for t in ("hot", "warm", "cool", "cold")}
     for row in rows:
@@ -146,8 +129,8 @@ async def get_score_breakdown(org_id: str) -> dict:
     """
     Average sub-scores across all leads for the org.
     """
-    async with aiosqlite.connect(LEADS_DB) as db:
-        async with db.execute(
+    async with get_pool().acquire() as conn:
+        row = dict(await conn.fetchrow(
             """SELECT
                 AVG(icp_fit_score)    avg_icp,
                 AVG(intent_score)     avg_intent,
@@ -157,10 +140,9 @@ async def get_score_breakdown(org_id: str) -> dict:
                 MAX(total_score)      max_score,
                 MIN(total_score)      min_score,
                 COUNT(*)              cnt
-            FROM enriched_leads WHERE organization_id=?""",
-            (org_id,),
-        ) as cur:
-            row = dict(await cur.fetchone())
+            FROM enriched_leads WHERE organization_id=$1""",
+            org_id,
+        ))
 
     return {
         "avg_icp_score":        _safe_avg(row["avg_icp"]),
@@ -185,17 +167,15 @@ async def get_enrichment_trend(org_id: str, days: int = 30) -> list[dict]:
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
-    async with aiosqlite.connect(LEADS_DB) as db:
-        async with db.execute(
-            """SELECT substr(enriched_at, 1, 10) day, COUNT(*) cnt
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT SUBSTRING(enriched_at, 1, 10) day, COUNT(*) cnt
                FROM enriched_leads
-               WHERE organization_id=? AND enriched_at>=?
+               WHERE organization_id=$1 AND enriched_at>=$2
                GROUP BY day ORDER BY day""",
-            (org_id, cutoff),
-        ) as cur:
-            rows = await cur.fetchall()
+            org_id, cutoff,
+        )
 
-    # Build zero-filled date range
     today = datetime.now(timezone.utc).date()
     date_map: dict[str, int] = {}
     for i in range(days):
@@ -215,15 +195,14 @@ async def get_enrichment_trend(org_id: str, days: int = 30) -> list[dict]:
 
 async def get_top_companies(org_id: str, limit: int = 10) -> list[dict]:
     """Most common companies in enriched leads."""
-    async with aiosqlite.connect(LEADS_DB) as db:
-        async with db.execute(
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
             """SELECT company, COUNT(*) cnt, AVG(total_score) avg_score
                FROM enriched_leads
-               WHERE organization_id=? AND company IS NOT NULL AND company!=''
-               GROUP BY company ORDER BY cnt DESC LIMIT ?""",
-            (org_id, limit),
-        ) as cur:
-            rows = await cur.fetchall()
+               WHERE organization_id=$1 AND company IS NOT NULL AND company!=''
+               GROUP BY company ORDER BY cnt DESC LIMIT $2""",
+            org_id, limit,
+        )
     return [
         {"company": r[0], "lead_count": int(r[1]), "avg_score": _safe_avg(r[2])}
         for r in rows
@@ -232,43 +211,40 @@ async def get_top_companies(org_id: str, limit: int = 10) -> list[dict]:
 
 async def get_top_industries(org_id: str, limit: int = 10) -> list[dict]:
     """Most common industries across enriched leads."""
-    async with aiosqlite.connect(LEADS_DB) as db:
-        async with db.execute(
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
             """SELECT industry, COUNT(*) cnt
                FROM enriched_leads
-               WHERE organization_id=? AND industry IS NOT NULL AND industry!=''
-               GROUP BY industry ORDER BY cnt DESC LIMIT ?""",
-            (org_id, limit),
-        ) as cur:
-            rows = await cur.fetchall()
+               WHERE organization_id=$1 AND industry IS NOT NULL AND industry!=''
+               GROUP BY industry ORDER BY cnt DESC LIMIT $2""",
+            org_id, limit,
+        )
     return [{"industry": r[0], "count": int(r[1])} for r in rows]
 
 
 async def get_top_titles(org_id: str, limit: int = 15) -> list[dict]:
     """Most common job titles."""
-    async with aiosqlite.connect(LEADS_DB) as db:
-        async with db.execute(
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
             """SELECT title, COUNT(*) cnt
                FROM enriched_leads
-               WHERE organization_id=? AND title IS NOT NULL AND title!=''
-               GROUP BY title ORDER BY cnt DESC LIMIT ?""",
-            (org_id, limit),
-        ) as cur:
-            rows = await cur.fetchall()
+               WHERE organization_id=$1 AND title IS NOT NULL AND title!=''
+               GROUP BY title ORDER BY cnt DESC LIMIT $2""",
+            org_id, limit,
+        )
     return [{"title": r[0], "count": int(r[1])} for r in rows]
 
 
 async def get_seniority_breakdown(org_id: str) -> list[dict]:
     """Counts per seniority level."""
-    async with aiosqlite.connect(LEADS_DB) as db:
-        async with db.execute(
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
             """SELECT seniority_level, COUNT(*) cnt, AVG(total_score) avg_score
                FROM enriched_leads
-               WHERE organization_id=? AND seniority_level IS NOT NULL AND seniority_level!=''
+               WHERE organization_id=$1 AND seniority_level IS NOT NULL AND seniority_level!=''
                GROUP BY seniority_level ORDER BY cnt DESC""",
-            (org_id,),
-        ) as cur:
-            rows = await cur.fetchall()
+            org_id,
+        )
     return [
         {"seniority": r[0], "count": int(r[1]), "avg_score": _safe_avg(r[2])}
         for r in rows
@@ -283,8 +259,8 @@ async def get_job_stats(org_id: str) -> dict:
     """
     Aggregate stats across all enrichment jobs for the org.
     """
-    async with aiosqlite.connect(LEADS_DB) as db:
-        async with db.execute(
+    async with get_pool().acquire() as conn:
+        row = dict(await conn.fetchrow(
             """SELECT
                 COUNT(*)          total_jobs,
                 SUM(total_urls)   total_submitted,
@@ -294,10 +270,9 @@ async def get_job_stats(org_id: str) -> dict:
                 COUNT(CASE WHEN status='failed'                 THEN 1 END) failed_jobs,
                 COUNT(CASE WHEN status='running'                THEN 1 END) running,
                 COUNT(CASE WHEN status='completed_with_errors'  THEN 1 END) partial
-            FROM enrichment_jobs WHERE organization_id=?""",
-            (org_id,),
-        ) as cur:
-            row = dict(await cur.fetchone())
+            FROM enrichment_jobs WHERE organization_id=$1""",
+            org_id,
+        ))
 
     total_sub  = int(row["total_submitted"] or 0)
     total_proc = int(row["total_processed"] or 0)
@@ -333,13 +308,12 @@ async def get_score_distribution(org_id: str) -> list[dict]:
         ("80-100", 80, 100),
     ]
     result = []
-    async with aiosqlite.connect(LEADS_DB) as db:
+    async with get_pool().acquire() as conn:
         for label, lo, hi in buckets:
-            async with db.execute(
-                "SELECT COUNT(*) FROM enriched_leads WHERE organization_id=? AND total_score>=? AND total_score<=?",
-                (org_id, lo, hi),
-            ) as cur:
-                cnt = (await cur.fetchone())[0]
+            cnt = await conn.fetchval(
+                "SELECT COUNT(*) FROM enriched_leads WHERE organization_id=$1 AND total_score>=$2 AND total_score<=$3",
+                org_id, lo, hi,
+            )
             result.append({"range": label, "count": int(cnt)})
     return result
 

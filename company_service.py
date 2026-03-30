@@ -41,14 +41,10 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-import aiosqlite
 import httpx
+from db import get_pool, named_args
 
 logger = logging.getLogger(__name__)
-
-# ── DB ────────────────────────────────────────────────────────────────────────
-_DB_DIR     = os.path.join(os.path.dirname(__file__), "configs")
-COMPANY_DB  = os.path.join(_DB_DIR, "leads_enrichment.db")   # shared DB
 
 # ── Cache TTL ─────────────────────────────────────────────────────────────────
 CACHE_TTL_DAYS = 7
@@ -63,14 +59,12 @@ async def init_company_db() -> None:
     Create company_enrichments table and add company_id + combined_score
     columns to enriched_leads.  Fully idempotent — safe to call on every startup.
     """
-    async with aiosqlite.connect(COMPANY_DB) as db:
-        # ── company_enrichments ───────────────────────────────────────────────
-        await db.execute("""
+    async with get_pool().acquire() as conn:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS company_enrichments (
                 id                  TEXT PRIMARY KEY,
                 company_linkedin_url TEXT NOT NULL,
                 org_id              TEXT NOT NULL DEFAULT 'default',
-                -- Identity
                 name                TEXT,
                 domain              TEXT,
                 website             TEXT,
@@ -80,75 +74,50 @@ async def init_company_db() -> None:
                 employee_count      INTEGER DEFAULT 0,
                 hq_location         TEXT,
                 founded_year        TEXT,
-                -- Funding
                 funding_stage       TEXT,
                 total_funding       TEXT,
                 last_funding_date   TEXT,
                 lead_investor       TEXT,
-                -- Social
                 company_twitter     TEXT,
                 company_email       TEXT,
                 company_phone       TEXT,
-                -- Posts (P2)
                 linkedin_posts      TEXT DEFAULT '[]',
                 post_themes         TEXT,
-                -- Free signals (P4)
                 crunchbase_data     TEXT DEFAULT '{}',
                 news_mentions       TEXT DEFAULT '[]',
                 wappalyzer_tech     TEXT DEFAULT '[]',
-                -- AI Analysis (P3)
                 company_tags        TEXT DEFAULT '[]',
                 culture_signals     TEXT DEFAULT '{}',
                 account_pitch       TEXT DEFAULT '{}',
-                -- Scoring (P5)
                 company_score       INTEGER DEFAULT 0,
                 company_score_tier  TEXT DEFAULT 'C',
-                -- Cache (P6)
                 last_enriched_at    TEXT,
                 cache_expires_at    TEXT,
                 refresh_triggered_by TEXT,
-                -- Raw
                 raw_data            TEXT DEFAULT '{}',
-                created_at          TEXT DEFAULT (datetime('now')),
-                updated_at          TEXT DEFAULT (datetime('now'))
+                created_at          TEXT DEFAULT '',
+                updated_at          TEXT DEFAULT ''
             )
         """)
-
-        # Indexes
         for idx in [
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_co_linkedin ON company_enrichments(company_linkedin_url, org_id)",
             "CREATE INDEX IF NOT EXISTS idx_co_org ON company_enrichments(org_id, company_score DESC)",
             "CREATE INDEX IF NOT EXISTS idx_co_expires ON company_enrichments(cache_expires_at)",
         ]:
-            try:
-                await db.execute(idx)
-            except Exception:
-                pass
+            await conn.execute(idx)
 
-        await db.commit()
-
-        # ── enriched_leads: add company_id + combined_score columns ──────────
         for col, col_type in [
             ("company_id",     "TEXT"),
             ("combined_score", "INTEGER DEFAULT 0"),
             ("company_score",  "INTEGER DEFAULT 0"),
         ]:
-            try:
-                await db.execute(f"ALTER TABLE enriched_leads ADD COLUMN {col} {col_type}")
-            except Exception:
-                pass  # already exists
+            await conn.execute(f"ALTER TABLE enriched_leads ADD COLUMN IF NOT EXISTS {col} {col_type}")
 
-        # Index for company_id join
-        try:
-            await db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_leads_company ON enriched_leads(company_id)"
-            )
-        except Exception:
-            pass
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_leads_company ON enriched_leads(company_id)"
+        )
 
-        await db.commit()
-
-    logger.info("[CompanyService] DB ready: %s", COMPANY_DB)
+    logger.info("[CompanyService] DB ready (PostgreSQL)")
 
 
 def _company_id(linkedin_url: str) -> str:
@@ -160,28 +129,27 @@ def _company_id(linkedin_url: str) -> str:
 async def _get_company(linkedin_url: str, org_id: str = "default") -> Optional[dict]:
     """Fetch cached company enrichment. Returns None if not found or stale."""
     cid = _company_id(linkedin_url)
-    async with aiosqlite.connect(COMPANY_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM company_enrichments WHERE id=? AND org_id=?",
-            (cid, org_id),
-        ) as cur:
-            row = await cur.fetchone()
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM company_enrichments WHERE id=$1 AND org_id=$2",
+            cid, org_id,
+        )
     return dict(row) if row else None
 
 
 async def _upsert_company(record: dict) -> None:
     cols = [k for k in record if k != "id"]
-    placeholders = ", ".join(f":{k}" for k in cols)
-    updates = ", ".join(f"{k}=excluded.{k}" for k in cols)
+    all_keys = ["id"] + cols
+    placeholders = ", ".join(f"${i + 1}" for i in range(len(all_keys)))
+    updates = ", ".join(f"{k}=EXCLUDED.{k}" for k in cols)
     sql = f"""
-        INSERT INTO company_enrichments (id, {', '.join(cols)})
-        VALUES (:id, {placeholders})
+        INSERT INTO company_enrichments ({', '.join(all_keys)})
+        VALUES ({placeholders})
         ON CONFLICT(id) DO UPDATE SET {updates}
     """
-    async with aiosqlite.connect(COMPANY_DB) as db:
-        await db.execute(sql, record)
-        await db.commit()
+    args = [record[k] for k in all_keys]
+    async with get_pool().acquire() as conn:
+        await conn.execute(sql, *args)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1126,19 +1094,17 @@ async def get_company_for_lead(company_linkedin_url: str, org_id: str = "default
 
 async def list_companies(org_id: str, limit: int = 50, offset: int = 0) -> list[dict]:
     """List all enriched companies for an org, ordered by score."""
-    async with aiosqlite.connect(COMPANY_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
             """SELECT id, company_linkedin_url, name, domain, industry,
                       employee_count, funding_stage, company_score, company_score_tier,
                       company_tags, culture_signals, last_enriched_at
                FROM company_enrichments
-               WHERE org_id=?
+               WHERE org_id=$1
                ORDER BY company_score DESC
-               LIMIT ? OFFSET ?""",
-            (org_id, limit, offset),
-        ) as cur:
-            rows = await cur.fetchall()
+               LIMIT $2 OFFSET $3""",
+            org_id, limit, offset,
+        )
 
     results = []
     for row in rows:

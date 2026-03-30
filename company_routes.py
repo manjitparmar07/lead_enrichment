@@ -19,14 +19,10 @@ from pydantic import BaseModel
 
 from auth_routes import get_current_user
 import company_service as cs
-import aiosqlite
-import os
+from db import get_pool
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Companies"])
-
-_DB_DIR  = os.path.join(os.path.dirname(__file__), "configs")
-LEADS_DB = os.path.join(_DB_DIR, "leads_enrichment.db")
 
 
 # ── List companies for org ────────────────────────────────────────────────────
@@ -50,17 +46,13 @@ async def get_company(
     current_user: dict = Depends(get_current_user),
 ):
     org_id = str(current_user.get("organization_id", "default"))
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM company_enrichments WHERE id=? AND org_id=?",
-            (company_id, org_id),
-        ) as cur:
-            row = await cur.fetchone()
-
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM company_enrichments WHERE id=$1 AND org_id=$2",
+            company_id, org_id,
+        )
     if not row:
         raise HTTPException(status_code=404, detail="Company not found")
-
     return cs._deserialise_record(dict(row))
 
 
@@ -73,29 +65,22 @@ async def get_lead_company(
 ):
     org_id = str(current_user.get("organization_id", "default"))
 
-    # Find company_id on the lead
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT company_id, company_linkedin FROM enriched_leads WHERE id=? AND organization_id=?",
-            (lead_id, org_id),
-        ) as cur:
-            lead_row = await cur.fetchone()
+    async with get_pool().acquire() as conn:
+        lead_row = await conn.fetchrow(
+            "SELECT company_id, company_linkedin FROM enriched_leads WHERE id=$1 AND organization_id=$2",
+            lead_id, org_id,
+        )
+        if not lead_row:
+            raise HTTPException(status_code=404, detail="Lead not found")
 
-    if not lead_row:
-        raise HTTPException(status_code=404, detail="Lead not found")
+        cid = lead_row["company_id"]
+        if not cid:
+            return {"company": None, "message": "No company enrichment linked to this lead"}
 
-    cid = lead_row["company_id"] if lead_row else None
-    if not cid:
-        return {"company": None, "message": "No company enrichment linked to this lead"}
-
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM company_enrichments WHERE id=? AND org_id=?",
-            (cid, org_id),
-        ) as cur:
-            row = await cur.fetchone()
+        row = await conn.fetchrow(
+            "SELECT * FROM company_enrichments WHERE id=$1 AND org_id=$2",
+            cid, org_id,
+        )
 
     if not row:
         return {"company": None, "message": "Company enrichment not yet available"}

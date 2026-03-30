@@ -33,9 +33,13 @@ from enrichment_config_routes import router as enrichment_config_router
 from company_routes import router as company_router
 from ai_enrichment_routes import router as ai_enrichment_router
 from analytics_routes import router as analytics_router
+from import_routes import router as import_router
+from storage_routes import router as storage_router
 from security import SecurityMiddleware
 import keys_service
 import lead_enrichment_worker as worker
+import import_worker as _import_worker
+import db as _db
 from lead_enrichment_brightdata_service import init_leads_db
 from workspace_service import init_workspace_db
 from enrichment_config_service import init_config_db
@@ -86,6 +90,8 @@ app.include_router(enrichment_config_router,  prefix="/api", include_in_schema=F
 app.include_router(company_router,            prefix="/api", include_in_schema=False)
 app.include_router(ai_enrichment_router,      prefix="/api")
 app.include_router(analytics_router,          prefix="/api")
+app.include_router(import_router)
+app.include_router(storage_router)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 # Production requests go through nginx which owns CORS headers.
@@ -112,17 +118,27 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup():
     keys_service.reload()
+    await _db.init_pool()
     await init_leads_db()
     await init_workspace_db()
     await init_config_db()
     await init_company_db()
     await worker.start_workers()
+    await _import_worker.start_import_workers()
+    # Migrate import schema (add new columns if they don't exist yet)
+    from import_service import _ensure_schema as _ensure_import_schema
+    await _ensure_import_schema()
+    from storage_routes import _ensure_unmapped_table
+    async with _db.get_pool().acquire() as _conn:
+        await _ensure_unmapped_table(_conn)
     logger.info("Lead Enrichment API started — http://0.0.0.0:%s", os.getenv("PORT", "8020"))
 
 
 @app.on_event("shutdown")
 async def shutdown():
     await worker.stop_workers()
+    await _import_worker.stop_import_workers()
+    await _db.close_pool()
     logger.info("Lead Enrichment API stopped")
 
 # ── Health ────────────────────────────────────────────────────────────────────

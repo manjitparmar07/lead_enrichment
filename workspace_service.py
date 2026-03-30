@@ -37,18 +37,16 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 
-import aiosqlite
+from db import get_pool
 
-logger  = logging.getLogger(__name__)
-_DB_DIR = os.path.join(os.path.dirname(__file__), "configs")
-WS_DB   = os.path.join(_DB_DIR, "leads_enrichment.db")   # same DB as leads
+logger = logging.getLogger(__name__)
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 
 async def init_workspace_db() -> None:
-    async with aiosqlite.connect(WS_DB) as db:
-        await db.execute("""
+    async with get_pool().acquire() as conn:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS workspace_configs (
                 org_id            TEXT PRIMARY KEY,
                 product_name      TEXT,
@@ -61,11 +59,10 @@ async def init_workspace_db() -> None:
                 cta_style         TEXT DEFAULT 'question',
                 banned_phrases    TEXT DEFAULT '[]',
                 case_studies      TEXT DEFAULT '[]',
-                created_at        TEXT DEFAULT (datetime('now')),
-                updated_at        TEXT DEFAULT (datetime('now'))
+                created_at        TEXT DEFAULT '',
+                updated_at        TEXT DEFAULT ''
             )
         """)
-        await db.commit()
     logger.info("[WorkspaceService] DB ready")
 
 
@@ -77,12 +74,10 @@ async def get_workspace_config(org_id: str) -> dict:
     Returns a default config dict (not saved) if none exists yet —
     so AI analysis always gets something sensible.
     """
-    async with aiosqlite.connect(WS_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM workspace_configs WHERE org_id=?", (org_id,)
-        ) as cur:
-            row = await cur.fetchone()
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM workspace_configs WHERE org_id=$1", org_id
+        )
 
     if row:
         cfg = dict(row)
@@ -112,6 +107,7 @@ async def get_workspace_config(org_id: str) -> dict:
 
 async def upsert_workspace_config(org_id: str, data: dict) -> dict:
     """Create or update workspace config. Returns saved record."""
+    from db import named_args
     now = datetime.now(timezone.utc).isoformat()
 
     # Serialise JSON arrays
@@ -119,38 +115,37 @@ async def upsert_workspace_config(org_id: str, data: dict) -> dict:
         if k in data and isinstance(data[k], list):
             data[k] = json.dumps(data[k])
 
-    async with aiosqlite.connect(WS_DB) as db:
-        # Check if exists
-        async with db.execute(
-            "SELECT org_id FROM workspace_configs WHERE org_id=?", (org_id,)
-        ) as cur:
-            exists = await cur.fetchone()
-
+    async with get_pool().acquire() as conn:
+        exists = await conn.fetchrow(
+            "SELECT org_id FROM workspace_configs WHERE org_id=$1", org_id
+        )
         if exists:
-            sets = ", ".join(f"{k}=:{k}" for k in data if k != "org_id")
-            data["org_id"] = org_id
-            data["updated_at"] = now
-            await db.execute(
+            update_data = {k: v for k, v in data.items() if k != "org_id"}
+            update_data["updated_at"] = now
+            update_data["org_id"] = org_id
+            sets = ", ".join(f"{k}=:{k}" for k in update_data if k != "org_id")
+            sql, args = named_args(
                 f"UPDATE workspace_configs SET {sets}, updated_at=:updated_at WHERE org_id=:org_id",
-                data,
+                update_data,
             )
+            await conn.execute(sql, *args)
         else:
             data["org_id"]     = org_id
             data["created_at"] = now
             data["updated_at"] = now
-            cols         = ", ".join(data.keys())
-            placeholders = ", ".join(f":{k}" for k in data.keys())
-            await db.execute(
-                f"INSERT INTO workspace_configs ({cols}) VALUES ({placeholders})", data
+            cols = list(data.keys())
+            placeholders = ", ".join(f"${i + 1}" for i in range(len(cols)))
+            args = [data[k] for k in cols]
+            await conn.execute(
+                f"INSERT INTO workspace_configs ({', '.join(cols)}) VALUES ({placeholders})",
+                *args,
             )
-        await db.commit()
 
     logger.info("[WorkspaceService] Config upserted for org=%s", org_id)
     return await get_workspace_config(org_id)
 
 
 async def delete_workspace_config(org_id: str) -> bool:
-    async with aiosqlite.connect(WS_DB) as db:
-        await db.execute("DELETE FROM workspace_configs WHERE org_id=?", (org_id,))
-        await db.commit()
+    async with get_pool().acquire() as conn:
+        await conn.execute("DELETE FROM workspace_configs WHERE org_id=$1", org_id)
     return True

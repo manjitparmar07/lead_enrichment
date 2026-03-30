@@ -27,8 +27,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-import aiosqlite
 import httpx
+from db import get_pool, named_args
 try:
     import redis.asyncio as aioredis
     _REDIS_AVAILABLE = True
@@ -79,8 +79,7 @@ GROQ_MODEL         = ""  # use _groq_model() inside functions
 OUTREACH_THRESHOLD = 50  # use _outreach_threshold() inside functions
 
 # ── DB ────────────────────────────────────────────────────────────────────────
-_DB_DIR  = os.path.join(os.path.dirname(__file__), "configs")
-LEADS_DB = os.path.join(_DB_DIR, "leads_enrichment.db")
+# Pool is initialised by main.py at startup via db.init_pool().
 
 # ── Redis queues ───────────────────────────────────────────────────────────────
 REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -283,8 +282,8 @@ async def _publish_job_done(org_id: str, job_id: str, processed: int, failed: in
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def init_leads_db() -> None:
-    async with aiosqlite.connect(LEADS_DB) as db:
-        await db.execute("""
+    async with get_pool().acquire() as conn:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS enriched_leads (
                 id               TEXT PRIMARY KEY,
                 linkedin_url     TEXT NOT NULL,
@@ -390,17 +389,12 @@ async def init_leads_db() -> None:
                 job_id           TEXT,
                 organization_id  TEXT NOT NULL DEFAULT 'default',
                 enriched_at      TEXT,
-                created_at       TEXT DEFAULT (datetime('now')),
+                created_at       TEXT DEFAULT '',
                 lio_results_json TEXT
             )
         """)
-        # Migration: add lio_results_json column if it doesn't exist yet
-        try:
-            await db.execute("ALTER TABLE enriched_leads ADD COLUMN lio_results_json TEXT")
-            await db.commit()
-        except Exception:
-            pass  # Column already exists
-        await db.execute("""
+        await conn.execute("ALTER TABLE enriched_leads ADD COLUMN IF NOT EXISTS lio_results_json TEXT")
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS enrichment_jobs (
                 id              TEXT PRIMARY KEY,
                 snapshot_id     TEXT,
@@ -411,11 +405,11 @@ async def init_leads_db() -> None:
                 error           TEXT,
                 webhook_url     TEXT,
                 organization_id TEXT NOT NULL DEFAULT 'default',
-                created_at      TEXT DEFAULT (datetime('now')),
-                updated_at      TEXT DEFAULT (datetime('now'))
+                created_at      TEXT DEFAULT '',
+                updated_at      TEXT DEFAULT ''
             )
         """)
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS enrichment_sub_jobs (
                 id              TEXT PRIMARY KEY,
                 job_id          TEXT NOT NULL,
@@ -425,15 +419,14 @@ async def init_leads_db() -> None:
                 failed          INTEGER DEFAULT 0,
                 status          TEXT DEFAULT 'pending',
                 organization_id TEXT NOT NULL DEFAULT 'default',
-                created_at      TEXT DEFAULT (datetime('now')),
-                updated_at      TEXT DEFAULT (datetime('now'))
+                created_at      TEXT DEFAULT '',
+                updated_at      TEXT DEFAULT ''
             )
         """)
-        await db.execute(
+        await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sub_jobs_job ON enrichment_sub_jobs(job_id)"
         )
-        await db.commit()
-        # Add columns to existing tables (idempotent)
+        # Add columns to existing tables (idempotent via IF NOT EXISTS)
         _NEW_COLS = [
             ("work_email", "TEXT"), ("personal_email", "TEXT"),
             ("direct_phone", "TEXT"), ("twitter", "TEXT"),
@@ -464,80 +457,44 @@ async def init_leads_db() -> None:
             ("data_completeness", "INTEGER DEFAULT 0"),
             ("crm_stage", "TEXT"), ("tags", "TEXT"),
             ("assigned_owner", "TEXT"), ("full_data", "TEXT"),
-            # Company waterfall enrichment columns
-            ("avatar_url", "TEXT"),
-            ("company_logo", "TEXT"),
-            ("company_email", "TEXT"),
-            ("company_description", "TEXT"),
-            ("company_linkedin", "TEXT"),
-            ("company_twitter", "TEXT"),
-            ("company_phone", "TEXT"),
-            ("waterfall_log", "TEXT"),
-            # Stage 3 — Website Intelligence columns
-            ("website_intelligence", "TEXT"),
-            ("product_offerings", "TEXT"),
-            ("value_proposition", "TEXT"),
-            ("target_customers", "TEXT"),
-            ("business_model", "TEXT"),
-            ("pricing_signals", "TEXT"),
-            ("product_category", "TEXT"),
-            ("data_completeness_score", "INTEGER DEFAULT 0"),
-            ("organization_id", "TEXT NOT NULL DEFAULT 'default'"),
-            # P1 — Activity feed (full posts/likes/comments array from BD)
-            ("activity_feed",        "TEXT"),
-            # P3 — AI Analysis layer outputs
-            ("auto_tags",            "TEXT"),   # JSON array of 6-8 pill strings
-            ("behavioural_signals",  "TEXT"),   # JSON: posts_about, engages_with, etc.
-            ("pitch_intelligence",   "TEXT"),   # JSON: pain_point, value_prop, avoid, angle, cta
-            ("warm_signal",          "TEXT"),   # e.g. "Liked a Lio post about lead scoring"
-            # P4 — Enhanced email verification
-            ("email_verified",       "INTEGER DEFAULT 0"),
-            ("bounce_risk",          "TEXT"),   # low / medium / high
-            # Company enrichment (P1/P5 — joined from company_enrichments at enrich time)
-            ("company_id",           "TEXT"),
-            ("company_score",        "INTEGER DEFAULT 0"),
-            ("combined_score",       "INTEGER DEFAULT 0"),
-            ("company_tags",         "TEXT"),   # JSON array — mirrors company_enrichments
-            ("culture_signals",      "TEXT"),   # JSON object
-            ("account_pitch",        "TEXT"),   # JSON object
-            ("wappalyzer_tech",      "TEXT"),   # JSON array
-            ("news_mentions",        "TEXT"),   # JSON array
-            ("crunchbase_data",      "TEXT"),   # JSON object
-            ("linkedin_posts",       "TEXT"),   # JSON array (company posts)
-            ("company_score_tier",   "TEXT"),
+            ("avatar_url", "TEXT"), ("company_logo", "TEXT"),
+            ("company_email", "TEXT"), ("company_description", "TEXT"),
+            ("company_linkedin", "TEXT"), ("company_twitter", "TEXT"),
+            ("company_phone", "TEXT"), ("waterfall_log", "TEXT"),
+            ("website_intelligence", "TEXT"), ("product_offerings", "TEXT"),
+            ("value_proposition", "TEXT"), ("target_customers", "TEXT"),
+            ("business_model", "TEXT"), ("pricing_signals", "TEXT"),
+            ("product_category", "TEXT"), ("data_completeness_score", "INTEGER DEFAULT 0"),
+            ("organization_id", "TEXT DEFAULT 'default'"),
+            ("activity_feed", "TEXT"), ("auto_tags", "TEXT"),
+            ("behavioural_signals", "TEXT"), ("pitch_intelligence", "TEXT"),
+            ("warm_signal", "TEXT"), ("email_verified", "INTEGER DEFAULT 0"),
+            ("bounce_risk", "TEXT"), ("company_id", "TEXT"),
+            ("company_score", "INTEGER DEFAULT 0"), ("combined_score", "INTEGER DEFAULT 0"),
+            ("company_tags", "TEXT"), ("culture_signals", "TEXT"),
+            ("account_pitch", "TEXT"), ("wappalyzer_tech", "TEXT"),
+            ("news_mentions", "TEXT"), ("crunchbase_data", "TEXT"),
+            ("linkedin_posts", "TEXT"), ("company_score_tier", "TEXT"),
         ]
         for col, col_type in _NEW_COLS:
-            try:
-                await db.execute(f"ALTER TABLE enriched_leads ADD COLUMN {col} {col_type}")
-            except Exception:
-                pass  # Column already exists
-        # Idempotent migration for enrichment_jobs
-        _JOB_COLS = [("organization_id", "TEXT NOT NULL DEFAULT 'default'")]
-        for col, col_type in _JOB_COLS:
-            try:
-                await db.execute(f"ALTER TABLE enrichment_jobs ADD COLUMN {col} {col_type}")
-            except Exception:
-                pass
-        # Indexes for org isolation
+            await conn.execute(f"ALTER TABLE enriched_leads ADD COLUMN IF NOT EXISTS {col} {col_type}")
+        await conn.execute("ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS organization_id TEXT DEFAULT 'default'")
         for idx_sql in [
             "CREATE INDEX IF NOT EXISTS idx_leads_org ON enriched_leads(organization_id, total_score DESC)",
             "CREATE INDEX IF NOT EXISTS idx_jobs_org  ON enrichment_jobs(organization_id, created_at DESC)",
         ]:
-            try:
-                await db.execute(idx_sql)
-            except Exception:
-                pass
+            await conn.execute(idx_sql)
         # ── processed_snapshots — webhook idempotency ─────────────────────────
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS processed_snapshots (
                 snapshot_id  TEXT PRIMARY KEY,
                 job_id       TEXT,
                 org_id       TEXT,
-                processed_at TEXT DEFAULT (datetime('now'))
+                processed_at TEXT DEFAULT ''
             )
         """)
         # ── enrichment_audit_log — who did what ────────────────────────────────
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS enrichment_audit_log (
                 id           TEXT PRIMARY KEY,
                 org_id       TEXT NOT NULL,
@@ -547,27 +504,26 @@ async def init_leads_db() -> None:
                 job_id       TEXT,
                 user_email   TEXT,
                 meta         TEXT,
-                created_at   TEXT DEFAULT (datetime('now'))
+                created_at   TEXT DEFAULT ''
             )
         """)
-        await db.execute(
+        await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_audit_org ON enrichment_audit_log(org_id, created_at DESC)"
         )
         # ── lead_notes — manual annotations ───────────────────────────────────
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS lead_notes (
                 id         TEXT PRIMARY KEY,
                 lead_id    TEXT NOT NULL,
                 org_id     TEXT NOT NULL,
                 note       TEXT NOT NULL,
-                created_at TEXT DEFAULT (datetime('now'))
+                created_at TEXT DEFAULT ''
             )
         """)
-        await db.execute(
+        await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_notes_lead ON lead_notes(lead_id)"
         )
-        await db.commit()
-    logger.info("[LeadEnrichmentBD] DB initialized: %s", LEADS_DB)
+    logger.info("[LeadEnrichmentBD] DB initialized (PostgreSQL)")
 
 
 async def _upsert_lead(lead: dict) -> None:
@@ -583,70 +539,68 @@ async def _upsert_lead(lead: dict) -> None:
                                 "about", "location", "city", "country"])
 
     cols = [k for k in lead if k != "id"]
-    placeholders = ", ".join(f":{k}" for k in cols)
-    updates = ", ".join(f"{k}=excluded.{k}" for k in cols)
+    all_keys = ["id"] + cols
+    placeholders = ", ".join(f"${i + 1}" for i in range(len(all_keys)))
+    updates = ", ".join(f"{k}=EXCLUDED.{k}" for k in cols)
     sql = f"""
-        INSERT INTO enriched_leads (id, {', '.join(cols)})
-        VALUES (:id, {placeholders})
+        INSERT INTO enriched_leads ({', '.join(all_keys)})
+        VALUES ({placeholders})
         ON CONFLICT(id) DO UPDATE SET {updates}
     """
-    async with aiosqlite.connect(LEADS_DB) as db:
-        await db.execute(sql, lead)
-        await db.commit()
+    args = [lead[k] for k in all_keys]
+    async with get_pool().acquire() as conn:
+        await conn.execute(sql, *args)
 
 
 async def _update_job(job_id: str, **kwargs) -> None:
     if not kwargs:
         return
     kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
-    sets = ", ".join(f"{k}=:{k}" for k in kwargs)
-    kwargs["id"] = job_id
-    async with aiosqlite.connect(LEADS_DB) as db:
-        await db.execute(f"UPDATE enrichment_jobs SET {sets} WHERE id=:id", kwargs)
-        await db.commit()
+    keys = list(kwargs.keys())
+    sets = ", ".join(f"{k}=${i + 1}" for i, k in enumerate(keys))
+    args = [kwargs[k] for k in keys] + [job_id]
+    async with get_pool().acquire() as conn:
+        await conn.execute(f"UPDATE enrichment_jobs SET {sets} WHERE id=${len(args)}", *args)
 
 
 async def _create_sub_job(
     sub_job_id: str, job_id: str, chunk_index: int, total_urls: int, org_id: str
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(LEADS_DB) as db:
-        await db.execute(
-            """INSERT OR IGNORE INTO enrichment_sub_jobs
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            """INSERT INTO enrichment_sub_jobs
                (id, job_id, chunk_index, total_urls, processed, failed, status, organization_id, created_at, updated_at)
-               VALUES (?,?,?,?,0,0,'pending',?,?,?)""",
-            (sub_job_id, job_id, chunk_index, total_urls, org_id, now, now),
+               VALUES ($1,$2,$3,$4,0,0,'pending',$5,$6,$7)
+               ON CONFLICT(id) DO NOTHING""",
+            sub_job_id, job_id, chunk_index, total_urls, org_id, now, now,
         )
-        await db.commit()
 
 
 async def _update_sub_job(sub_job_id: str, **kwargs) -> None:
     if not kwargs:
         return
     kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
-    sets = ", ".join(f"{k}=:{k}" for k in kwargs)
-    kwargs["id"] = sub_job_id
-    async with aiosqlite.connect(LEADS_DB) as db:
-        await db.execute(f"UPDATE enrichment_sub_jobs SET {sets} WHERE id=:id", kwargs)
-        await db.commit()
+    keys = list(kwargs.keys())
+    sets = ", ".join(f"{k}=${i + 1}" for i, k in enumerate(keys))
+    args = [kwargs[k] for k in keys] + [sub_job_id]
+    async with get_pool().acquire() as conn:
+        await conn.execute(f"UPDATE enrichment_sub_jobs SET {sets} WHERE id=${len(args)}", *args)
 
 
 async def list_sub_jobs(job_id: str, org_id: str = "default") -> list[dict]:
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM enrichment_sub_jobs WHERE job_id=? AND organization_id=? ORDER BY chunk_index",
-            (job_id, org_id),
-        ) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM enrichment_sub_jobs WHERE job_id=$1 AND organization_id=$2 ORDER BY chunk_index",
+            job_id, org_id,
+        )
+        return [dict(r) for r in rows]
 
 
 async def get_lead(lead_id: str) -> Optional[dict]:
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM enriched_leads WHERE id=?", (lead_id,)) as cur:
-            row = await cur.fetchone()
-            return dict(row) if row else None
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM enriched_leads WHERE id=$1", lead_id)
+        return dict(row) if row else None
 
 
 async def get_lead_by_url(linkedin_url: str) -> Optional[dict]:
@@ -748,39 +702,35 @@ def _format_linkedin_enrich(lead: dict) -> dict:
 
 async def get_lead_lio_results(lead_id: str) -> dict:
     """Return saved LIO stage results for a lead (empty dict if none)."""
-    async with aiosqlite.connect(LEADS_DB) as db:
-        async with db.execute(
-            "SELECT lio_results_json FROM enriched_leads WHERE id=?", (lead_id,)
-        ) as cur:
-            row = await cur.fetchone()
-            if not row or not row[0]:
-                return {}
-            try:
-                return json.loads(row[0])
-            except Exception:
-                return {}
+    async with get_pool().acquire() as conn:
+        raw = await conn.fetchval(
+            "SELECT lio_results_json FROM enriched_leads WHERE id=$1", lead_id
+        )
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
 
 
 async def save_lead_lio_results(lead_id: str, results: dict) -> None:
     """Merge new stage results into saved LIO results for a lead."""
-    async with aiosqlite.connect(LEADS_DB) as db:
-        # Load existing
-        async with db.execute(
-            "SELECT lio_results_json FROM enriched_leads WHERE id=?", (lead_id,)
-        ) as cur:
-            row = await cur.fetchone()
+    async with get_pool().acquire() as conn:
+        raw = await conn.fetchval(
+            "SELECT lio_results_json FROM enriched_leads WHERE id=$1", lead_id
+        )
         existing: dict = {}
-        if row and row[0]:
+        if raw:
             try:
-                existing = json.loads(row[0])
+                existing = json.loads(raw)
             except Exception:
                 pass
         existing.update(results)
-        await db.execute(
-            "UPDATE enriched_leads SET lio_results_json=? WHERE id=?",
-            (json.dumps(existing), lead_id),
+        await conn.execute(
+            "UPDATE enriched_leads SET lio_results_json=$1 WHERE id=$2",
+            json.dumps(existing), lead_id,
         )
-        await db.commit()
 
 
 async def list_leads(
@@ -793,55 +743,53 @@ async def list_leads(
     clauses: list[str] = []
     params: list = []
     if org_id:
-        clauses.append("organization_id=?"); params.append(org_id)
+        params.append(org_id); clauses.append(f"organization_id=${len(params)}")
     if job_id:
-        clauses.append("job_id=?"); params.append(job_id)
+        params.append(job_id); clauses.append(f"job_id=${len(params)}")
     if min_score is not None:
-        clauses.append("total_score>=?"); params.append(min_score)
+        params.append(min_score); clauses.append(f"total_score>=${len(params)}")
     if tier:
-        clauses.append("score_tier=?"); params.append(tier)
+        params.append(tier); clauses.append(f"score_tier=${len(params)}")
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(f"SELECT COUNT(*) FROM enriched_leads {where}", params) as cur:
-            total = (await cur.fetchone())[0]
-        async with db.execute(
-            f"SELECT * FROM enriched_leads {where} ORDER BY total_score DESC, enriched_at DESC LIMIT ? OFFSET ?",
-            [*params, limit, offset],
-        ) as cur:
-            rows = [dict(r) for r in await cur.fetchall()]
-    return {"total": total, "leads": rows}
+    params_page = params + [limit, offset]
+    async with get_pool().acquire() as conn:
+        total = await conn.fetchval(f"SELECT COUNT(*) FROM enriched_leads {where}", *params)
+        rows = await conn.fetch(
+            f"SELECT * FROM enriched_leads {where} ORDER BY total_score DESC, enriched_at DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}",
+            *params_page,
+        )
+    return {"total": total, "leads": [dict(r) for r in rows]}
 
 
 async def get_job(job_id: str, org_id: Optional[str] = None) -> Optional[dict]:
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
+    async with get_pool().acquire() as conn:
         if org_id:
-            sql, args = "SELECT * FROM enrichment_jobs WHERE id=? AND organization_id=?", (job_id, org_id)
+            row = await conn.fetchrow(
+                "SELECT * FROM enrichment_jobs WHERE id=$1 AND organization_id=$2", job_id, org_id
+            )
         else:
-            sql, args = "SELECT * FROM enrichment_jobs WHERE id=?", (job_id,)
-        async with db.execute(sql, args) as cur:
-            row = await cur.fetchone()
-            return dict(row) if row else None
+            row = await conn.fetchrow("SELECT * FROM enrichment_jobs WHERE id=$1", job_id)
+        return dict(row) if row else None
 
 
 async def list_jobs(limit: int = 20, org_id: Optional[str] = None) -> list[dict]:
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
+    async with get_pool().acquire() as conn:
         if org_id:
-            sql, args = "SELECT * FROM enrichment_jobs WHERE organization_id=? ORDER BY created_at DESC LIMIT ?", (org_id, limit)
+            rows = await conn.fetch(
+                "SELECT * FROM enrichment_jobs WHERE organization_id=$1 ORDER BY created_at DESC LIMIT $2",
+                org_id, limit,
+            )
         else:
-            sql, args = "SELECT * FROM enrichment_jobs ORDER BY created_at DESC LIMIT ?", (limit,)
-        async with db.execute(sql, args) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+            rows = await conn.fetch(
+                "SELECT * FROM enrichment_jobs ORDER BY created_at DESC LIMIT $1", limit
+            )
+        return [dict(r) for r in rows]
 
 
 async def delete_lead(lead_id: str) -> bool:
-    async with aiosqlite.connect(LEADS_DB) as db:
-        async with db.execute("DELETE FROM enriched_leads WHERE id=?", (lead_id,)) as cur:
-            deleted = cur.rowcount > 0
-        await db.commit()
-    return deleted
+    async with get_pool().acquire() as conn:
+        status = await conn.execute("DELETE FROM enriched_leads WHERE id=$1", lead_id)
+    return status != "DELETE 0"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -858,13 +806,11 @@ async def check_existing_lead(linkedin_url: str, org_id: str) -> Optional[dict]:
     - is_stale=False → fresh cache hit
     """
     lead_id = _lead_id(_normalize_linkedin_url(linkedin_url))
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM enriched_leads WHERE id=? AND organization_id=?",
-            (lead_id, org_id),
-        ) as cur:
-            row = await cur.fetchone()
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM enriched_leads WHERE id=$1 AND organization_id=$2",
+            lead_id, org_id,
+        )
     if not row:
         return None
     lead = dict(row)
@@ -893,23 +839,23 @@ async def get_stale_leads(
     """
     from datetime import datetime, timezone, timedelta
     cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
-    clauses = ["organization_id=?", "enriched_at<?"]
     params: list = [org_id, cutoff]
+    clauses = ["organization_id=$1", "enriched_at<$2"]
     if tier:
-        clauses.append("score_tier=?"); params.append(tier)
+        params.append(tier); clauses.append(f"score_tier=${len(params)}")
     if min_score:
-        clauses.append("total_score>=?"); params.append(min_score)
-    where = "WHERE " + " AND ".join(clauses)
+        params.append(min_score); clauses.append(f"total_score>=${len(params)}")
     max_limit = int(os.getenv("LEAD_REFRESH_LIMIT", "200"))
     limit = min(limit, max_limit)
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
+    params.append(limit)
+    where = "WHERE " + " AND ".join(clauses)
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
             f"SELECT id, linkedin_url, enriched_at, total_score, score_tier "
-            f"FROM enriched_leads {where} ORDER BY total_score DESC LIMIT ?",
-            [*params, limit],
-        ) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+            f"FROM enriched_leads {where} ORDER BY total_score DESC LIMIT ${len(params)}",
+            *params,
+        )
+        return [dict(r) for r in rows]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -918,21 +864,20 @@ async def get_stale_leads(
 
 async def mark_snapshot_processed(snapshot_id: str, job_id: Optional[str], org_id: str) -> None:
     """Record that a snapshot has been processed (idempotency guard)."""
-    async with aiosqlite.connect(LEADS_DB) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO processed_snapshots(snapshot_id, job_id, org_id) VALUES(?,?,?)",
-            (snapshot_id, job_id, org_id),
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            "INSERT INTO processed_snapshots(snapshot_id, job_id, org_id) VALUES($1,$2,$3) ON CONFLICT(snapshot_id) DO NOTHING",
+            snapshot_id, job_id, org_id,
         )
-        await db.commit()
 
 
 async def is_snapshot_processed(snapshot_id: str) -> bool:
     """Return True if this snapshot_id was already processed."""
-    async with aiosqlite.connect(LEADS_DB) as db:
-        async with db.execute(
-            "SELECT 1 FROM processed_snapshots WHERE snapshot_id=?", (snapshot_id,)
-        ) as cur:
-            return (await cur.fetchone()) is not None
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM processed_snapshots WHERE snapshot_id=$1", snapshot_id
+        )
+        return row is not None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -955,18 +900,17 @@ async def audit_log(
     """
     try:
         entry_id = str(uuid.uuid4())
-        async with aiosqlite.connect(LEADS_DB) as db:
-            await db.execute(
+        now = datetime.now(timezone.utc).isoformat()
+        async with get_pool().acquire() as conn:
+            await conn.execute(
                 """INSERT INTO enrichment_audit_log
-                   (id, org_id, action, lead_id, linkedin_url, job_id, user_email, meta)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (
-                    entry_id, org_id, action, lead_id, linkedin_url,
-                    job_id, user_email,
-                    json.dumps(meta) if meta else None,
-                ),
+                   (id, org_id, action, lead_id, linkedin_url, job_id, user_email, meta, created_at)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)""",
+                entry_id, org_id, action, lead_id, linkedin_url,
+                job_id, user_email,
+                json.dumps(meta) if meta else None,
+                now,
             )
-            await db.commit()
     except Exception as e:
         logger.debug("[AuditLog] write failed: %s", e)
 
@@ -978,22 +922,19 @@ async def list_audit_log(
     offset: int = 0,
 ) -> dict:
     """List audit log entries for an org."""
-    clauses = ["org_id=?"]
     params: list = [org_id]
+    clauses = ["org_id=$1"]
     if action:
-        clauses.append("action=?"); params.append(action)
+        params.append(action); clauses.append(f"action=${len(params)}")
     where = "WHERE " + " AND ".join(clauses)
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            f"SELECT COUNT(*) FROM enrichment_audit_log {where}", params
-        ) as cur:
-            total = (await cur.fetchone())[0]
-        async with db.execute(
-            f"SELECT * FROM enrichment_audit_log {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
-            [*params, limit, offset],
-        ) as cur:
-            rows = [dict(r) for r in await cur.fetchall()]
+    params_page = params + [limit, offset]
+    async with get_pool().acquire() as conn:
+        total = await conn.fetchval(f"SELECT COUNT(*) FROM enrichment_audit_log {where}", *params)
+        rows = await conn.fetch(
+            f"SELECT * FROM enrichment_audit_log {where} ORDER BY created_at DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}",
+            *params_page,
+        )
+    rows = [dict(r) for r in rows]
     # Parse meta JSON
     for row in rows:
         if row.get("meta"):
@@ -1011,37 +952,33 @@ async def list_audit_log(
 async def add_lead_note(lead_id: str, org_id: str, note: str) -> dict:
     """Add a text note to a lead. Returns the created note row."""
     note_id = str(uuid.uuid4())
-    async with aiosqlite.connect(LEADS_DB) as db:
-        await db.execute(
-            "INSERT INTO lead_notes(id, lead_id, org_id, note) VALUES(?,?,?,?)",
-            (note_id, lead_id, org_id, note.strip()),
+    now = datetime.now(timezone.utc).isoformat()
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            "INSERT INTO lead_notes(id, lead_id, org_id, note, created_at) VALUES($1,$2,$3,$4,$5)",
+            note_id, lead_id, org_id, note.strip(), now,
         )
-        await db.commit()
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM lead_notes WHERE id=?", (note_id,)) as cur:
-            return dict(await cur.fetchone())
+        row = await conn.fetchrow("SELECT * FROM lead_notes WHERE id=$1", note_id)
+        return dict(row)
 
 
 async def list_lead_notes(lead_id: str, org_id: str) -> list[dict]:
     """Return all notes for a lead, newest first."""
-    async with aiosqlite.connect(LEADS_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM lead_notes WHERE lead_id=? AND org_id=? ORDER BY created_at DESC",
-            (lead_id, org_id),
-        ) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM lead_notes WHERE lead_id=$1 AND org_id=$2 ORDER BY created_at DESC",
+            lead_id, org_id,
+        )
+        return [dict(r) for r in rows]
 
 
 async def delete_lead_note(note_id: str, org_id: str) -> bool:
     """Delete a note by id (org-scoped for safety)."""
-    async with aiosqlite.connect(LEADS_DB) as db:
-        async with db.execute(
-            "DELETE FROM lead_notes WHERE id=? AND org_id=?", (note_id, org_id)
-        ) as cur:
-            deleted = cur.rowcount > 0
-        await db.commit()
-    return deleted
+    async with get_pool().acquire() as conn:
+        status = await conn.execute(
+            "DELETE FROM lead_notes WHERE id=$1 AND org_id=$2", note_id, org_id
+        )
+    return status != "DELETE 0"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3940,6 +3877,7 @@ async def enrich_company_url(
     linkedin_url: str,
     job_id: Optional[str] = None,
     org_id: str = "default",
+    forward_to_lio: bool = False,
 ) -> dict:
     """
     Enrich a LinkedIn Company URL directly.
@@ -4223,6 +4161,8 @@ async def enrich_company_url(
         "✓ Company enriched: %s | score=%d (%s) | email=%s | website=%s",
         final_name, total_score, score_tier, company_email or "—", website or "—",
     )
+    if not forward_to_lio:
+        asyncio.create_task(send_to_lio(lead))
     return lead
 
 
@@ -4238,6 +4178,7 @@ async def enrich_single(
     generate_outreach_flag: bool = True,
     tools: Optional[dict] = None,
     sso_id: str = "",
+    forward_to_lio: bool = False,
 ) -> dict:
     """
     Sequential 8-stage enrichment waterfall:
@@ -4266,7 +4207,7 @@ async def enrich_single(
     # ── Route: company URL → dedicated company pipeline ───────────────────────
     if _is_company_url(url):
         logger.info("[Enrich] Company URL detected — routing to company pipeline: %s", url)
-        return await enrich_company_url(url, job_id=job_id, org_id=org_id)
+        return await enrich_company_url(url, job_id=job_id, org_id=org_id, forward_to_lio=forward_to_lio)
 
     # ── Cache check: return existing enrichment if already in DB ─────────────
     cached = await get_lead(lead_id)
@@ -4274,7 +4215,8 @@ async def enrich_single(
         logger.info("[Enrich] Cache HIT for %s (lead_id=%s) — skipping Bright Data", url, lead_id)
         cached["_cache_hit"] = True
         cached["linkedin_enrich"] = _format_linkedin_enrich(cached)
-        asyncio.create_task(send_to_lio(cached, sso_id=sso_id))
+        if not forward_to_lio:
+            asyncio.create_task(send_to_lio(cached, sso_id=sso_id))
         return cached
 
     logger.info("[Enrich] Cache MISS for %s — fetching from Bright Data", url)
@@ -4747,7 +4689,8 @@ async def enrich_single(
     lead["linkedin_enrich"] = _format_linkedin_enrich(lead)
 
     # Forward to LIO — fire-and-forget, does not block return
-    asyncio.create_task(send_to_lio(lead, sso_id=sso_id))
+    if not forward_to_lio:
+        asyncio.create_task(send_to_lio(lead, sso_id=sso_id))
 
     return lead
 
@@ -4787,7 +4730,7 @@ async def enrich_single_stream(
         yield {"stage": "website",  "status": "loading"}
         yield {"stage": "scoring",  "status": "loading"}
         try:
-            lead = await enrich_company_url(url, org_id=org_id)
+            lead = await enrich_company_url(url, org_id=org_id, forward_to_lio=True)
             yield {"stage": "profile",  "status": "done", "data": {
                 "name": lead.get("name", ""), "title": lead.get("title", ""),
                 "company": lead.get("company", ""), "location": lead.get("location", ""),
@@ -5167,6 +5110,7 @@ async def enrich_bulk(
     webhook_auth: Optional[str] = None,
     org_id: str = "default",
     sso_id: str = "",
+    forward_to_lio: bool = False,
 ) -> dict:
     """
     Bulk enrichment pipeline — multi-tenant aware.
@@ -5200,14 +5144,14 @@ async def enrich_bulk(
         "organization_id": org_id,
         "created_at": now, "updated_at": now,
     }
-    async with aiosqlite.connect(LEADS_DB) as db:
-        await db.execute(
-            """INSERT INTO enrichment_jobs
-               (id,snapshot_id,total_urls,processed,failed,status,error,webhook_url,organization_id,created_at,updated_at)
-               VALUES (:id,:snapshot_id,:total_urls,:processed,:failed,:status,:error,:webhook_url,:organization_id,:created_at,:updated_at)""",
-            job,
-        )
-        await db.commit()
+    sql, args = named_args(
+        """INSERT INTO enrichment_jobs
+           (id,snapshot_id,total_urls,processed,failed,status,error,webhook_url,organization_id,created_at,updated_at)
+           VALUES (:id,:snapshot_id,:total_urls,:processed,:failed,:status,:error,:webhook_url,:organization_id,:created_at,:updated_at)""",
+        job,
+    )
+    async with get_pool().acquire() as conn:
+        await conn.execute(sql, *args)
 
     if not webhook_url:
         # Fair multi-tenant queue (per-tenant queues + round-robin scheduler)
@@ -5228,6 +5172,7 @@ async def enrich_bulk(
                     r=r,
                     generate_outreach=True,
                     sso_id=sso_id,
+                    forward_to_lio=forward_to_lio,
                 )
                 await _update_job(job_id, status="running")
                 job["status"] = "running"
@@ -5249,7 +5194,7 @@ async def enrich_bulk(
             "[BulkEnrich] Starting in-process batch for %d URLs → %d chunks (org=%s)",
             len(urls), len(url_chunks), org_id,
         )
-        asyncio.create_task(_process_sequential_batch(job_id, url_chunks, sub_job_ids, org_id=org_id, sso_id=sso_id))
+        asyncio.create_task(_process_sequential_batch(job_id, url_chunks, sub_job_ids, org_id=org_id, sso_id=sso_id, forward_to_lio=forward_to_lio))
 
     return job
 
@@ -5260,6 +5205,7 @@ async def _process_sequential_batch(
     sub_job_ids: list[str],
     org_id: str = "default",
     sso_id: str = "",
+    forward_to_lio: bool = False,
 ) -> None:
     """
     In-process sequential bulk enrichment — fallback when Redis is unavailable.
@@ -5278,7 +5224,7 @@ async def _process_sequential_batch(
         chunk_ok = chunk_fail = 0
         for i, url in enumerate(chunk):
             try:
-                lead = await enrich_single(url, job_id=job_id, org_id=org_id, sso_id=sso_id)
+                lead = await enrich_single(url, job_id=job_id, org_id=org_id, sso_id=sso_id, forward_to_lio=forward_to_lio)
                 chunk_ok += 1
                 logger.info(
                     "[BulkBatch] Chunk %d/%d · URL %d/%d OK: %s",
@@ -5543,14 +5489,11 @@ async def regenerate_outreach_for_lead(lead_id: str) -> Optional[dict]:
     cold_email    = generated["cold_email"]["full_email"] or generated["cold_email"]["body"]
     linkedin_note = generated["linkedin_note"]
 
-    async with aiosqlite.connect(LEADS_DB) as db:
-        await db.execute(
-            """UPDATE enriched_leads SET
-               email_subject=?, cold_email=?, linkedin_note=?
-               WHERE id=?""",
-            (email_subject, cold_email, linkedin_note, lead_id),
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            "UPDATE enriched_leads SET email_subject=$1, cold_email=$2, linkedin_note=$3 WHERE id=$4",
+            email_subject, cold_email, linkedin_note, lead_id,
         )
-        await db.commit()
     return await get_lead(lead_id)
 
 
@@ -5611,13 +5554,10 @@ async def regenerate_company_for_lead(lead_id: str) -> Optional[dict]:
         })
 
     # Update lead row
-    async with aiosqlite.connect(LEADS_DB) as db:
-        await db.execute(
-            """UPDATE enriched_leads SET
-               company_tags=?, culture_signals=?, account_pitch=?
-               WHERE id=?""",
-            (tags_json, culture_json, pitch_json, lead_id),
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            "UPDATE enriched_leads SET company_tags=$1, culture_signals=$2, account_pitch=$3 WHERE id=$4",
+            tags_json, culture_json, pitch_json, lead_id,
         )
-        await db.commit()
 
     return await get_lead(lead_id)
