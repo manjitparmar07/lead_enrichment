@@ -48,6 +48,8 @@ from workspace_service import init_workspace_db
 from enrichment_config_service import init_config_db
 from company_service import init_company_db
 from system_prompt_service import init_system_prompts_db
+from serpapi_routes import router as serpapi_router
+from serpapi_service import init_serpapi_db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -102,6 +104,7 @@ app.include_router(spg_router,               prefix="/api", include_in_schema=Fa
 app.include_router(import_router)
 app.include_router(storage_router)
 app.include_router(email_enrichment_router,   prefix="/api")
+app.include_router(serpapi_router,            prefix="/api")
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 # Production requests go through nginx which owns CORS headers.
@@ -135,6 +138,7 @@ async def startup():
     await init_config_db()
     await init_company_db()
     await init_system_prompts_db()
+    await init_serpapi_db()
     await worker.start_workers()
     await _import_worker.start_import_workers()
     logger.info("Lead Enrichment API started — http://0.0.0.0:%s", os.getenv("PORT", "8020"))

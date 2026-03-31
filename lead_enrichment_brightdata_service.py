@@ -602,6 +602,8 @@ async def init_leads_db() -> None:
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sub_jobs_job ON enrichment_sub_jobs(job_id)"
         )
+        # Add snapshot_id to sub_jobs (chunked BD approach — each chunk has its own snapshot)
+        await conn.execute("ALTER TABLE enrichment_sub_jobs ADD COLUMN IF NOT EXISTS snapshot_id TEXT")
         # Add columns to existing tables (idempotent via IF NOT EXISTS)
         _NEW_COLS = [
             ("work_email", "TEXT"), ("personal_email", "TEXT"),
@@ -755,16 +757,17 @@ async def _update_job(job_id: str, **kwargs) -> None:
 
 
 async def _create_sub_job(
-    sub_job_id: str, job_id: str, chunk_index: int, total_urls: int, org_id: str
+    sub_job_id: str, job_id: str, chunk_index: int, total_urls: int, org_id: str,
+    snapshot_id: Optional[str] = None,
 ) -> None:
     now = datetime.now(timezone.utc)
     async with get_pool().acquire() as conn:
         await conn.execute(
             """INSERT INTO enrichment_sub_jobs
-               (id, job_id, chunk_index, total_urls, processed, failed, status, organization_id, created_at, updated_at)
-               VALUES ($1,$2,$3,$4,0,0,'pending',$5,$6,$7)
+               (id, job_id, chunk_index, total_urls, processed, failed, status, organization_id, snapshot_id, created_at, updated_at)
+               VALUES ($1,$2,$3,$4,0,0,'pending',$5,$6,$7,$8)
                ON CONFLICT(id) DO NOTHING""",
-            sub_job_id, job_id, chunk_index, total_urls, org_id, now, now,
+            sub_job_id, job_id, chunk_index, total_urls, org_id, snapshot_id, now, now,
         )
 
 
@@ -5475,6 +5478,42 @@ async def enrich_single_stream(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+async def _poll_and_process_snapshot(
+    snapshot_id: str, job_id: str, org_id: str, sub_job_id: Optional[str] = None
+) -> None:
+    """Poll BrightData for snapshot results and process them (used when no webhook URL is set)."""
+    try:
+        logger.info("[BulkPoll] Polling snapshot %s for job %s (sub_job=%s)", snapshot_id, job_id, sub_job_id or "—")
+        profiles = await poll_snapshot(snapshot_id, interval=15, timeout=1800)
+        logger.info("[BulkPoll] Snapshot %s ready — %d profiles, processing…", snapshot_id, len(profiles))
+        result = await process_webhook_profiles(profiles, job_id=job_id, sub_job_id=sub_job_id)
+        logger.info("[BulkPoll] Done: processed=%d failed=%d", result["processed"], result["failed"])
+    except Exception as e:
+        logger.error("[BulkPoll] snapshot %s failed: %s", snapshot_id, e)
+        if sub_job_id:
+            await _update_sub_job(sub_job_id, status="failed")
+        await _update_job(job_id, status="failed", error=str(e))
+
+
+def _bd_chunk_size(total: int) -> int:
+    """
+    Chunk size for BrightData batch API calls.
+    Keeps each BD snapshot small enough for fast delivery and granular progress.
+
+      total ≤ 20   → all at once  (no benefit splitting tiny batches)
+      total ≤ 100  → 25/chunk     (≤4 parallel snapshots)
+      total ≤ 300  → 50/chunk     (≤6 parallel snapshots)
+      total > 300  → 100/chunk    (capped — avoid BD concurrency limits)
+    """
+    if total <= 20:
+        return total
+    if total <= 100:
+        return 25
+    if total <= 300:
+        return 50
+    return 100
+
+
 def _dynamic_chunk_size(total: int) -> int:
     """
     Dynamic chunk sizing based on batch size.
@@ -5512,24 +5551,50 @@ async def enrich_bulk(
     status = "pending"
     error_msg = None
 
-    # Auto-build webhook URL from APP_URL if caller did not supply one
-    if not webhook_url:
-        app_url = os.getenv("APP_URL", "").rstrip("/")
-        if app_url:
-            webhook_url = f"{app_url}/api/leads/webhook/brightdata?job_id={job_id}"
-            notify_url  = notify_url or f"{app_url}/api/leads/webhook/notify?job_id={job_id}"
-            logger.info("[BulkEnrich] Auto-webhook: %s", webhook_url)
+    # Base app URL — used to build per-chunk webhook URLs
+    app_url = os.getenv("APP_URL", "").rstrip("/")
 
-    # Trigger BrightData batch when API key + webhook URL are both available
-    if _bd_api_key() and webhook_url:
+    # Trigger BrightData batch in parallel chunks when API key is available
+    if _bd_api_key():
         try:
-            snapshot_id = await trigger_batch_snapshot(urls, webhook_url, notify_url, webhook_auth)
+            chunk_size  = _bd_chunk_size(len(urls))
+            url_chunks  = [urls[i: i + chunk_size] for i in range(0, len(urls), chunk_size)]
+            sub_job_ids = [str(uuid.uuid4()) for _ in url_chunks]
+
+            async def _trigger_bd_chunk(idx: int, sjid: str, chunk: list) -> str:
+                if app_url:
+                    chunk_webhook = f"{app_url}/api/leads/webhook/brightdata?job_id={job_id}&sub_job_id={sjid}"
+                    chunk_notify  = f"{app_url}/api/leads/webhook/notify?job_id={job_id}&sub_job_id={sjid}"
+                elif webhook_url:
+                    sep = "&" if "?" in webhook_url else "?"
+                    chunk_webhook = f"{webhook_url}{sep}sub_job_id={sjid}"
+                    chunk_notify  = notify_url
+                else:
+                    chunk_webhook = None
+                    chunk_notify  = None
+                snap_id = await trigger_batch_snapshot(chunk, chunk_webhook, chunk_notify, webhook_auth)
+                await _create_sub_job(sjid, job_id, idx, len(chunk), org_id, snapshot_id=snap_id)
+                if not chunk_webhook:
+                    asyncio.create_task(_poll_and_process_snapshot(snap_id, job_id, org_id, sub_job_id=sjid))
+                logger.info(
+                    "[BulkEnrich] Chunk %d/%d (%d URLs) → snapshot %s (webhook=%s)",
+                    idx + 1, len(url_chunks), len(chunk), snap_id, chunk_webhook or "polling",
+                )
+                return snap_id
+
+            snap_ids    = await asyncio.gather(*[_trigger_bd_chunk(i, sjid, chunk) for i, (sjid, chunk) in enumerate(zip(sub_job_ids, url_chunks))])
+            snapshot_id = snap_ids[0] if snap_ids else None  # store first on parent job for compat
+            # Set webhook_url on parent job row so stop/rerun routes can find it
+            if not webhook_url and app_url:
+                webhook_url = f"{app_url}/api/leads/webhook/brightdata?job_id={job_id}"
             status = "running"
-            logger.info("[BulkEnrich] BD batch triggered: %s (webhook=%s)", snapshot_id, webhook_url)
+            logger.info(
+                "[BulkEnrich] %d URLs → %d BD chunks triggered for job %s (org=%s)",
+                len(urls), len(url_chunks), job_id, org_id,
+            )
         except Exception as e:
-            logger.error("[BulkEnrich] BD trigger failed: %s — falling back to queue", e)
+            logger.error("[BulkEnrich] BD chunk trigger failed: %s — falling back to queue", e)
             error_msg = str(e)
-            webhook_url = None  # fall through to Redis queue path
 
     job = {
         "id": job_id, "snapshot_id": snapshot_id,
@@ -5679,209 +5744,367 @@ async def _process_fallback_batch(job_id: str, urls: list[str]) -> None:
     await _process_sequential_batch(job_id, url_chunks, sub_job_ids)
 
 
-async def process_webhook_profiles(profiles: list[dict], job_id: Optional[str] = None) -> dict:
-    processed = failed = 0
-    for profile in profiles:
-        # Prefer input_url (canonical) → url (BD's returned URL) → linkedin_url
-        # Apply _clean_bd_linkedin_url to handle country domains, mixed case,
-        # and tracking params that BD may embed in any of these fields.
-        raw_url = profile.get("input_url") or profile.get("url") or profile.get("linkedin_url")
-        if not raw_url:
-            failed += 1
-            continue
+async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org_id: str) -> Optional[dict]:
+    """
+    Process a single BrightData profile through the full enrichment pipeline.
+    Returns the enriched lead dict on success, None on failure.
+    Designed to be called concurrently via asyncio.gather.
+    """
+    raw_url = profile.get("input_url") or profile.get("url") or profile.get("linkedin_url")
+    if not raw_url:
+        return None
+    try:
+        url = _normalize_linkedin_url(_clean_bd_linkedin_url(raw_url))
+        name = profile.get("name", "")
+        first, last = _parse_name(name)
+        company = profile.get("current_company_name", "")
+        raw_link = profile.get("current_company_link", "")
+        domain = _extract_domain(company, raw_link)
+        lead_id = _lead_id(url)
+
+        # ── Stage 1: SCRAPING — BrightData profile received, save basic data ──
+        await _upsert_lead({
+            "id": lead_id,
+            "linkedin_url": url,
+            "name": name,
+            "first_name": first,
+            "last_name": last,
+            "title": profile.get("position", ""),
+            "company": company,
+            "avatar_url": _extract_avatar(profile),
+            "raw_profile": json.dumps(profile, default=str),
+            "about": (profile.get("about") or "")[:1000],
+            "followers": _safe_int(profile.get("followers")),
+            "connections": _safe_int(profile.get("connections")),
+            "status": "scraping",
+            "job_id": job_id,
+            "enriched_at": datetime.now(timezone.utc).isoformat(),
+        })
+        logger.info("[Pipeline] %s → scraping", url)
+
+        # Parallel: company waterfall + contact + website all at once
+        company_extras, company_wf_log = await enrich_company_waterfall(company, domain, profile)
+        verified_domain = company_extras.pop("_verified_domain", domain) or domain
+        real_website = company_extras.get("company_website") or (f"https://{verified_domain}" if verified_domain else "")
+
+        contact, website_intel = await asyncio.gather(
+            find_contact_info(first, last, verified_domain, linkedin_url=url),
+            scrape_website_intelligence(real_website),
+            return_exceptions=True,
+        )
+        if isinstance(contact, Exception):
+            contact = {}
+        if isinstance(website_intel, Exception):
+            website_intel = {}
+
+        profile["_company_extras"] = company_extras
+
+        if website_intel and website_intel.get("pages_scraped"):
+            company_wf_log.append({
+                "step": 5, "source": "Website Scrape",
+                "fields_found": website_intel.get("pages_scraped", []),
+                "note": f"pages={len(website_intel.get('pages_scraped', []))}, category={website_intel.get('product_category', '?')}",
+            })
+
+        # ── Stage 2: ENRICHING — about to call LLM ────────────────────────────
+        async with get_pool().acquire() as _conn:
+            await _conn.execute(
+                "UPDATE enriched_leads SET status='enriching', updated_at=NOW() WHERE id=$1",
+                lead_id,
+            )
+        logger.info("[Pipeline] %s → enriching", url)
+
+        enrichment = await build_comprehensive_enrichment(url, profile, contact, website_intel=website_intel, org_id=org_id)
+
+        scoring = enrichment.get("lead_scoring", enrichment.get("scoring", {}))
+        tier_raw = scoring.get("icp_match_tier") or scoring.get("score_tier", "")
+        score_tier = _resolve_tier(tier_raw)
+        now = datetime.now(timezone.utc).isoformat()
+
+        pp = enrichment.get("person_profile", {})
+        ident = enrichment.get("identity", {})
+        prof_legacy = enrichment.get("professional", {})
+        comp_legacy = enrichment.get("company", {})
+        ci = enrichment.get("company_identity", {})
+        cp = enrichment.get("company_profile", {})
+        cin = enrichment.get("company_intelligence", {})
+        intent_s = enrichment.get("intent_signals", {})
+        outreach = enrichment.get("outreach", {})
+        crm = enrichment.get("crm", {})
+        ls = enrichment.get("lead_scoring", scoring)
+        wi = enrichment.get("website_intelligence", website_intel or {})
+
+        # Build waterfall log
+        waterfall_log = [
+            {"step": 0, "source": "Bright Data", "fields_found": ["profile"], "note": f"LinkedIn scrape: {url}"},
+            *company_wf_log,
+            {
+                "step": 10,
+                "source": contact.get("source") or "none",
+                "fields_found": ["email"],
+                "note": f"email={contact.get('email')}",
+            },
+        ]
+
+        lead = {
+            "id": _lead_id(url),
+            "linkedin_url": url,
+            "name": pp.get("full_name") or ident.get("full_name") or name,
+            "first_name": first, "last_name": last,
+            "work_email": pp.get("work_email") or ident.get("work_email") or contact.get("email"),
+            "personal_email": pp.get("personal_email") or ident.get("personal_email"),
+            "direct_phone": pp.get("direct_phone") or ident.get("direct_phone") or contact.get("phone"),
+            "twitter": pp.get("twitter") or ident.get("twitter") or contact.get("twitter"),
+            "city": pp.get("city") or ident.get("city"),
+            "country": pp.get("country") or ident.get("country"),
+            "timezone": pp.get("timezone") or ident.get("timezone"),
+            "title": pp.get("current_title") or prof_legacy.get("current_title") or profile.get("position", ""),
+            "seniority_level": pp.get("seniority_level") or prof_legacy.get("seniority_level"),
+            "department": pp.get("department") or prof_legacy.get("department"),
+            "years_in_role": pp.get("years_in_role") or prof_legacy.get("years_in_role"),
+            "company": ci.get("name") or comp_legacy.get("name") or profile.get("current_company_name", ""),
+            "previous_companies": _safe_json(prof_legacy.get("previous_companies")),
+            "top_skills": _safe_json(pp.get("top_skills") or prof_legacy.get("top_skills")),
+            "education": pp.get("education") or prof_legacy.get("education"),
+            "certifications": _safe_json(pp.get("certifications") or prof_legacy.get("certifications")),
+            "languages": _safe_json(pp.get("languages") or prof_legacy.get("languages")),
+            "company_website": cp.get("website") or ci.get("website") or comp_legacy.get("website"),
+            "industry": cp.get("industry") or comp_legacy.get("industry"),
+            "employee_count": _safe_int(cp.get("employee_count") or comp_legacy.get("employee_count")),
+            "hq_location": cp.get("hq_location") or comp_legacy.get("hq_location"),
+            "founded_year": str(cp.get("founded_year") or comp_legacy.get("founded_year") or ""),
+            "funding_stage": cin.get("funding_stage") or comp_legacy.get("funding_stage"),
+            "total_funding": cin.get("total_funding") or comp_legacy.get("total_funding"),
+            "last_funding_date": cin.get("last_funding_date") or comp_legacy.get("last_funding_date"),
+            "lead_investor": cin.get("lead_investor") or comp_legacy.get("lead_investor"),
+            "annual_revenue": cp.get("annual_revenue_est") or comp_legacy.get("annual_revenue_est"),
+            "tech_stack": _safe_json(cp.get("tech_stack") or comp_legacy.get("tech_stack")),
+            "hiring_velocity": cin.get("hiring_velocity") or comp_legacy.get("hiring_velocity"),
+            "avatar_url": _extract_avatar(profile) or contact.get("avatar_url"),
+            "company_logo": cp.get("company_logo") or company_extras.get("company_logo"),
+            "company_email": cp.get("company_email") or company_extras.get("company_email"),
+            "company_description": wi.get("company_description") or company_extras.get("company_description"),
+            "company_linkedin": ci.get("linkedin_url") or company_extras.get("company_linkedin"),
+            "company_twitter": cp.get("company_twitter") or company_extras.get("company_twitter"),
+            "company_phone": cp.get("company_phone") or company_extras.get("company_phone"),
+            "waterfall_log": json.dumps(waterfall_log),
+            # Stage 3 — Website Intelligence
+            "website_intelligence": json.dumps(website_intel or {}),
+            "product_offerings": _safe_json(wi.get("product_offerings")),
+            "value_proposition": wi.get("value_proposition"),
+            "target_customers": _safe_json(wi.get("target_customers")),
+            "business_model": wi.get("business_model"),
+            "pricing_signals": wi.get("pricing_signals"),
+            "product_category": wi.get("product_category"),
+            "data_completeness_score": int(ls.get("data_completeness_score", 0)),
+            # Intent signals
+            "recent_funding_event": intent_s.get("recent_funding_event"),
+            "hiring_signal": intent_s.get("hiring_signal"),
+            "job_change": intent_s.get("job_change"),
+            "linkedin_activity": intent_s.get("linkedin_activity"),
+            "news_mention": intent_s.get("news_mention"),
+            "product_launch": intent_s.get("product_launch"),
+            "competitor_usage": intent_s.get("competitor_usage"),
+            "review_activity": intent_s.get("review_activity"),
+            # Scoring
+            "icp_fit_score": _safe_int(ls.get("icp_fit_score")),
+            "intent_score": _safe_int(ls.get("intent_score")),
+            "timing_score": _safe_int(ls.get("timing_score")),
+            "engagement_score": 0,
+            "total_score": _safe_int(ls.get("overall_score")),
+            "score_tier": score_tier,
+            "score_explanation": ls.get("score_explanation"),
+            "icp_match_tier": ls.get("icp_match_tier") or tier_raw,
+            "disqualification_flags": _safe_json(ls.get("disqualification_flags")),
+            "email_subject": outreach.get("email_subject"),
+            "cold_email": outreach.get("cold_email"),
+            "linkedin_note": outreach.get("linkedin_note"),
+            "best_channel": outreach.get("best_channel"),
+            "best_send_time": outreach.get("best_send_time"),
+            "outreach_angle": outreach.get("outreach_angle"),
+            "sequence_type": outreach.get("sequence_type"),
+            "outreach_sequence": _safe_json(outreach.get("sequence")),
+            "last_contacted": outreach.get("last_contacted"),
+            "email_status": outreach.get("email_status"),
+            "lead_source": crm.get("lead_source", "LinkedIn URL"),
+            "enrichment_source": crm.get("enrichment_source"),
+            "data_completeness": _safe_int(crm.get("data_completeness")),
+            "crm_stage": crm.get("crm_stage"),
+            "tags": _safe_json(crm.get("tags")),
+            "assigned_owner": crm.get("assigned_owner"),
+            "full_data": json.dumps({
+                "person_profile": enrichment.get("person_profile", {}),
+                "company_identity": enrichment.get("company_identity", {}),
+                "website_intelligence": enrichment.get("website_intelligence", website_intel or {}),
+                "company_profile": enrichment.get("company_profile", {}),
+                "company_intelligence": enrichment.get("company_intelligence", {}),
+                "intent_signals": enrichment.get("intent_signals", {}),
+                "lead_scoring": enrichment.get("lead_scoring", {}),
+                "outreach": enrichment.get("outreach", {}),
+                # Legacy compatibility
+                "identity": enrichment.get("identity", {}),
+                "professional": enrichment.get("professional", {}),
+                "company": enrichment.get("company", {}),
+                "scoring": enrichment.get("scoring", {}),
+                # Profile-level data for UI
+                "recommendations": profile.get("recommendations") or [],
+                "recommendations_count": profile.get("recommendations_count") or 0,
+                "similar_profiles": profile.get("_similar_profiles") or [],
+                "banner_image": profile.get("banner_image") or "",
+                "linkedin_num_id": profile.get("linkedin_num_id") or "",
+                "activity_emails": profile.get("_activity_emails") or [],
+                "activity_phones": profile.get("_activity_phones") or [],
+                "activity_full": profile.get("_activity_full") or [],
+                "linkedin_posts": profile.get("_posts") or [],
+                "hiring_signals": profile.get("_hiring_signals") or [],
+            }, default=str),
+            "raw_profile": json.dumps(profile, default=str),
+            "about": (profile.get("about") or "")[:1000],
+            "followers": _safe_int(profile.get("followers")),
+            "connections": _safe_int(profile.get("connections")),
+            "email_source": contact.get("source") if isinstance(contact, dict) else None,
+            "email_confidence": contact.get("confidence") if isinstance(contact, dict) else None,
+            # ── Stage 3: COMPLETED — LLM done, full data saved ───────────────
+            "status": "completed",
+            "job_id": job_id,
+            "enriched_at": now,
+        }
+        await _upsert_lead(lead)
+        logger.info("[Pipeline] %s → completed", url)
+        return lead
+    except Exception as e:
+        logger.warning("[Webhook] %s: %s", raw_url, e)
+        # Mark lead as failed if it was already saved in scraping/enriching stage
         try:
-            url = _normalize_linkedin_url(_clean_bd_linkedin_url(raw_url))
-            name = profile.get("name", "")
-            first, last = _parse_name(name)
-            company = profile.get("current_company_name", "")
-            raw_link = profile.get("current_company_link", "")
-            domain = _extract_domain(company, raw_link)
+            lead_id = _lead_id(_normalize_linkedin_url(_clean_bd_linkedin_url(raw_url)))
+            async with get_pool().acquire() as _conn:
+                await _conn.execute(
+                    "UPDATE enriched_leads SET status='failed', updated_at=NOW() WHERE id=$1 AND status IN ('scraping','enriching')",
+                    lead_id,
+                )
+        except Exception:
+            pass
+        return None
 
-            # Sequential waterfall: company first → verified domain → person contact → website
-            company_extras, company_wf_log = await enrich_company_waterfall(company, domain, profile)
-            verified_domain = company_extras.pop("_verified_domain", domain) or domain
-            real_website = company_extras.get("company_website") or (f"https://{verified_domain}" if verified_domain else "")
-            contact = await find_contact_info(first, last, verified_domain, linkedin_url=url)
-            website_intel = await scrape_website_intelligence(real_website)
 
-            # Inject company extras into profile so LLM prompt can use them
-            profile["_company_extras"] = company_extras
+async def rerun_brightdata_snapshot(snapshot_id: str) -> str:
+    """Rerun a BrightData snapshot and return the new snapshot_id."""
+    if not _bd_api_key():
+        raise ValueError("BRIGHT_DATA_API_KEY not configured")
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{BD_BASE}/snapshot/{snapshot_id}/rerun",
+            headers=_bd_headers(),
+        )
+        resp.raise_for_status()
+    new_snapshot_id = resp.json().get("snapshot_id") or resp.json().get("id")
+    if not new_snapshot_id:
+        raise ValueError(f"No snapshot_id in rerun response: {resp.text[:200]}")
+    logger.info("[Rerun] BD snapshot %s rerun → new snapshot_id=%s", snapshot_id, new_snapshot_id)
+    return new_snapshot_id
 
-            # Add website scraping step to waterfall log
-            if website_intel and website_intel.get("pages_scraped"):
-                company_wf_log.append({
-                    "step": 5, "source": "Website Scrape",
-                    "fields_found": website_intel.get("pages_scraped", []),
-                    "note": f"pages={len(website_intel.get('pages_scraped', []))}, category={website_intel.get('product_category', '?')}",
-                })
 
-            enrichment = await build_comprehensive_enrichment(url, profile, contact, website_intel=website_intel, org_id=org_id)
+async def cancel_brightdata_snapshot(snapshot_id: str) -> None:
+    """Cancel an in-progress BrightData snapshot via the cancel API."""
+    if not _bd_api_key():
+        return
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{BD_BASE}/snapshot/{snapshot_id}/cancel",
+                headers=_bd_headers(),
+            )
+            logger.info("[Cancel] BD snapshot %s cancel response: %s", snapshot_id, resp.status_code)
+    except Exception as e:
+        logger.warning("[Cancel] BD snapshot %s cancel failed: %s", snapshot_id, e)
 
-            scoring = enrichment.get("lead_scoring", enrichment.get("scoring", {}))
-            tier_raw = scoring.get("icp_match_tier") or scoring.get("score_tier", "")
-            score_tier = _resolve_tier(tier_raw)
-            now = datetime.now(timezone.utc).isoformat()
 
-            pp = enrichment.get("person_profile", {})
-            ident = enrichment.get("identity", {})
-            prof_legacy = enrichment.get("professional", {})
-            comp_legacy = enrichment.get("company", {})
-            ci = enrichment.get("company_identity", {})
-            cp = enrichment.get("company_profile", {})
-            cin = enrichment.get("company_intelligence", {})
-            intent_s = enrichment.get("intent_signals", {})
-            outreach = enrichment.get("outreach", {})
-            crm = enrichment.get("crm", {})
-            ls = enrichment.get("lead_scoring", scoring)
-            wi = enrichment.get("website_intelligence", website_intel or {})
-
-            # Build waterfall log
-            waterfall_log = [
-                {"step": 0, "source": "Bright Data", "fields_found": ["profile"], "note": f"LinkedIn scrape: {url}"},
-                *company_wf_log,
-                {
-                    "step": 10,
-                    "source": contact.get("source") or "none",
-                    "fields_found": ["email"],
-                    "note": f"email={contact.get('email')}",
-                },
-            ]
-
-            lead = {
-                "id": _lead_id(url),
-                "linkedin_url": url,
-                "name": pp.get("full_name") or ident.get("full_name") or name,
-                "first_name": first, "last_name": last,
-                "work_email": pp.get("work_email") or ident.get("work_email") or contact.get("email"),
-                "personal_email": pp.get("personal_email") or ident.get("personal_email"),
-                "direct_phone": pp.get("direct_phone") or ident.get("direct_phone") or contact.get("phone"),
-                "twitter": pp.get("twitter") or ident.get("twitter") or contact.get("twitter"),
-                "city": pp.get("city") or ident.get("city"),
-                "country": pp.get("country") or ident.get("country"),
-                "timezone": pp.get("timezone") or ident.get("timezone"),
-                "title": pp.get("current_title") or prof_legacy.get("current_title") or profile.get("position", ""),
-                "seniority_level": pp.get("seniority_level") or prof_legacy.get("seniority_level"),
-                "department": pp.get("department") or prof_legacy.get("department"),
-                "years_in_role": pp.get("years_in_role") or prof_legacy.get("years_in_role"),
-                "company": ci.get("name") or comp_legacy.get("name") or profile.get("current_company_name", ""),
-                "previous_companies": _safe_json(prof_legacy.get("previous_companies")),
-                "top_skills": _safe_json(pp.get("top_skills") or prof_legacy.get("top_skills")),
-                "education": pp.get("education") or prof_legacy.get("education"),
-                "certifications": _safe_json(pp.get("certifications") or prof_legacy.get("certifications")),
-                "languages": _safe_json(pp.get("languages") or prof_legacy.get("languages")),
-                "company_website": cp.get("website") or ci.get("website") or comp_legacy.get("website"),
-                "industry": cp.get("industry") or comp_legacy.get("industry"),
-                "employee_count": _safe_int(cp.get("employee_count") or comp_legacy.get("employee_count")),
-                "hq_location": cp.get("hq_location") or comp_legacy.get("hq_location"),
-                "founded_year": str(cp.get("founded_year") or comp_legacy.get("founded_year") or ""),
-                "funding_stage": cin.get("funding_stage") or comp_legacy.get("funding_stage"),
-                "total_funding": cin.get("total_funding") or comp_legacy.get("total_funding"),
-                "last_funding_date": cin.get("last_funding_date") or comp_legacy.get("last_funding_date"),
-                "lead_investor": cin.get("lead_investor") or comp_legacy.get("lead_investor"),
-                "annual_revenue": cp.get("annual_revenue_est") or comp_legacy.get("annual_revenue_est"),
-                "tech_stack": _safe_json(cp.get("tech_stack") or comp_legacy.get("tech_stack")),
-                "hiring_velocity": cin.get("hiring_velocity") or comp_legacy.get("hiring_velocity"),
-                "avatar_url": _extract_avatar(profile) or contact.get("avatar_url"),
-                "company_logo": cp.get("company_logo") or company_extras.get("company_logo"),
-                "company_email": cp.get("company_email") or company_extras.get("company_email"),
-                "company_description": wi.get("company_description") or company_extras.get("company_description"),
-                "company_linkedin": ci.get("linkedin_url") or company_extras.get("company_linkedin"),
-                "company_twitter": cp.get("company_twitter") or company_extras.get("company_twitter"),
-                "company_phone": cp.get("company_phone") or company_extras.get("company_phone"),
-                "waterfall_log": json.dumps(waterfall_log),
-                # Stage 3 — Website Intelligence
-                "website_intelligence": json.dumps(website_intel or {}),
-                "product_offerings": _safe_json(wi.get("product_offerings")),
-                "value_proposition": wi.get("value_proposition"),
-                "target_customers": _safe_json(wi.get("target_customers")),
-                "business_model": wi.get("business_model"),
-                "pricing_signals": wi.get("pricing_signals"),
-                "product_category": wi.get("product_category"),
-                "data_completeness_score": int(ls.get("data_completeness_score", 0)),
-                # Intent signals
-                "recent_funding_event": intent_s.get("recent_funding_event"),
-                "hiring_signal": intent_s.get("hiring_signal"),
-                "job_change": intent_s.get("job_change"),
-                "linkedin_activity": intent_s.get("linkedin_activity"),
-                "news_mention": intent_s.get("news_mention"),
-                "product_launch": intent_s.get("product_launch"),
-                "competitor_usage": intent_s.get("competitor_usage"),
-                "review_activity": intent_s.get("review_activity"),
-                # Scoring
-                "icp_fit_score": _safe_int(ls.get("icp_fit_score")),
-                "intent_score": _safe_int(ls.get("intent_score")),
-                "timing_score": _safe_int(ls.get("timing_score")),
-                "engagement_score": 0,
-                "total_score": _safe_int(ls.get("overall_score")),
-                "score_tier": score_tier,
-                "score_explanation": ls.get("score_explanation"),
-                "icp_match_tier": ls.get("icp_match_tier") or tier_raw,
-                "disqualification_flags": _safe_json(ls.get("disqualification_flags")),
-                "email_subject": outreach.get("email_subject"),
-                "cold_email": outreach.get("cold_email"),
-                "linkedin_note": outreach.get("linkedin_note"),
-                "best_channel": outreach.get("best_channel"),
-                "best_send_time": outreach.get("best_send_time"),
-                "outreach_angle": outreach.get("outreach_angle"),
-                "sequence_type": outreach.get("sequence_type"),
-                "outreach_sequence": _safe_json(outreach.get("sequence")),
-                "last_contacted": outreach.get("last_contacted"),
-                "email_status": outreach.get("email_status"),
-                "lead_source": crm.get("lead_source", "LinkedIn URL"),
-                "enrichment_source": crm.get("enrichment_source"),
-                "data_completeness": _safe_int(crm.get("data_completeness")),
-                "crm_stage": crm.get("crm_stage"),
-                "tags": _safe_json(crm.get("tags")),
-                "assigned_owner": crm.get("assigned_owner"),
-                "full_data": json.dumps({
-                    "person_profile": enrichment.get("person_profile", {}),
-                    "company_identity": enrichment.get("company_identity", {}),
-                    "website_intelligence": enrichment.get("website_intelligence", website_intel or {}),
-                    "company_profile": enrichment.get("company_profile", {}),
-                    "company_intelligence": enrichment.get("company_intelligence", {}),
-                    "intent_signals": enrichment.get("intent_signals", {}),
-                    "lead_scoring": enrichment.get("lead_scoring", {}),
-                    "outreach": enrichment.get("outreach", {}),
-                    # Legacy compatibility
-                    "identity": enrichment.get("identity", {}),
-                    "professional": enrichment.get("professional", {}),
-                    "company": enrichment.get("company", {}),
-                    "scoring": enrichment.get("scoring", {}),
-                    # Profile-level data for UI
-                    "recommendations": profile.get("recommendations") or [],
-                    "recommendations_count": profile.get("recommendations_count") or 0,
-                    "similar_profiles": profile.get("_similar_profiles") or [],
-                    "banner_image": profile.get("banner_image") or "",
-                    "linkedin_num_id": profile.get("linkedin_num_id") or "",
-                    "activity_emails": profile.get("_activity_emails") or [],
-                    "activity_phones": profile.get("_activity_phones") or [],
-                    "activity_full": profile.get("_activity_full") or [],
-                    "linkedin_posts": profile.get("_posts") or [],
-                    "hiring_signals": profile.get("_hiring_signals") or [],
-                }, default=str),
-                "raw_profile": json.dumps(profile, default=str),
-                "about": (profile.get("about") or "")[:1000],
-                "followers": _safe_int(profile.get("followers")),
-                "connections": _safe_int(profile.get("connections")),
-                "email_source": contact.get("source"),
-                "email_confidence": contact.get("confidence"),
-                "status": "enriched",
-                "job_id": job_id,
-                "enriched_at": now,
-            }
-            await _upsert_lead(lead)
-            processed += 1
-        except Exception as e:
-            logger.warning("[Webhook] %s: %s", url, e)
-            failed += 1
-
+async def process_webhook_profiles(
+    profiles: list[dict],
+    job_id: Optional[str] = None,
+    sub_job_id: Optional[str] = None,
+) -> dict:
+    # Resolve org_id from job record (needed for Ably events + sub_job)
+    org_id = "default"
     if job_id:
-        ex = await get_job(job_id)
-        if ex:
-            await _update_job(job_id, processed=ex["processed"] + processed, failed=ex["failed"] + failed)
-            up = await get_job(job_id)
-            if up and up["processed"] + up["failed"] >= up["total_urls"]:
-                await _update_job(job_id, status="completed")
+        job = await get_job(job_id)
+        if job:
+            # Guard: discard webhook results if job was cancelled
+            if job.get("status") == "cancelled":
+                logger.info("[Webhook] job %s is cancelled — discarding %d profiles", job_id, len(profiles))
+                return {"processed": 0, "failed": 0, "cancelled": True}
+            org_id = job.get("organization_id") or "default"
+
+    # Use pre-created sub_job (chunked BD path) or create one (legacy/webhook path)
+    _sub_job_id = sub_job_id
+    if job_id:
+        try:
+            if _sub_job_id:
+                # Chunk was pre-created by enrich_bulk — mark it running
+                await _update_sub_job(_sub_job_id, status="running", total_urls=len(profiles))
+            else:
+                async with get_pool().acquire() as conn:
+                    chunk_index = await conn.fetchval(
+                        "SELECT COUNT(*) FROM enrichment_sub_jobs WHERE job_id=$1", job_id
+                    )
+                _sub_job_id = str(uuid.uuid4())
+                await _create_sub_job(_sub_job_id, job_id, int(chunk_index), len(profiles), org_id)
+                await _update_sub_job(_sub_job_id, status="running")
+        except Exception as e:
+            logger.debug("[Webhook] sub_job setup failed: %s", e)
+            _sub_job_id = None
+
+    # Process all profiles in parallel — one coroutine per profile
+    results = await asyncio.gather(
+        *[_process_one_webhook_profile(p, job_id, org_id) for p in profiles],
+        return_exceptions=True,
+    )
+
+    ok_leads = [r for r in results if isinstance(r, dict)]
+    processed = len(ok_leads)
+    failed    = len(results) - processed
+
+    logger.info("[Webhook] batch done: processed=%d failed=%d job=%s", processed, failed, job_id or "—")
+
+    # Update sub_job to reflect completion of this chunk
+    if _sub_job_id:
+        try:
+            sub_status = (
+                "completed" if failed == 0
+                else ("failed" if processed == 0 else "completed_with_errors")
+            )
+            await _update_sub_job(_sub_job_id, status=sub_status, processed=processed, failed=failed)
+        except Exception as e:
+            logger.debug("[Webhook] sub_job update failed: %s", e)
+
+    # Atomic job progress update — avoids race condition when multiple webhook
+    # calls arrive simultaneously (BrightData sends partial batches)
+    if job_id:
+        async with get_pool().acquire() as conn:
+            row = await conn.fetchrow(
+                """UPDATE enrichment_jobs
+                      SET processed   = processed + $1,
+                          failed      = failed + $2,
+                          updated_at  = $3
+                    WHERE id = $4
+                RETURNING processed, failed, total_urls, organization_id, status""",
+                processed, failed, datetime.now(timezone.utc), job_id,
+            )
+        if row:
+            org_id = row["organization_id"] or org_id
+            total_done = row["processed"] + row["failed"]
+            if total_done >= row["total_urls"] and row["status"] not in ("completed", "failed", "completed_with_errors"):
+                final_status = (
+                    "completed" if row["failed"] == 0
+                    else ("failed" if row["processed"] == 0 else "completed_with_errors")
+                )
+                await _update_job(job_id, status=final_status)
+                await _publish_job_done(org_id, job_id, row["processed"], row["failed"])
+
+    # Publish per-lead Ably events (real-time frontend updates)
+    if job_id and ok_leads:
+        for lead in ok_leads:
+            await _publish_lead_done(org_id, job_id, lead)
 
     return {"processed": processed, "failed": failed}
 
