@@ -271,6 +271,7 @@ def _normalise_person_text(lead: dict) -> None:
 # ── Shared persistent HTTP clients (reuse TCP/TLS connections across requests) ─
 # Each external service gets its own client so keep-alive pools don't interfere.
 LIO_RECEIVE_URL = os.getenv("LIO_RECEIVE_URL", "https://api-lio.worksbuddy.ai/api/enrich/receive")
+_JWT_SECRET     = os.getenv("JWT_SECRET", "")
 _lio_client: Optional[httpx.AsyncClient] = None
 _api_client: Optional[httpx.AsyncClient] = None   # Hunter / Apollo / Dropcontact / PDL / ZeroBounce
 _bd_client: Optional[httpx.AsyncClient] = None    # Bright Data
@@ -282,7 +283,10 @@ _HTTP_LIMITS = httpx.Limits(max_connections=40, max_keepalive_connections=20)
 def _get_lio_client() -> httpx.AsyncClient:
     global _lio_client
     if _lio_client is None or _lio_client.is_closed:
-        _lio_client = httpx.AsyncClient(timeout=30.0, limits=_HTTP_LIMITS)
+        headers = {}
+        if _JWT_SECRET:
+            headers["Authorization"] = f"Bearer {_JWT_SECRET}"
+        _lio_client = httpx.AsyncClient(timeout=30.0, limits=_HTTP_LIMITS, headers=headers)
     return _lio_client
 
 

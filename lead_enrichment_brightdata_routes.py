@@ -726,9 +726,7 @@ async def enrich_bulk(request: Request):
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Invalid request body: {e}")
 
-    # org_id, sso_id = _validate_token(body.token)
-    org_id = "default"
-    sso_id = ""
+    org_id, sso_id = _validate_token(body.token)
 
     urls_to_submit = body.linkedin_urls
     skipped_urls: list[str] = []
