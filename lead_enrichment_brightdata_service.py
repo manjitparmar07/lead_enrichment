@@ -3728,20 +3728,22 @@ async def build_comprehensive_enrichment(
             if effective_crm_prompt:
                 try:
                     linkedin_snapshot = json.dumps({
-                        "name":         data.get("person_profile", {}).get("full_name", ""),
-                        "title":        data.get("person_profile", {}).get("current_title", ""),
-                        "company":      data.get("company_identity", {}).get("name", ""),
-                        "location":     data.get("person_profile", {}).get("city", ""),
-                        "linkedin_url": linkedin_url,
-                        "followers":    data.get("person_profile", {}).get("followers", 0),
-                        "about":        data.get("person_profile", {}).get("about", ""),
-                        "skills":       data.get("person_profile", {}).get("top_skills", []),
-                        "experience":   (profile.get("experience") or [])[:5],
-                        "education":    (profile.get("education") or [])[:3],
-                        "activity":     data.get("online_presence", {}),
-                        "intent":       data.get("intent_signals", {}),
-                        "scores":       data.get("scoring", {}),
-                        "outreach":     data.get("outreach", {}),
+                        "name":          data.get("person_profile", {}).get("full_name", ""),
+                        "title":         data.get("person_profile", {}).get("current_title", ""),
+                        "company":       data.get("company_identity", {}).get("name", ""),
+                        "location":      data.get("person_profile", {}).get("city", ""),
+                        "linkedin_url":  linkedin_url,
+                        "profile_image": _extract_avatar(profile),
+                        "company_logo":  (profile.get("_company_extras") or {}).get("company_logo") or data.get("company_profile", {}).get("company_logo"),
+                        "followers":     data.get("person_profile", {}).get("followers", 0),
+                        "about":         data.get("person_profile", {}).get("about", ""),
+                        "skills":        data.get("person_profile", {}).get("top_skills", []),
+                        "experience":    (profile.get("experience") or [])[:5],
+                        "education":     (profile.get("education") or [])[:3],
+                        "activity":      data.get("online_presence", {}),
+                        "intent":        data.get("intent_signals", {}),
+                        "scores":        data.get("scoring", {}),
+                        "outreach":      data.get("outreach", {}),
                     }, default=str)
                     crm_brief_user = f"Analyze this LinkedIn prospect data and produce the CRM brief:\n\n{linkedin_snapshot}"
                     brief = await _call_llm([
@@ -3749,7 +3751,17 @@ async def build_comprehensive_enrichment(
                         {"role": "user",   "content": crm_brief_user},
                     ], max_tokens=2000, temperature=0.4, model_override=model_override)
                     if brief:
-                        data["crm_brief"] = brief
+                        import re as _re
+                        # Strip <think>...</think> reasoning blocks (qwen3, deepseek, etc.)
+                        brief = _re.sub(r"<think>.*?</think>", "", brief, flags=_re.DOTALL).strip()
+                        # Strip ```json fences if present
+                        brief = _re.sub(r"^```json\s*", "", brief)
+                        brief = _re.sub(r"\s*```$", "", brief).strip()
+                        # Try to parse as JSON — store as dict if valid, else raw string
+                        try:
+                            data["crm_brief"] = json.loads(brief)
+                        except Exception:
+                            data["crm_brief"] = brief
                         logger.info("[Enrichment] CRM brief generated (%d chars)", len(brief))
                 except Exception as _be:
                     logger.warning("[Enrichment] CRM brief failed: %s", _be)
