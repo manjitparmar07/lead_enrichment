@@ -1372,7 +1372,14 @@ async def regenerate_crm_brief(lead_id: str, request: Request):
     """
     org_id = _get_org_id(request)
     try:
-        result = await svc.regenerate_crm_brief_for_lead(lead_id, org_id=org_id)
+        # 25s hard cap so Railway's gateway (30s) never kills the connection with a 502
+        result = await asyncio.wait_for(
+            svc.regenerate_crm_brief_for_lead(lead_id, org_id=org_id),
+            timeout=25.0,
+        )
+    except asyncio.TimeoutError:
+        logger.error("[RegenerateCrmBrief] Timed out after 25s for lead=%s", lead_id)
+        raise HTTPException(status_code=503, detail="LLM generation timed out — please try again in a moment")
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except Exception as exc:

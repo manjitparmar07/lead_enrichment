@@ -1242,10 +1242,13 @@ async def _call_llm(
     wb_llm_host_override: Optional[str] = None,
     wb_llm_key_override: Optional[str] = None,
     wb_llm_model_override: Optional[str] = None,
+    # When True: skip WB LLM and try HuggingFace first, then Groq as fallback
+    hf_first: bool = False,
 ) -> Optional[str]:
-    """Try WB LLM → Groq. Returns raw content string or None.
+    """Try WB LLM → Groq → HuggingFace (default) or HuggingFace → Groq (hf_first=True).
     model_override: overrides the Groq model (env default or explicit groq_api_key).
     groq_api_key / wb_llm_*_override: explicit keys from DB — take priority over env/keys_service.
+    hf_first: skip WB LLM and use HuggingFace as primary, Groq as fallback.
     """
     async def _post(base_url: str, api_key: str, model: str, msgs: list, timeout: int = 60) -> str:
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
@@ -1268,22 +1271,10 @@ async def _call_llm(
                 result.append(m)
         return result
 
-    # WB LLM — explicit override takes priority over env/keys_service
-    wb_host = wb_llm_host_override or _wb_llm_host()
-    wb_key  = wb_llm_key_override  or _wb_llm_key()
-    wb_mdl  = wb_llm_model_override or _wb_llm_model()
-    if wb_host and wb_key:
-        try:
-            return await _post(wb_host, wb_key, wb_mdl, messages)
-        except Exception as e:
-            logger.warning("[LLM] WB failed: %s", e)
-
-    # Groq — explicit override takes priority over env/keys_service
-    # Groq base URL must include /openai prefix: https://api.groq.com/openai
-    g_key = groq_api_key or _groq_key()
-    if g_key:
-        # If model_override looks like a WB/vendor model (e.g. "qwen/qwen3-32b"),
-        # it's not a valid Groq model — fall back to the Groq default from env.
+    async def _try_groq() -> Optional[str]:
+        g_key = groq_api_key or _groq_key()
+        if not g_key:
+            return None
         _is_wb_model = model_override and ("/" in model_override or model_override.startswith("wb-"))
         groq_model = (None if _is_wb_model else model_override) or _groq_model()
         groq_messages = _truncate_for_groq(messages)
@@ -1296,21 +1287,47 @@ async def _call_llm(
                     logger.warning("[LLM] Groq %s — retrying in %ds (attempt %d/3)", "429" if "429" in str(e) else "413", wait, attempt + 1)
                     await asyncio.sleep(wait)
                 else:
-                    logger.warning("[LLM] Groq failed: %s — falling back to HuggingFace", e)
+                    logger.warning("[LLM] Groq failed: %s", e)
                     break
+        return None
 
-    # HuggingFace Router — final fallback, receives FULL untruncated messages
-    # Uses 180s timeout to handle large payloads with heavy models
-    hf_token = _hf_token()
-    if hf_token:
+    async def _try_hf() -> Optional[str]:
+        hf_token = _hf_token()
+        if not hf_token:
+            return None
         hf_model = _hf_model()
         try:
             logger.info("[LLM] Trying HuggingFace (%s) with full payload (%d chars)", hf_model, sum(len(m["content"]) for m in messages))
             return await _post("https://router.huggingface.co", hf_token, hf_model, messages, timeout=180)
         except Exception as e:
             logger.warning("[LLM] HuggingFace failed: %s", e)
+        return None
 
-    return None
+    if hf_first:
+        # HuggingFace first → Groq fallback (skips WB LLM)
+        result = await _try_hf()
+        if result:
+            return result
+        return await _try_groq()
+
+    # Default order: WB LLM → Groq → HuggingFace
+    wb_host = wb_llm_host_override or _wb_llm_host()
+    wb_key  = wb_llm_key_override  or _wb_llm_key()
+    wb_mdl  = wb_llm_model_override or _wb_llm_model()
+    if wb_host and wb_key:
+        try:
+            return await _post(wb_host, wb_key, wb_mdl, messages)
+        except Exception as e:
+            logger.warning("[LLM] WB failed: %s", e)
+
+    # Groq — explicit override takes priority over env/keys_service
+    # Groq base URL must include /openai prefix: https://api.groq.com/openai
+    result = await _try_groq()
+    if result:
+        return result
+
+    # HuggingFace Router — final fallback, receives FULL untruncated messages
+    return await _try_hf()
 
 
 def _parse_json_from_llm(raw: str) -> dict:
@@ -3784,7 +3801,7 @@ async def build_comprehensive_enrichment(
             brief = await _call_llm([
                 {"role": "system", "content": effective_crm_prompt},
                 {"role": "user",   "content": crm_brief_user},
-            ], max_tokens=2500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override)
+            ], max_tokens=2500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override, hf_first=True)
             if brief:
                 import re as _re
                 # Strip ALL <think>...</think> blocks (qwen3, deepseek, etc.)
@@ -6518,7 +6535,7 @@ async def regenerate_crm_brief_for_lead(lead_id: str, org_id: str = "") -> Optio
     brief = await _call_llm([
         {"role": "system", "content": crm_brief_prompt},
         {"role": "user",   "content": f"Analyze this LinkedIn prospect data and return the JSON exactly as specified:\n\n{optimized_str}"},
-    ], max_tokens=2500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override)
+    ], max_tokens=2500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override, hf_first=True)
 
     if not brief:
         raise RuntimeError("LLM unavailable or returned no content.")
