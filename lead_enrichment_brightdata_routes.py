@@ -459,7 +459,7 @@ class BulkEnrichRequest(BaseModel):
     webhook_auth: Optional[str] = None  # Auth header value for your webhook
     token: Optional[str] = None         # Tenant/org token — echoed back in response + webhook
     skip_existing: bool = True          # skip URLs already enriched (< LEAD_CACHE_TTL_DAYS old)
-    forward_to_lio: bool = False        # forward enriched leads to LIO (external API callers only)
+    forward_to_lio: bool = False        # suppress LIO forwarding when True; False (default) = auto-send to LIO
     system_prompt: Optional[str] = None  # optional: custom system prompt used during outreach/AI generation per lead
 
     @field_validator("linkedin_urls")
@@ -744,7 +744,7 @@ async def enrich_bulk(request: Request):
                     and existing.get("enriched_at")
                 )
                 if data_complete:
-                    # Data is good — forward to LIO unless caller suppressed it
+                    # Data is good — send to LIO unless caller suppressed it (forward_to_lio=True = suppress)
                     if not body.forward_to_lio:
                         existing["linkedin_enrich"] = svc._format_linkedin_enrich(existing)
                         import asyncio as _asyncio

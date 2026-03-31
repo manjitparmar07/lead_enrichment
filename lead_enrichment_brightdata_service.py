@@ -4174,7 +4174,11 @@ def _country_name(code: str) -> str:
 
 
 def _lead_id(linkedin_url: str) -> str:
-    return hashlib.md5(linkedin_url.strip().lower().encode()).hexdigest()[:16]
+    # Hash only the profile slug (/in/username) so all URL variants map to the same lead:
+    # www vs no-www, country domains, query params, trailing slashes, protocol — all ignored
+    m = re.search(r"/in/([^/?#\s]+)", linkedin_url.strip(), re.IGNORECASE)
+    slug = m.group(1).lower().rstrip("/") if m else linkedin_url.strip().lower()
+    return hashlib.md5(slug.encode()).hexdigest()[:16]
 
 
 def _safe_json(v) -> str:
