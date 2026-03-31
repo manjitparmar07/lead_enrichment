@@ -36,8 +36,8 @@ async def init_pool() -> None:
     global _pool
     _pool = await asyncpg.create_pool(
         os.environ["DATABASE_URL"],
-        min_size=10,
-        max_size=100,
+        min_size=20,
+        max_size=200,
         command_timeout=300,  # 5 min — needed for bulk COPY to remote DB
     )
 
