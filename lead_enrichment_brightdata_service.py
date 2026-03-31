@@ -272,6 +272,7 @@ def _normalise_person_text(lead: dict) -> None:
 # Each external service gets its own client so keep-alive pools don't interfere.
 LIO_RECEIVE_URL = os.getenv("LIO_RECEIVE_URL", "https://api-lio.worksbuddy.ai/api/enrich/receive")
 _JWT_SECRET     = os.getenv("JWT_SECRET", "")
+_LIO_TOKEN      = os.getenv("LIO_TOKEN", "")   # dedicated bearer token for LIO auth
 _lio_client: Optional[httpx.AsyncClient] = None
 _api_client: Optional[httpx.AsyncClient] = None   # Hunter / Apollo / Dropcontact / PDL / ZeroBounce
 _bd_client: Optional[httpx.AsyncClient] = None    # Bright Data
@@ -284,8 +285,10 @@ def _get_lio_client() -> httpx.AsyncClient:
     global _lio_client
     if _lio_client is None or _lio_client.is_closed:
         headers = {}
-        if _JWT_SECRET:
-            headers["Authorization"] = f"Bearer {_JWT_SECRET}"
+        # Use dedicated LIO_TOKEN if set, otherwise fall back to JWT_SECRET
+        lio_auth = _LIO_TOKEN or _JWT_SECRET
+        if lio_auth:
+            headers["Authorization"] = f"Bearer {lio_auth}"
         _lio_client = httpx.AsyncClient(timeout=30.0, limits=_HTTP_LIMITS, headers=headers)
     return _lio_client
 
@@ -5520,15 +5523,9 @@ def _bd_chunk_size(total: int) -> int:
 
 def _dynamic_chunk_size(total: int) -> int:
     """
-    Dynamic chunk sizing based on batch size.
-    Target: ~20 chunks per job. Minimum chunk size = 1.
-
-      total ≤ 20   → chunk_size = 1  (1 URL per chunk, up to 20 chunks)
-      total = 100  → chunk_size = 5  (5 URLs per chunk, 20 chunks)
-      total = 200  → chunk_size = 10 (10 URLs per chunk, 20 chunks)
-      total = 500  → chunk_size = 25 (25 URLs per chunk, 20 chunks)
+    1 URL per chunk — each lead is processed independently for granular progress.
     """
-    return max(1, total // 20)
+    return 1
 
 
 async def enrich_bulk(
@@ -5557,6 +5554,8 @@ async def enrich_bulk(
 
     # Base app URL — used to build per-chunk webhook URLs
     app_url = os.getenv("APP_URL", "").rstrip("/")
+
+    bd_triggered = False  # tracks whether BD path succeeded — prevents queue double-run
 
     # Trigger BrightData batch in parallel chunks when API key is available
     if _bd_api_key():
@@ -5592,6 +5591,7 @@ async def enrich_bulk(
             if not webhook_url and app_url:
                 webhook_url = f"{app_url}/api/leads/webhook/brightdata?job_id={job_id}"
             status = "running"
+            bd_triggered = True
             logger.info(
                 "[BulkEnrich] %d URLs → %d BD chunks triggered for job %s (org=%s)",
                 len(urls), len(url_chunks), job_id, org_id,
@@ -5617,7 +5617,7 @@ async def enrich_bulk(
     async with get_pool().acquire() as conn:
         await conn.execute(sql, *args)
 
-    if not webhook_url:
+    if not webhook_url and not bd_triggered:
         # Fair multi-tenant queue (per-tenant queues + round-robin scheduler)
         r = await _get_redis()
         if r:

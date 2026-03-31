@@ -623,18 +623,22 @@ def _decode_token(token: str) -> dict:
 def _validate_token(token: Optional[str]) -> tuple[str, str]:
     """
     Verify JWT with JWT_SECRET and return (org_id, sso_id).
-    Raises HTTP 401 if token is missing, signature invalid, expired,
-    or platform != 'worksbuddy'.
+    Raises HTTP 401 if token is missing or signature invalid/expired.
+    platform check is skipped for OAuth tokens (isOAuthToken=true or no platform field).
     """
     if not token:
         raise HTTPException(status_code=401, detail="Token required.")
     payload = _decode_token(token)
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid or expired token.")
-    if payload.get("platform") != "worksbuddy":
+    # Only enforce platform check for non-OAuth tokens that explicitly set platform
+    platform = payload.get("platform")
+    is_oauth = payload.get("isOAuthToken", False)
+    if platform and not is_oauth and platform != "worksbuddy":
         raise HTTPException(status_code=401, detail="Invalid token: platform mismatch.")
     org_id = str(payload.get("organization_id", "default"))
-    sso_id = str(payload.get("sso_id") or payload.get("sub") or payload.get("user_id") or "")
+    # Support id, sso_id, sub, user_id as fallbacks
+    sso_id = str(payload.get("sso_id") or payload.get("sub") or payload.get("user_id") or payload.get("id") or "")
     return org_id, sso_id
 
 
