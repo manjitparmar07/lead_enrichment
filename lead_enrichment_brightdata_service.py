@@ -361,10 +361,20 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
         if v and "placeholder" in str(v).lower():
             contact_block[email_key] = None
 
+    # crm_brief is stored as JSON string in DB — parse back to dict for LIO
+    _crm_brief_raw = lead.get("crm_brief")
+    _crm_brief = None
+    if _crm_brief_raw:
+        try:
+            _crm_brief = json.loads(_crm_brief_raw) if isinstance(_crm_brief_raw, str) else _crm_brief_raw
+        except Exception:
+            pass
+
     payload = {
         "enrichment_data": linkedin_enrich,
         "sso_id":          sso_id,
         "organization_id": lead.get("organization_id", ""),
+        "crm_brief":       _crm_brief,
     }
 
     logger.info("[LIO] Sending lead %s to %s | sso_id=%s | org=%s",
@@ -3727,36 +3737,58 @@ async def build_comprehensive_enrichment(
             effective_crm_prompt = system_prompt_override.strip() if (system_prompt_override and system_prompt_override.strip()) else crm_brief_prompt
             if effective_crm_prompt:
                 try:
+                    _pp   = data.get("person_profile", {})
+                    _ci   = data.get("company_identity", {})
+                    _cp   = data.get("company_profile", {})
+                    _raw_skills = profile.get("skills") or []
                     linkedin_snapshot = json.dumps({
-                        "name":          data.get("person_profile", {}).get("full_name", ""),
-                        "title":         data.get("person_profile", {}).get("current_title", ""),
-                        "company":       data.get("company_identity", {}).get("name", ""),
-                        "location":      data.get("person_profile", {}).get("city", ""),
                         "linkedin_url":  linkedin_url,
+                        "name":          _pp.get("full_name", ""),
+                        "title":         _pp.get("current_title", "") or profile.get("position", ""),
+                        "company":       _ci.get("name", "") or profile.get("current_company_name", ""),
+                        "location":      _pp.get("city", "") or profile.get("city", ""),
                         "profile_image": _extract_avatar(profile),
-                        "company_logo":  (profile.get("_company_extras") or {}).get("company_logo") or data.get("company_profile", {}).get("company_logo"),
-                        "followers":     data.get("person_profile", {}).get("followers", 0),
-                        "about":         data.get("person_profile", {}).get("about", ""),
-                        "skills":        data.get("person_profile", {}).get("top_skills", []),
-                        "experience":    (profile.get("experience") or [])[:5],
-                        "education":     (profile.get("education") or [])[:3],
-                        "activity":      data.get("online_presence", {}),
+                        "company_logo":  (profile.get("_company_extras") or {}).get("company_logo") or _cp.get("company_logo", ""),
+                        "followers":     _pp.get("followers", 0),
+                        "connections":   profile.get("connections", 0),
+                        "about":         (_pp.get("about", "") or profile.get("about", ""))[:400],
+                        "skills":        [s.get("name", s) if isinstance(s, dict) else s for s in _raw_skills][:12] or _pp.get("top_skills", [])[:12],
+                        "certifications": [(c.get("title", "") + " — " + c.get("subtitle", ""))[:60] for c in (profile.get("certifications") or [])[:5]],
+                        "education":     [(e.get("title", "") + " " + e.get("start_year", "") + "-" + e.get("end_year", ""))[:60] for e in (profile.get("education") or [])[:3]],
+                        "posts":         [{"title": p.get("title", "")[:80], "interaction": p.get("interaction", "")} for p in (profile.get("posts") or [])[:4]],
+                        "activity":      [{"title": a.get("title", "")[:80], "interaction": str(a.get("interaction", "") or "liked")} for a in (profile.get("activity") or [])[:8]],
+                        "recommendations": [(r[:120] if isinstance(r, str) else str(r)[:120]) for r in (profile.get("recommendations") or [])[:2]],
+                        "company_website": _ci.get("domain", "") or _ci.get("website", ""),
+                        "company_industry": _ci.get("industry", "") or _cp.get("industry", ""),
+                        "company_size":  _ci.get("employee_count", "") or _cp.get("employee_count", ""),
                         "intent":        data.get("intent_signals", {}),
                         "scores":        data.get("scoring", {}),
-                        "outreach":      data.get("outreach", {}),
-                    }, default=str)
-                    crm_brief_user = f"Analyze this LinkedIn prospect data and produce the CRM brief:\n\n{linkedin_snapshot}"
+                        "outreach_hints": {k: v for k, v in (data.get("outreach") or {}).items() if k in ("best_channel", "outreach_angle", "best_send_time", "cold_email_subject")},
+                    }, separators=(",", ":"), default=str)
+                    crm_brief_user = f"Analyze this LinkedIn prospect data:\n\n{linkedin_snapshot}"
                     brief = await _call_llm([
                         {"role": "system", "content": effective_crm_prompt},
                         {"role": "user",   "content": crm_brief_user},
-                    ], max_tokens=2000, temperature=0.4, model_override=model_override)
+                    ], max_tokens=2500, temperature=0.3, model_override=model_override)
                     if brief:
                         import re as _re
-                        # Strip <think>...</think> reasoning blocks (qwen3, deepseek, etc.)
-                        brief = _re.sub(r"<think>.*?</think>", "", brief, flags=_re.DOTALL).strip()
-                        # Strip ```json fences if present
-                        brief = _re.sub(r"^```json\s*", "", brief)
-                        brief = _re.sub(r"\s*```$", "", brief).strip()
+                        # Strip ALL <think>...</think> blocks (qwen3, deepseek, etc.)
+                        brief = _re.sub(r"<think>.*?</think>", "", brief, flags=_re.DOTALL)
+                        # Strip any unclosed <think> block at end
+                        brief = _re.sub(r"<think>.*", "", brief, flags=_re.DOTALL).strip()
+                        # Extract first complete JSON object using brace counting
+                        _start = brief.find("{")
+                        if _start != -1:
+                            _depth = 0
+                            _end = _start
+                            for _i, _ch in enumerate(brief[_start:], _start):
+                                if _ch == "{": _depth += 1
+                                elif _ch == "}":
+                                    _depth -= 1
+                                    if _depth == 0:
+                                        _end = _i
+                                        break
+                            brief = brief[_start:_end + 1]
                         # Try to parse as JSON — store as dict if valid, else raw string
                         try:
                             data["crm_brief"] = json.loads(brief)
@@ -5073,6 +5105,7 @@ async def enrich_single(
             "scoring": enrichment.get("scoring", {}),
         }, default=str),
         "raw_profile": json.dumps(profile, default=str),
+        "crm_brief": json.dumps(enrichment.get("crm_brief"), default=str) if enrichment.get("crm_brief") is not None else None,
         "about": (profile.get("about") or "")[:1000],
         "followers": _safe_int(profile.get("followers")),
         "connections": _safe_int(profile.get("connections")),
