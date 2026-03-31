@@ -691,12 +691,11 @@ WORKSPACE_CONTEXT_DEFAULTS = {
 }
 
 
-async def get_workspace_config(org_id: str) -> dict:
-    """Return workspace config dict for the org."""
+async def get_workspace_config(org_id: str = "") -> dict:
+    """Return workspace config dict — fetches the first available row."""
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT lio_system_prompt, lio_model, lio_prompts_json, workspace_context_json, ai_prompts_json FROM workspace_configs WHERE org_id=$1",
-            org_id,
+            "SELECT lio_system_prompt, lio_model, lio_prompts_json, workspace_context_json, ai_prompts_json FROM workspace_configs LIMIT 1",
         )
         if not row:
             return {}

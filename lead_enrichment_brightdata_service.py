@@ -62,6 +62,8 @@ def _wb_llm_key()         -> str:  return _k("WB_LLM_API_KEY")
 def _wb_llm_model()       -> str:  return _k("WB_LLM_DEFAULT_MODEL", "wb-pro")
 def _groq_key()           -> str:  return _k("GROQ_API_KEY")
 def _groq_model()         -> str:  return _k("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")
+def _hf_token()           -> str:  return _k("HF_TOKEN")
+def _hf_model()           -> str:  return _k("HF_MODEL", "Qwen/Qwen2.5-72B-Instruct")
 def _outreach_threshold() -> int:
     try: return int(_k("LEAD_OUTREACH_THRESHOLD", "50"))
     except ValueError: return 50
@@ -909,6 +911,8 @@ def _format_linkedin_enrich(lead: dict, include_contact: bool = True) -> dict:
             _parse_json_safe(lead.get("auto_tags"), []) or
             _parse_json_safe(lead.get("tags"), [])
         ),
+
+        "crm_brief": _parse_json_safe(lead.get("crm_brief"), None),
     }
 
 
@@ -1243,16 +1247,26 @@ async def _call_llm(
     model_override: overrides the Groq model (env default or explicit groq_api_key).
     groq_api_key / wb_llm_*_override: explicit keys from DB — take priority over env/keys_service.
     """
-    async def _post(base_url: str, api_key: str, model: str) -> str:
+    async def _post(base_url: str, api_key: str, model: str, msgs: list, timeout: int = 60) -> str:
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 f"{base_url.rstrip('/')}/v1/chat/completions",
                 headers=headers,
-                json={"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens},
+                json={"model": model, "messages": msgs, "temperature": temperature, "max_tokens": max_tokens},
             )
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"].strip()
+
+    # Groq has a ~6K token request limit — truncate user message if too large
+    def _truncate_for_groq(msgs: list, char_limit: int = 12000) -> list:
+        result = []
+        for m in msgs:
+            if m["role"] == "user" and len(m["content"]) > char_limit:
+                result.append({**m, "content": m["content"][:char_limit] + "\n...[truncated for token limit]"})
+            else:
+                result.append(m)
+        return result
 
     # WB LLM — explicit override takes priority over env/keys_service
     wb_host = wb_llm_host_override or _wb_llm_host()
@@ -1260,7 +1274,7 @@ async def _call_llm(
     wb_mdl  = wb_llm_model_override or _wb_llm_model()
     if wb_host and wb_key:
         try:
-            return await _post(wb_host, wb_key, wb_mdl)
+            return await _post(wb_host, wb_key, wb_mdl, messages)
         except Exception as e:
             logger.warning("[LLM] WB failed: %s", e)
 
@@ -1268,18 +1282,33 @@ async def _call_llm(
     # Groq base URL must include /openai prefix: https://api.groq.com/openai
     g_key = groq_api_key or _groq_key()
     if g_key:
-        groq_model = model_override or _groq_model()
+        # If model_override looks like a WB/vendor model (e.g. "qwen/qwen3-32b"),
+        # it's not a valid Groq model — fall back to the Groq default from env.
+        _is_wb_model = model_override and ("/" in model_override or model_override.startswith("wb-"))
+        groq_model = (None if _is_wb_model else model_override) or _groq_model()
+        groq_messages = _truncate_for_groq(messages)
         for attempt in range(3):
             try:
-                return await _post("https://api.groq.com/openai", g_key, groq_model)
+                return await _post("https://api.groq.com/openai", g_key, groq_model, groq_messages)
             except Exception as e:
-                if "429" in str(e) and attempt < 2:
-                    wait = 5 * (attempt + 1)  # 5s, 10s
-                    logger.warning("[LLM] Groq 429 — retrying in %ds (attempt %d/3)", wait, attempt + 1)
+                if ("429" in str(e) or "413" in str(e)) and attempt < 2:
+                    wait = 5 * (attempt + 1)
+                    logger.warning("[LLM] Groq %s — retrying in %ds (attempt %d/3)", "429" if "429" in str(e) else "413", wait, attempt + 1)
                     await asyncio.sleep(wait)
                 else:
-                    logger.warning("[LLM] Groq failed: %s", e)
+                    logger.warning("[LLM] Groq failed: %s — falling back to HuggingFace", e)
                     break
+
+    # HuggingFace Router — final fallback, receives FULL untruncated messages
+    # Uses 180s timeout to handle large payloads with heavy models
+    hf_token = _hf_token()
+    if hf_token:
+        hf_model = _hf_model()
+        try:
+            logger.info("[LLM] Trying HuggingFace (%s) with full payload (%d chars)", hf_model, sum(len(m["content"]) for m in messages))
+            return await _post("https://router.huggingface.co", hf_token, hf_model, messages, timeout=180)
+        except Exception as e:
+            logger.warning("[LLM] HuggingFace failed: %s", e)
 
     return None
 
@@ -2990,6 +3019,26 @@ Return ONLY valid JSON with these exact keys. Use null for missing data, never h
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Default CRM Brief system prompt — used when lio_system_prompt is not set in DB
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DEFAULT_CRM_BRIEF_PROMPT = """You are a B2B sales analyst. Analyze LinkedIn data. Return ONLY valid JSON, no markdown, no text outside JSON.
+
+RULES:
+- Synthesize, never copy verbatim. Mark guesses [inferred].
+- analyst_note: 2-3 sentences from profile+posts+company+pain points — what they do and what they struggle with.
+- pain_points: derive from profile/posts/company context, not generic.
+- Liked/commented/reposted = intent signals. Authored posts = professional identity.
+- If experience missing, reconstruct from activity and company context.
+- recent_posts_summary: authored posts only, max 5.
+- recent_interactions_summary: likes/comments/reposts only, max 5.
+- All arrays: min 1 item. All strings: non-empty.
+
+OUTPUT JSON:
+{"who_they_are":{"name":"","title":"","company":"","location":"","linkedin_url":"","profile_image":"","company_logo":"","followers":0,"connections":0,"persona":"","seniority":"","trajectory":"","decision_maker":""},"their_company":{"type":"","industry":"","stage":"","company_size":"","founded":"","website":"","company_tags":[],"relevance_score":0,"relevance_reason":""},"what_they_care_about":{"primary_interests":[],"also_interested_in":[],"passion_signals":[]},"online_behaviour":{"activity_level":"","style":"","recurring_themes":[],"platform":""},"communication":{"tone":"","writing_style":"","emotional_mode":"","archetype":"","mirror_tip":""},"what_drives_them":{"values":[],"motivators":[],"pain_points":[],"ambitions":[]},"buying_signals":{"intent_level":"","trigger_events":[],"tools_used":[],"decision_style":"","intent_tags":[]},"smart_tags":[],"outreach_blueprint":{"best_channel":"","best_approach":"","opening_hook_1":"","opening_hook_2":"","content_to_send":"","topics_to_avoid":[],"one_line_strategy":""},"crm_scores":{"icp_fit":0,"engagement":0,"timing":0,"priority":""},"crm_import_fields":{"buyer_type":"","buying_signal":"","outreach_tone":"","hook_theme":"","key_avoid":"","tag_1":"","tag_2":"","tag_3":"","analyst_note":""},"recent_posts_summary":[{"topic":"","tone":"","key_message":"","engagement":"","intent_signal":""}],"recent_interactions_summary":[{"type":"","content_topic":"","why_it_matters":"","intent_signal":""}]}"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Comprehensive 8-stage LLM enrichment
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3695,17 +3744,10 @@ async def build_comprehensive_enrichment(
         except Exception as _tie:
             logger.debug("[TitleInfer] Failed: %s", _tie)
 
-    prompt = _build_comprehensive_prompt(linkedin_url, profile, contact, now, website_intel=website_intel)
-
-    # Main JSON enrichment always uses a JSON-focused system prompt — never overridden.
-    # (The user prompt already hardcodes "Return ONLY a valid JSON object" so the system
-    #  prompt must stay JSON-oriented or the schema parse fails.)
-    _DEFAULT_SYSTEM = "Expert B2B lead intelligence analyst. Return ONLY valid JSON."
-
     try:
         cfg = await get_workspace_config(org_id)
-        model_override  = cfg.get("lio_model", "").strip() or None
-        crm_brief_prompt = cfg.get("lio_system_prompt", "").strip()  # used for CRM brief, not JSON enrichment
+        model_override   = cfg.get("lio_model", "").strip() or None
+        crm_brief_prompt = cfg.get("lio_system_prompt", "").strip()
     except Exception:
         model_override   = None
         crm_brief_prompt = ""
@@ -3722,86 +3764,214 @@ async def build_comprehensive_enrichment(
         model_override or "default",
     )
 
-    raw = await _call_llm([
-        {"role": "system", "content": _DEFAULT_SYSTEM},
-        {"role": "user",   "content": prompt},
-    ], max_tokens=2200, temperature=0.25, model_override=model_override)
+    # Base enrichment from rule-based assembly (scoring, ICP, signals, etc.)
+    data = _rule_based_enrichment(linkedin_url, profile, contact, now, website_intel=website_intel, scoring_cfg=scoring_cfg)
 
-    if raw:
-        data = _parse_json_from_llm(raw)
-        if data and ("person_profile" in data or "identity" in data):
-            logger.info("[Enrichment] LLM produced comprehensive 8-stage report")
-
-            # ── CRM Brief — second LLM call using the custom system prompt ────
-            # Only fires when a custom prompt is saved in LIO Config.
-            effective_crm_prompt = system_prompt_override.strip() if (system_prompt_override and system_prompt_override.strip()) else crm_brief_prompt
-            if effective_crm_prompt:
+    # ── CRM Brief — single LLM call using lio_system_prompt + raw profile ────
+    # system: lio_system_prompt from workspace_configs (set in LIO Config UI)
+    # user:   raw BrightData profile JSON
+    # model:  lio_model from workspace_configs (wb-pro / qwen by default)
+    effective_crm_prompt = (
+        system_prompt_override.strip() if (system_prompt_override and system_prompt_override.strip())
+        else crm_brief_prompt
+        or _DEFAULT_CRM_BRIEF_PROMPT
+    )
+    if effective_crm_prompt:
+        try:
+            _optimized = _build_llm_profile(profile)
+            raw_profile_str = json.dumps(_optimized, separators=(",", ":"), ensure_ascii=False, default=str)
+            crm_brief_user = f"Analyze this LinkedIn prospect data and return the JSON exactly as specified:\n\n{raw_profile_str}"
+            brief = await _call_llm([
+                {"role": "system", "content": effective_crm_prompt},
+                {"role": "user",   "content": crm_brief_user},
+            ], max_tokens=2500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override)
+            if brief:
+                import re as _re
+                # Strip ALL <think>...</think> blocks (qwen3, deepseek, etc.)
+                brief = _re.sub(r"<think>.*?</think>", "", brief, flags=_re.DOTALL)
+                # Strip any unclosed <think> block at end
+                brief = _re.sub(r"<think>.*", "", brief, flags=_re.DOTALL).strip()
+                # Extract first complete JSON object using brace counting
+                _start = brief.find("{")
+                if _start != -1:
+                    _depth = 0
+                    _end = _start
+                    for _i, _ch in enumerate(brief[_start:], _start):
+                        if _ch == "{": _depth += 1
+                        elif _ch == "}":
+                            _depth -= 1
+                            if _depth == 0:
+                                _end = _i
+                                break
+                    brief = brief[_start:_end + 1]
+                # Try to parse as JSON — store as dict if valid, else raw string
                 try:
-                    _pp   = data.get("person_profile", {})
-                    _ci   = data.get("company_identity", {})
-                    _cp   = data.get("company_profile", {})
-                    _raw_skills = profile.get("skills") or []
-                    linkedin_snapshot = json.dumps({
-                        "linkedin_url":  linkedin_url,
-                        "name":          _pp.get("full_name", ""),
-                        "title":         _pp.get("current_title", "") or profile.get("position", ""),
-                        "company":       _ci.get("name", "") or profile.get("current_company_name", ""),
-                        "location":      _pp.get("city", "") or profile.get("city", ""),
-                        "profile_image": _extract_avatar(profile),
-                        "company_logo":  (profile.get("_company_extras") or {}).get("company_logo") or _cp.get("company_logo", ""),
-                        "followers":     _pp.get("followers", 0),
-                        "connections":   profile.get("connections", 0),
-                        "about":         (_pp.get("about", "") or profile.get("about", ""))[:400],
-                        "skills":        [s.get("name", s) if isinstance(s, dict) else s for s in _raw_skills][:12] or _pp.get("top_skills", [])[:12],
-                        "certifications": [(c.get("title", "") + " — " + c.get("subtitle", ""))[:60] for c in (profile.get("certifications") or [])[:5]],
-                        "education":     [(e.get("title", "") + " " + e.get("start_year", "") + "-" + e.get("end_year", ""))[:60] for e in (profile.get("education") or [])[:3]],
-                        "posts":         [{"title": p.get("title", "")[:80], "interaction": p.get("interaction", "")} for p in (profile.get("posts") or [])[:4]],
-                        "activity":      [{"title": a.get("title", "")[:80], "interaction": str(a.get("interaction", "") or "liked")} for a in (profile.get("activity") or [])[:8]],
-                        "recommendations": [(r[:120] if isinstance(r, str) else str(r)[:120]) for r in (profile.get("recommendations") or [])[:2]],
-                        "company_website": _ci.get("domain", "") or _ci.get("website", ""),
-                        "company_industry": _ci.get("industry", "") or _cp.get("industry", ""),
-                        "company_size":  _ci.get("employee_count", "") or _cp.get("employee_count", ""),
-                        "intent":        data.get("intent_signals", {}),
-                        "scores":        data.get("scoring", {}),
-                        "outreach_hints": {k: v for k, v in (data.get("outreach") or {}).items() if k in ("best_channel", "outreach_angle", "best_send_time", "cold_email_subject")},
-                    }, separators=(",", ":"), default=str)
-                    crm_brief_user = f"Analyze this LinkedIn prospect data:\n\n{linkedin_snapshot}"
-                    brief = await _call_llm([
-                        {"role": "system", "content": effective_crm_prompt},
-                        {"role": "user",   "content": crm_brief_user},
-                    ], max_tokens=2500, temperature=0.3, model_override=model_override)
-                    if brief:
-                        import re as _re
-                        # Strip ALL <think>...</think> blocks (qwen3, deepseek, etc.)
-                        brief = _re.sub(r"<think>.*?</think>", "", brief, flags=_re.DOTALL)
-                        # Strip any unclosed <think> block at end
-                        brief = _re.sub(r"<think>.*", "", brief, flags=_re.DOTALL).strip()
-                        # Extract first complete JSON object using brace counting
-                        _start = brief.find("{")
-                        if _start != -1:
-                            _depth = 0
-                            _end = _start
-                            for _i, _ch in enumerate(brief[_start:], _start):
-                                if _ch == "{": _depth += 1
-                                elif _ch == "}":
-                                    _depth -= 1
-                                    if _depth == 0:
-                                        _end = _i
-                                        break
-                            brief = brief[_start:_end + 1]
-                        # Try to parse as JSON — store as dict if valid, else raw string
-                        try:
-                            data["crm_brief"] = json.loads(brief)
-                        except Exception:
-                            data["crm_brief"] = brief
-                        logger.info("[Enrichment] CRM brief generated (%d chars)", len(brief))
-                except Exception as _be:
-                    logger.warning("[Enrichment] CRM brief failed: %s", _be)
+                    data["crm_brief"] = json.loads(brief)
+                except Exception:
+                    data["crm_brief"] = brief
+                logger.info("[Enrichment] CRM brief generated (%d chars)", len(brief))
+        except Exception as _be:
+            logger.warning("[Enrichment] CRM brief failed: %s", _be)
 
-            return data
+    return data
 
-    logger.warning("[Enrichment] LLM unavailable or unusable — using rule-based fallback")
-    return _rule_based_enrichment(linkedin_url, profile, contact, now, website_intel=website_intel, scoring_cfg=scoring_cfg)
+
+def _build_llm_profile(profile: dict) -> dict:
+    """
+    Extract and clean all fields meaningful for CRM/LLM analysis.
+    Strips pure noise (people_also_viewed, HTML duplicates, logo URLs, internal IDs)
+    but keeps ALL signal content — experience descriptions, posts, activity, recommendations,
+    volunteer work, languages, groups — to maximise model context utilisation.
+    Qwen2.5-72B has a 128K context window; we target ~30-40K chars of signal-dense content.
+    """
+    # ── Experience — full descriptions, drop HTML + logo URLs + internal IDs ───────
+    def _clean_exp(items):
+        out = []
+        for e in (items or []):
+            entry = {
+                "title":       e.get("title", ""),
+                "company":     e.get("company", ""),
+                "start_date":  e.get("start_date", ""),
+                "end_date":    e.get("end_date", ""),
+                "location":    e.get("location", ""),
+                "description": (e.get("description") or "")[:2000],  # plain text, cap long essays
+            }
+            # include sub_positions (career progression within same company)
+            subs = e.get("sub_positions") or []
+            if subs:
+                entry["sub_positions"] = [
+                    {
+                        "title":       s.get("title", ""),
+                        "start_date":  s.get("start_date", ""),
+                        "end_date":    s.get("end_date", ""),
+                        "description": (s.get("description") or "")[:500],
+                    }
+                    for s in subs
+                ]
+            out.append(entry)
+        return out
+
+    # ── Activity — full titles, drop image URLs, cap at 50 items ─────────────────
+    def _clean_activity(items):
+        out = []
+        for a in (items or [])[:50]:
+            title = (a.get("title") or "").strip()
+            if not title:
+                continue
+            out.append({
+                "interaction": a.get("interaction") or "liked",
+                "title":       title[:400],
+                "link":        a.get("link", ""),
+            })
+        return out
+
+    # ── Posts — author's own posts (strongest intent signals) ────────────────────
+    def _clean_posts(items):
+        out = []
+        for p in (items or [])[:30]:
+            text = (p.get("text") or p.get("content") or p.get("title") or "").strip()
+            if not text:
+                continue
+            out.append({
+                "text":        text[:600],
+                "likes":       p.get("num_likes") or p.get("likes", 0),
+                "comments":    p.get("num_comments") or p.get("comments", 0),
+                "posted_at":   p.get("posted_at") or p.get("date", ""),
+            })
+        return out
+
+    # ── Education — full details ──────────────────────────────────────────────────
+    def _clean_edu(items):
+        out = []
+        for e in (items or []):
+            if isinstance(e, dict):
+                out.append({
+                    "school":       e.get("title") or e.get("school") or e.get("name", ""),
+                    "degree":       e.get("subtitle") or e.get("degree", ""),
+                    "field":        e.get("field_of_study") or e.get("field", ""),
+                    "dates":        f"{e.get('start_year','')}-{e.get('end_year','')}".strip("-"),
+                    "description":  (e.get("description") or "")[:300],
+                })
+        return out
+
+    # ── Recommendations — full text, higher cap ────────────────────────────────────
+    def _clean_recs(items):
+        out = []
+        for r in (items or []):
+            if isinstance(r, str):
+                text = r
+            else:
+                text = r.get("description") or r.get("text") or r.get("title") or ""
+            if text:
+                out.append(str(text)[:600])
+        return out
+
+    # ── Volunteer work ────────────────────────────────────────────────────────────
+    def _clean_volunteer(items):
+        out = []
+        for v in (items or []):
+            if isinstance(v, dict):
+                out.append({
+                    "role":        v.get("role") or v.get("title", ""),
+                    "org":         v.get("organization") or v.get("company", ""),
+                    "cause":       v.get("cause", ""),
+                    "description": (v.get("description") or "")[:300],
+                })
+        return out
+
+    # ── Current company — clean, no logo URLs ────────────────────────────────────
+    def _clean_company(co: dict) -> dict:
+        if not co:
+            return {}
+        return {
+            "name":        co.get("name", ""),
+            "industry":    co.get("industry", ""),
+            "size":        co.get("company_size") or co.get("size", ""),
+            "founded":     co.get("founded", ""),
+            "website":     co.get("website", ""),
+            "description": (co.get("description") or "")[:500],
+            "specialties": co.get("specialities") or co.get("specialties", []),
+        }
+
+    # ── Build maximally signal-dense profile ──────────────────────────────────────
+    _current_co = profile.get("current_company") or {}
+    return {
+        "name":            profile.get("name", ""),
+        "first_name":      profile.get("first_name", ""),
+        "last_name":       profile.get("last_name", ""),
+        "headline":        profile.get("headline") or profile.get("position") or profile.get("title", ""),
+        "location":        profile.get("location") or profile.get("city", ""),
+        "country":         profile.get("country_code", ""),
+        "linkedin_url":    profile.get("url") or profile.get("input_url", ""),
+        "about":           profile.get("about") or "",   # full bio — primary intent signal
+        "followers":       profile.get("followers", 0),
+        "connections":     profile.get("connections", 0),
+        "current_company": _clean_company(_current_co),
+        "experience":      _clean_exp(profile.get("experience")),
+        "education":       _clean_edu(profile.get("education") or []),
+        "skills":          [
+            (s.get("name") if isinstance(s, dict) else s)
+            for s in (profile.get("skills") or [])
+        ][:40],
+        "certifications":  [
+            (c.get("title") or str(c))[:120]
+            for c in (profile.get("certifications") or [])
+        ][:15],
+        "honors_awards":   profile.get("honors_and_awards") or None,
+        "languages": [
+            {"lang": (l.get("title") or l.get("name") or str(l)), "level": l.get("subtitle", "")}
+            if isinstance(l, dict) else {"lang": str(l)}
+            for l in (profile.get("languages") or [])
+        ],
+        "groups": [
+            g.get("name") or g.get("title") or str(g)
+            for g in (profile.get("groups") or [])
+        ][:20],
+        "volunteer":       _clean_volunteer(profile.get("volunteer_experience") or profile.get("volunteer") or []),
+        "recommendations": _clean_recs(profile.get("recommendations")),
+        "posts":           _clean_posts(profile.get("posts") or profile.get("recent_posts") or []),
+        "activity":        _clean_activity(profile.get("activity")),
+    }
 
 
 def _rule_based_enrichment(
@@ -6277,4 +6447,91 @@ async def regenerate_company_for_lead(lead_id: str) -> Optional[dict]:
             tags_json, culture_json, pitch_json, lead_id,
         )
 
+    return await get_lead(lead_id)
+
+
+async def regenerate_crm_brief_for_lead(lead_id: str, org_id: str = "") -> Optional[dict]:
+    """
+    Re-run the CRM brief LLM call for an already-enriched lead.
+    Reads raw_profile from DB, uses lio_system_prompt + lio_model from
+    workspace_configs, saves updated crm_brief back to enriched_leads.
+    org_id is taken from the JWT (passed by the route) and falls back to
+    the lead's stored organization_id so the right config is always loaded.
+    """
+    import re as _re
+    from enrichment_config_service import get_workspace_config
+
+    lead = await get_lead(lead_id)
+    if not lead:
+        return None
+
+    # Prefer org_id from JWT (request), fall back to what's stored on the lead
+    org_id = org_id or lead.get("organization_id") or "default"
+
+    # Read raw_profile from DB
+    raw_profile_raw = lead.get("raw_profile")
+    if not raw_profile_raw:
+        raise RuntimeError("No raw_profile found for this lead — cannot regenerate CRM brief.")
+    try:
+        profile = json.loads(raw_profile_raw) if isinstance(raw_profile_raw, str) else raw_profile_raw
+    except Exception:
+        profile = {}
+
+    # Read config from workspace_configs
+    try:
+        cfg = await get_workspace_config(org_id)
+        model_override   = cfg.get("lio_model", "").strip() or None
+        crm_brief_prompt = cfg.get("lio_system_prompt", "").strip()
+    except Exception:
+        model_override   = None
+        crm_brief_prompt = ""
+
+    if not crm_brief_prompt:
+        crm_brief_prompt = _DEFAULT_CRM_BRIEF_PROMPT
+
+    # Build optimized, noise-free profile for the LLM
+    optimized = _build_llm_profile(profile)
+    optimized_str = json.dumps(optimized, separators=(",", ":"), ensure_ascii=False, default=str)
+    logger.info(
+        "[RegenerateCrmBrief] Optimized profile: %d chars (raw was %d chars) ~%d tokens",
+        len(optimized_str), len(json.dumps(profile, default=str)), len(optimized_str) // 4,
+    )
+
+    brief = await _call_llm([
+        {"role": "system", "content": crm_brief_prompt},
+        {"role": "user",   "content": f"Analyze this LinkedIn prospect data and return the JSON exactly as specified:\n\n{optimized_str}"},
+    ], max_tokens=2500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override)
+
+    if not brief:
+        raise RuntimeError("LLM unavailable or returned no content.")
+
+    # Strip <think>...</think> blocks (qwen3, deepseek, etc.)
+    brief = _re.sub(r"<think>.*?</think>", "", brief, flags=_re.DOTALL)
+    brief = _re.sub(r"<think>.*", "", brief, flags=_re.DOTALL).strip()
+
+    # Extract first complete JSON object
+    _start = brief.find("{")
+    if _start != -1:
+        _depth, _end = 0, _start
+        for _i, _ch in enumerate(brief[_start:], _start):
+            if _ch == "{": _depth += 1
+            elif _ch == "}":
+                _depth -= 1
+                if _depth == 0:
+                    _end = _i
+                    break
+        brief = brief[_start:_end + 1]
+
+    try:
+        crm_brief_db = json.dumps(json.loads(brief), default=str)
+    except Exception:
+        crm_brief_db = brief
+
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            "UPDATE enriched_leads SET crm_brief=$1 WHERE id=$2",
+            crm_brief_db, lead_id,
+        )
+
+    logger.info("[RegenerateCrmBrief] Updated crm_brief for lead=%s (%d chars)", lead_id, len(crm_brief_db))
     return await get_lead(lead_id)

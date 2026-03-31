@@ -1364,6 +1364,25 @@ async def regenerate_company(lead_id: str):
     return {"success": True, "lead": _format_lead(result, full=True)}
 
 
+@router.post("/{lead_id}/crm-brief", include_in_schema=False)
+async def regenerate_crm_brief(lead_id: str, request: Request):
+    """
+    Re-run the CRM brief LLM call for an already-enriched lead.
+    Uses raw_profile from DB + lio_system_prompt + lio_model from workspace_configs.
+    """
+    org_id = _get_org_id(request)
+    try:
+        result = await svc.regenerate_crm_brief_for_lead(lead_id, org_id=org_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        logger.error("[RegenerateCrmBrief] Unexpected error for lead=%s: %s", lead_id, exc)
+        raise HTTPException(status_code=500, detail=f"Regeneration failed: {exc}")
+    if not result:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return {"success": True, "lead": _format_lead(result, full=True)}
+
+
 @router.delete("/{lead_id}", include_in_schema=False)
 async def delete_lead(lead_id: str, request: Request, background_tasks: BackgroundTasks):
     """Delete an enriched lead record."""
