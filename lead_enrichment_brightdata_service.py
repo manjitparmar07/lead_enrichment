@@ -3687,19 +3687,18 @@ async def build_comprehensive_enrichment(
 
     prompt = _build_comprehensive_prompt(linkedin_url, profile, contact, now, website_intel=website_intel)
 
-    # Read system prompt + model from LIO config; fall back to hardcoded defaults
+    # Main JSON enrichment always uses a JSON-focused system prompt — never overridden.
+    # (The user prompt already hardcodes "Return ONLY a valid JSON object" so the system
+    #  prompt must stay JSON-oriented or the schema parse fails.)
     _DEFAULT_SYSTEM = "Expert B2B lead intelligence analyst. Return ONLY valid JSON."
+
     try:
         cfg = await get_workspace_config(org_id)
-        system_prompt = cfg.get("lio_system_prompt", "").strip() or _DEFAULT_SYSTEM
-        model_override = cfg.get("lio_model", "").strip() or None
+        model_override  = cfg.get("lio_model", "").strip() or None
+        crm_brief_prompt = cfg.get("lio_system_prompt", "").strip()  # used for CRM brief, not JSON enrichment
     except Exception:
-        system_prompt  = _DEFAULT_SYSTEM
-        model_override = None
-
-    # Caller-supplied system prompt takes priority over config
-    if system_prompt_override and system_prompt_override.strip():
-        system_prompt = system_prompt_override.strip()
+        model_override   = None
+        crm_brief_prompt = ""
 
     try:
         scoring_cfg = await get_scoring_config(org_id)
@@ -3707,14 +3706,14 @@ async def build_comprehensive_enrichment(
         scoring_cfg = None
 
     logger.debug(
-        "[Enrichment] org=%s  system_prompt_source=%s  model=%s",
+        "[Enrichment] org=%s  crm_brief_prompt=%s  model=%s",
         org_id,
-        "config" if system_prompt != _DEFAULT_SYSTEM else "default",
+        "custom" if crm_brief_prompt else "none",
         model_override or "default",
     )
 
     raw = await _call_llm([
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": _DEFAULT_SYSTEM},
         {"role": "user",   "content": prompt},
     ], max_tokens=2200, temperature=0.25, model_override=model_override)
 
@@ -3722,6 +3721,39 @@ async def build_comprehensive_enrichment(
         data = _parse_json_from_llm(raw)
         if data and ("person_profile" in data or "identity" in data):
             logger.info("[Enrichment] LLM produced comprehensive 8-stage report")
+
+            # ── CRM Brief — second LLM call using the custom system prompt ────
+            # Only fires when a custom prompt is saved in LIO Config.
+            effective_crm_prompt = system_prompt_override.strip() if (system_prompt_override and system_prompt_override.strip()) else crm_brief_prompt
+            if effective_crm_prompt:
+                try:
+                    linkedin_snapshot = json.dumps({
+                        "name":         data.get("person_profile", {}).get("full_name", ""),
+                        "title":        data.get("person_profile", {}).get("current_title", ""),
+                        "company":      data.get("company_identity", {}).get("name", ""),
+                        "location":     data.get("person_profile", {}).get("city", ""),
+                        "linkedin_url": linkedin_url,
+                        "followers":    data.get("person_profile", {}).get("followers", 0),
+                        "about":        data.get("person_profile", {}).get("about", ""),
+                        "skills":       data.get("person_profile", {}).get("top_skills", []),
+                        "experience":   (profile.get("experience") or [])[:5],
+                        "education":    (profile.get("education") or [])[:3],
+                        "activity":     data.get("online_presence", {}),
+                        "intent":       data.get("intent_signals", {}),
+                        "scores":       data.get("scoring", {}),
+                        "outreach":     data.get("outreach", {}),
+                    }, default=str)
+                    crm_brief_user = f"Analyze this LinkedIn prospect data and produce the CRM brief:\n\n{linkedin_snapshot}"
+                    brief = await _call_llm([
+                        {"role": "system", "content": effective_crm_prompt},
+                        {"role": "user",   "content": crm_brief_user},
+                    ], max_tokens=2000, temperature=0.4, model_override=model_override)
+                    if brief:
+                        data["crm_brief"] = brief
+                        logger.info("[Enrichment] CRM brief generated (%d chars)", len(brief))
+                except Exception as _be:
+                    logger.warning("[Enrichment] CRM brief failed: %s", _be)
+
             return data
 
     logger.warning("[Enrichment] LLM unavailable or unusable — using rule-based fallback")
