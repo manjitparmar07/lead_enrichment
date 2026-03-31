@@ -5508,15 +5508,24 @@ async def enrich_bulk(
     status = "pending"
     error_msg = None
 
-    # Only trigger BD batch when webhook delivery is configured
+    # Auto-build webhook URL from APP_URL if caller did not supply one
+    if not webhook_url:
+        app_url = os.getenv("APP_URL", "").rstrip("/")
+        if app_url:
+            webhook_url = f"{app_url}/api/leads/webhook/brightdata?job_id={job_id}"
+            notify_url  = notify_url or f"{app_url}/api/leads/webhook/notify?job_id={job_id}"
+            logger.info("[BulkEnrich] Auto-webhook: %s", webhook_url)
+
+    # Trigger BrightData batch when API key + webhook URL are both available
     if _bd_api_key() and webhook_url:
         try:
             snapshot_id = await trigger_batch_snapshot(urls, webhook_url, notify_url, webhook_auth)
             status = "running"
             logger.info("[BulkEnrich] BD batch triggered: %s (webhook=%s)", snapshot_id, webhook_url)
         except Exception as e:
-            logger.error("[BulkEnrich] BD trigger failed: %s — falling back to sequential", e)
+            logger.error("[BulkEnrich] BD trigger failed: %s — falling back to queue", e)
             error_msg = str(e)
+            webhook_url = None  # fall through to Redis queue path
 
     job = {
         "id": job_id, "snapshot_id": snapshot_id,
