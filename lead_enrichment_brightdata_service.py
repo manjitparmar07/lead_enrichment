@@ -6007,6 +6007,23 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
         return None
     try:
         url = _normalize_linkedin_url(_clean_bd_linkedin_url(raw_url))
+
+        # ── Retry if BrightData returned empty/partial profile (no name/title/company) ──
+        # Up to 3 re-scrape attempts with 5s back-off before giving up.
+        _has_data = lambda p: bool(p.get("name") or p.get("full_name") or p.get("position") or p.get("current_company_name"))
+        if not _has_data(profile):
+            for _attempt in range(1, 4):
+                logger.warning("[Pipeline] Empty BD profile for %s — retry %d/3", url, _attempt)
+                await asyncio.sleep(5 * _attempt)
+                retried = await fetch_profile_sync(url)
+                if retried and not retried.get("_bd_error") and _has_data(retried):
+                    profile = retried
+                    logger.info("[Pipeline] Retry %d succeeded for %s", _attempt, url)
+                    break
+            else:
+                logger.error("[Pipeline] All 3 retries returned empty profile for %s — skipping", url)
+                return None
+
         name = profile.get("name", "")
         first, last = _parse_name(name)
         company = profile.get("current_company_name", "")
@@ -6330,13 +6347,14 @@ async def process_webhook_profiles(
             logger.debug("[Webhook] sub_job update failed: %s", e)
 
     # Atomic job progress update — avoids race condition when multiple webhook
-    # calls arrive simultaneously (BrightData sends partial batches)
+    # calls arrive simultaneously (BrightData sends partial batches).
+    # Cap increments so processed+failed never exceeds total_urls (prevents >100% progress).
     if job_id:
         async with get_pool().acquire() as conn:
             row = await conn.fetchrow(
                 """UPDATE enrichment_jobs
-                      SET processed   = processed + $1,
-                          failed      = failed + $2,
+                      SET processed   = LEAST(processed + $1, total_urls),
+                          failed      = LEAST(failed + $2,    GREATEST(total_urls - LEAST(processed + $1, total_urls), 0)),
                           updated_at  = $3
                     WHERE id = $4
                 RETURNING processed, failed, total_urls, organization_id, status""",
