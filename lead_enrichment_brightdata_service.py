@@ -1292,6 +1292,32 @@ def _normalize_linkedin_url(url: str) -> str:
     return url
 
 
+def _clean_bd_linkedin_url(url: str) -> str:
+    """
+    Normalise a LinkedIn URL returned by BrightData to a canonical form.
+
+    Handles every known BrightData variant so the URL always matches the
+    lead_id key (MD5 of the lowercase normalised input URL):
+      - Country-specific domains  mx./in./nl./de./… → www.linkedin.com
+      - Mixed-case paths          Sumit-Singh → sumit-singh
+      - Tracking query params     ?trk=… / ?originalSubdomain=… stripped
+      - Trailing slashes          removed
+    """
+    if not url or not isinstance(url, str):
+        return url or ""
+    url = url.strip()
+    # Strip tracking / query params from LinkedIn URLs only
+    if "linkedin.com/" in url.lower():
+        url = url.split("?")[0]
+    # Normalise country-specific subdomains → www.linkedin.com
+    url = re.sub(r"https?://[a-z]{2}\.linkedin\.com", "https://www.linkedin.com", url, flags=re.IGNORECASE)
+    # Remove trailing slash
+    url = url.rstrip("/")
+    # Lowercase entire URL (LinkedIn paths are case-insensitive)
+    url = url.lower()
+    return url
+
+
 def _normalize_bd_profile(raw: dict) -> dict:
     """
     Normalize a raw Bright Data person profile response to the flat dict
@@ -1343,10 +1369,10 @@ def _normalize_bd_profile(raw: dict) -> dict:
                     or first_exp.get("linkedin_url") or first_exp.get("company_linkedin_url") or ""
                 )
                 if exp_url and "linkedin.com/company/" in exp_url:
-                    p["current_company_link"] = exp_url
+                    p["current_company_link"] = _clean_bd_linkedin_url(exp_url)
                     co_id = ""  # already set
         if co_id and not p.get("current_company_link"):
-            p["current_company_link"] = f"https://www.linkedin.com/company/{co_id}/"
+            p["current_company_link"] = f"https://www.linkedin.com/company/{co_id.lower()}/"
 
     # ── Avatar / profile photo ────────────────────────────────────────────────
     # BD returns "avatar" at top level; service uses "avatar_url"
@@ -1767,14 +1793,19 @@ def _normalize_bd_profile(raw: dict) -> dict:
     if not p.get("country"):
         p["country"] = p.get("country_code", "")
 
-    # ── LinkedIn profile URL normalization ────────────────────────────────────
-    # BD may return locale-prefixed URLs: nl.linkedin.com, in.linkedin.com
-    # Normalise to www.linkedin.com for downstream use
-    for url_field in ("url", "input_url"):
+    # ── LinkedIn URL normalization (all URL fields from BD response) ──────────
+    # Applies _clean_bd_linkedin_url to every field that may carry a LinkedIn
+    # URL so that country domains, mixed-case paths, and tracking params are
+    # all normalised consistently — regardless of which BD dataset version
+    # returned the response.
+    for url_field in ("url", "input_url", "linkedin_url"):
         v = p.get(url_field) or ""
-        if v:
-            v = re.sub(r"https?://[a-z]{2}\.linkedin\.com", "https://www.linkedin.com", v)
-            p[url_field] = v
+        if v and "linkedin.com" in v.lower():
+            p[url_field] = _clean_bd_linkedin_url(v)
+
+    # Also clean the company link (may carry ?trk=… from profile topcard)
+    if p.get("current_company_link") and "linkedin.com" in p["current_company_link"].lower():
+        p["current_company_link"] = _clean_bd_linkedin_url(p["current_company_link"])
 
     return p
 
@@ -2579,6 +2610,14 @@ def _normalize_bd_company(c: dict) -> dict:
     tw = c.get("twitter") or c.get("twitter_url")
     if tw:
         result["company_twitter"] = str(tw)
+
+    # ── Normalise any LinkedIn URLs in the result ─────────────────────────────
+    # BD company responses may carry country-prefixed or mixed-case LinkedIn
+    # URLs in linkedin_url / url fields — clean them for consistency.
+    for url_field in ("linkedin_url", "company_linkedin", "url"):
+        v = c.get(url_field) or ""
+        if v and "linkedin.com" in v.lower():
+            result[url_field] = _clean_bd_linkedin_url(v)
 
     return result
 
@@ -5630,12 +5669,15 @@ async def _process_fallback_batch(job_id: str, urls: list[str]) -> None:
 async def process_webhook_profiles(profiles: list[dict], job_id: Optional[str] = None) -> dict:
     processed = failed = 0
     for profile in profiles:
-        url = profile.get("input_url") or profile.get("url") or profile.get("linkedin_url")
-        if not url:
+        # Prefer input_url (canonical) → url (BD's returned URL) → linkedin_url
+        # Apply _clean_bd_linkedin_url to handle country domains, mixed case,
+        # and tracking params that BD may embed in any of these fields.
+        raw_url = profile.get("input_url") or profile.get("url") or profile.get("linkedin_url")
+        if not raw_url:
             failed += 1
             continue
         try:
-            url = _normalize_linkedin_url(url)
+            url = _normalize_linkedin_url(_clean_bd_linkedin_url(raw_url))
             name = profile.get("name", "")
             first, last = _parse_name(name)
             company = profile.get("current_company_name", "")
