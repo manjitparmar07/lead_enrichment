@@ -798,27 +798,61 @@ async def prompt_tags(raw: dict) -> str:
 
 
 async def prompt_outreach(raw: dict) -> str:
+    # Extract tenant company context from scraped data
+    tenant_name     = raw.get("company_name") or ""
+    tenant_desc     = raw.get("company_description") or ""
+    tenant_industry = raw.get("industry") or ""
+    tenant_services = raw.get("services") or raw.get("specialties") or []
+    tenant_audience = raw.get("target_audience") or ""
+
+    tenant_context = (
+        f"SENDER COMPANY (the tenant whose SDR will send this outreach):\n"
+        f"- Company name: {tenant_name}\n"
+        f"- What they do: {tenant_desc}\n"
+        f"- Industry: {tenant_industry}\n"
+        f"- All services they offer: {', '.join(tenant_services)}\n"
+        f"- Target audience: {tenant_audience}\n"
+    )
+
     system = (
-        "You are a B2B outreach copywriter who specialises in cold email and LinkedIn messaging. "
-        "Your job is to craft hyper-personalised outreach that gets replies. "
-        "Produce: "
-        "1. Email subject line — curiosity-driven, under 8 words, no spam triggers. "
-        "2. Cold email — 3 short paragraphs, under 150 words total: "
-        "   Para 1: specific observation about them or their company (not generic flattery). "
-        "   Para 2: one relevant problem we solve + one concrete outcome (with number if possible). "
-        "   Para 3: low-friction CTA (not 'book a demo'). "
-        "3. LinkedIn connection note — under 300 chars, conversational, no pitch. "
-        "4. Best channel: Email / LinkedIn / Phone. "
-        "5. Best send time (day + time in their timezone). "
-        "6. Primary angle: Pain-based / Insight / Trigger event / Mutual connection. "
-        "Never use buzzwords like 'synergy', 'game-changer', 'innovative solution'. "
+        "You are a senior B2B sales strategist and cold outreach copywriter. "
+        "Your job is to write a SYSTEM PROMPT that will be used at runtime to generate personalised cold outreach "
+        "FROM the sender company TO a specific B2B lead whose profile will be provided at runtime.\n\n"
+        "RULES for the system prompt you write:\n"
+        "1. Open with: 'You are an SDR at [Sender Company Name]. We help [one-line: who they serve + what outcome they deliver].'\n"
+        "2. From the sender's service list, instruct the AI to pick ONLY the ONE service most relevant to the lead's "
+        "role, industry, and pain — mention ONLY that service in the email body. Never list all services.\n"
+        "3. Instruct the AI to always mention [Sender Company Name] by name in Para 2 — never use 'we' before introducing who 'we' is.\n"
+        "4. Instruct the AI to write a cold email — 3 tight paragraphs, under 150 words total:\n"
+        "   Para 1 — SPECIFIC HOOK (not generic): Reference what the lead's company actually DOES or a real signal "
+        "from their career/role (e.g. 'You're building X at Y' or 'After your move from Z to Y'). "
+        "Name the real challenge that comes with their stage — not 'managing growth is hard'. "
+        "This paragraph must NOT be something that could apply to any CEO. Make it specific to THIS lead.\n"
+        "   Para 2 — SENDER BRIDGE: Mention [Sender Company Name] by name. State the ONE relevant service. "
+        "Connect it directly to the lead's specific stage or pain. State ONE concrete outcome — "
+        "not 'save time' or 'boost efficiency', but a real business result (e.g. 'handle 10x clients without adding headcount').\n"
+        "   Para 3 — DISCOVERY CTA: Ask a single smart question that reveals the lead's current approach or situation. "
+        "It must be tied to their specific context — not 'what's your biggest challenge?'. "
+        "The question should feel like it came from someone who already understands their world.\n"
+        "5. Instruct the AI to write a LinkedIn note — under 300 chars, references something specific about the lead, "
+        "conversational tone, zero pitch, sounds human.\n"
+        "6. Instruct the AI to determine: best channel (Email/LinkedIn/Phone), best send time in lead's timezone, "
+        "and primary outreach angle (Pain-based/Trigger/Insight).\n"
+        "7. Instruct the AI to NEVER use: 'I noticed', 'I hope this finds you well', 'reaching out because', "
+        "'managing growth can be challenging', 'automate manual work', 'one outcome is', "
+        "'synergy', 'game-changer', 'innovative solution', or any phrase that sounds AI-generated.\n"
+        "8. Instruct the AI to return ONLY a valid JSON object — no markdown, no explanation — with this schema:\n"
+        "{\"cold_email\": {\"subject\": \"...\", \"body\": \"...\"}, "
+        "\"linkedin_note\": \"...\", \"best_channel\": \"...\", \"best_time\": \"...\", \"outreach_angle\": \"...\"}\n\n"
         "Output ONLY the system prompt text — no preamble, no explanation, no markdown fences."
     )
     user = (
-        "Using the profile data below, write a system prompt that instructs an AI copywriter to generate "
-        "outreach for this specific lead. Embed their name, company, role, and the strongest signal from "
-        "their data so every piece of copy references something real about them.\n\n"
-        f"Profile data:\n{_compact(raw)}"
+        f"{tenant_context}\n"
+        "Write the system prompt for this sender company. It will be injected at runtime alongside the lead's full profile.\n"
+        "The system prompt must be so specific and precise that it is IMPOSSIBLE for the AI to write a generic cold email. "
+        "Every instruction must force the AI to anchor copy in the lead's real data and the sender's actual capability — "
+        "not describe what good outreach looks like in theory.\n\n"
+        f"Full scraped company profile for reference:\n{_compact(raw)}"
     )
     return await _call_llm_generate(system, user)
 

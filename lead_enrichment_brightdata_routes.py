@@ -1439,6 +1439,129 @@ def _get_full_data(lead: dict) -> dict:
     return _parse_json_field(lead, "full_data", {})
 
 
+def _build_outreach_lead_ctx(lead: dict) -> str:
+    """
+    Build a structured, signal-rich lead context string for the outreach LLM call.
+    Works generically for any lead — DB row or inline lead_data.
+    Only includes fields that have actual values, so the LLM sees real signals
+    not empty placeholders.
+    """
+    sections: list[str] = []
+
+    # ── Identity ──────────────────────────────────────────────────────────────
+    identity_parts = []
+    if lead.get("name"):         identity_parts.append(f"Name: {lead['name']}")
+    if lead.get("title"):        identity_parts.append(f"Title: {lead['title']}")
+    if lead.get("company"):      identity_parts.append(f"Company: {lead['company']}")
+    if lead.get("seniority_level"): identity_parts.append(f"Seniority: {lead['seniority_level']}")
+    if lead.get("location"):     identity_parts.append(f"Location: {lead['location']}")
+    elif lead.get("city") or lead.get("country"):
+        identity_parts.append(f"Location: {', '.join(filter(None, [lead.get('city',''), lead.get('country','')]))}")
+    if lead.get("followers"):    identity_parts.append(f"Followers: {lead['followers']}")
+    if lead.get("connections"):  identity_parts.append(f"Connections: {lead['connections']}")
+    if identity_parts:
+        sections.append("## Lead Identity\n" + " | ".join(identity_parts))
+
+    # ── About ─────────────────────────────────────────────────────────────────
+    about = str(lead.get("about") or "").strip()
+    if about:
+        sections.append(f"## About\n{about[:400]}")
+
+    # ── Career History ────────────────────────────────────────────────────────
+    career = lead.get("career_history") or []
+    if career:
+        career_lines = [
+            f"- {c.get('title','')} at {c.get('company','')}"
+            for c in career[:4] if c.get("title") or c.get("company")
+        ]
+        if career_lines:
+            sections.append("## Career History\n" + "\n".join(career_lines))
+
+    # ── Scores & Signals ──────────────────────────────────────────────────────
+    signal_parts = []
+    if lead.get("score_tier"):   signal_parts.append(f"Score tier: {lead['score_tier']}")
+    if lead.get("lead_score"):   signal_parts.append(f"Score: {lead['lead_score']}")
+    if lead.get("warm_signal") and str(lead["warm_signal"]).lower() not in ("none", "no warm signal detected", "false", ""):
+        signal_parts.append(f"Warm signal: {lead['warm_signal']}")
+    if lead.get("industry"):     signal_parts.append(f"Industry: {lead['industry']}")
+    tags = lead.get("tags") or []
+    if tags:                     signal_parts.append(f"Tags: {', '.join(tags)}")
+    if signal_parts:
+        sections.append("## Signals\n" + " | ".join(signal_parts))
+
+    # ── Behavioural Context ───────────────────────────────────────────────────
+    behaviour_parts = []
+    if lead.get("engages_with"):       behaviour_parts.append(f"Engages with: {lead['engages_with']}")
+    if lead.get("decision_pattern"):   behaviour_parts.append(f"Decision pattern: {lead['decision_pattern']}")
+    if lead.get("communication_style"): behaviour_parts.append(f"Communication style: {lead['communication_style']}")
+    # Also try pulling from behavioural_signals dict if present
+    bs = lead.get("behavioural_signals") or {}
+    if isinstance(bs, str):
+        try: bs = json.loads(bs)
+        except Exception: bs = {}
+    if isinstance(bs, dict):
+        if not lead.get("engages_with") and bs.get("engages_with"):
+            behaviour_parts.append(f"Engages with: {bs['engages_with']}")
+        if not lead.get("decision_pattern") and bs.get("decision_pattern"):
+            behaviour_parts.append(f"Decision pattern: {bs['decision_pattern']}")
+        if bs.get("pain_point_hint"):
+            behaviour_parts.append(f"Pain hint: {bs['pain_point_hint']}")
+    if behaviour_parts:
+        sections.append("## Behavioural Context\n" + " | ".join(behaviour_parts))
+
+    # ── Pitch Intelligence ────────────────────────────────────────────────────
+    pitch = lead.get("pitch_intelligence") or {}
+    if isinstance(pitch, str):
+        # Could be a pre-formatted string (from _lead_from_ai_information) or raw JSON
+        try: pitch = json.loads(pitch)
+        except Exception:
+            if pitch.strip():
+                sections.append(f"## Pitch Intelligence\n{pitch[:500]}")
+            pitch = {}
+    if isinstance(pitch, dict) and pitch:
+        pitch_parts = []
+        if pitch.get("best_angle"):        pitch_parts.append(f"Best angle: {pitch['best_angle']}")
+        if pitch.get("top_pain_point"):    pitch_parts.append(f"Top pain: {pitch['top_pain_point']}")
+        if pitch.get("best_value_prop"):   pitch_parts.append(f"Value prop: {pitch['best_value_prop']}")
+        if pitch.get("suggested_cta"):     pitch_parts.append(f"Suggested CTA: {pitch['suggested_cta']}")
+        if pitch.get("do_not_pitch"):
+            dnp = pitch["do_not_pitch"]
+            pitch_parts.append(f"Do NOT pitch: {', '.join(dnp) if isinstance(dnp, list) else dnp}")
+        if pitch_parts:
+            sections.append("## Pitch Intelligence\n" + " | ".join(pitch_parts))
+
+    # ── Real LinkedIn Posts ───────────────────────────────────────────────────
+    # Pull from whichever field has data — DB leads use linkedin_posts, inline leads use activity_feed
+    raw_posts = None
+    for field in ("linkedin_posts", "activity_feed"):
+        val = lead.get(field)
+        if val and str(val).strip() not in ("null", "[]", "{}"):
+            try:
+                parsed = json.loads(val) if isinstance(val, str) else val
+                if isinstance(parsed, list) and parsed:
+                    raw_posts = parsed
+                    break
+            except Exception:
+                pass
+
+    if raw_posts:
+        post_lines = []
+        for p in raw_posts[:4]:  # top 4 posts max
+            if not isinstance(p, dict):
+                continue
+            text = (p.get("text") or p.get("title") or p.get("content") or "").strip()
+            date = p.get("date") or p.get("published_at") or ""
+            likes = p.get("likes") or p.get("num_likes") or ""
+            if text:
+                snippet = text[:200] + ("..." if len(text) > 200 else "")
+                meta = " | ".join(filter(None, [date[:10] if date else "", f"{likes} likes" if likes else ""]))
+                post_lines.append(f'- "{snippet}"' + (f" ({meta})" if meta else ""))
+        if post_lines:
+            sections.append("## Recent LinkedIn Posts (real signals — use these)\n" + "\n".join(post_lines))
+
+    return "\n\n".join(sections)
+
+
 def _lead_from_ai_information(data: dict) -> dict:
     """
     Map a full ai_information payload (as returned by the enrichment API)
@@ -1464,6 +1587,10 @@ def _lead_from_ai_information(data: dict) -> dict:
     activity_summary = "; ".join(
         item.get("title", "")[:120] for item in feed[:5] if item.get("title")
     )
+
+    # Map posts from activity object — preserves real post text for LLM
+    posts_raw = activity.get("posts") or activity.get("linkedin_posts") or []
+    linkedin_posts_json = json.dumps(posts_raw) if posts_raw else None
 
     # Pitch intelligence as a readable string
     pitch_str = (
@@ -1494,6 +1621,8 @@ def _lead_from_ai_information(data: dict) -> dict:
         "tags":              tags,
         "behavioural_signals": behaviour,
         "recent_activity":   activity_summary,
+        "linkedin_posts":    linkedin_posts_json,
+        "activity_feed":     json.dumps(feed[:10]) if feed else None,
         "email":             contact.get("work_email") or contact.get("email"),
         "seniority_level":   profile.get("seniority_level"),
         "decision_pattern":  behaviour.get("decision_pattern"),
@@ -1773,68 +1902,61 @@ async def outreach_enrichment(body: ViewOutreachRequest):
             raise HTTPException(404, f"Lead not found: {body.leadenrich_id}. Provide lead_data as a fallback.")
         lead = _lead_from_ai_information(body.lead_data)
 
-    full   = _get_full_data(lead)
-    outreach_data = full.get("outreach") or {}
+    # Default system prompt used when caller does not supply one
+    _DEFAULT_OUTREACH_SYSTEM = (
+        "You are a world-class B2B SDR. Write hyper-personalised cold outreach from the lead context provided.\n\n"
+        "STRICT OUTPUT RULES:\n"
+        "- Return ONLY a valid JSON object. No markdown, no explanation, no extra keys.\n"
+        "- Every key listed below is MANDATORY. Never omit a key.\n"
+        "Return JSON: {\"cold_email\": {\"subject\": \"...\", \"body\": \"...\"}, "
+        "\"linkedin_note\": \"...\", \"best_channel\": \"...\", \"best_time\": \"...\", \"outreach_angle\": \"...\"}"
+    )
 
-    # Return stored DB values — LLM is only called on POST /{lead_id}/outreach (Regenerate)
-    _stored_body = lead.get("cold_email") or outreach_data.get("cold_email") or ""
-    cold_email_block = {
-        "subject":    lead.get("email_subject") or outreach_data.get("email_subject") or "",
-        "greeting":   "",
-        "opening":    "",
-        "body":       _stored_body,
-        "cta":        "",
-        "sign_off":   "",
-        "full_email": _stored_body,
-    }
-    linkedin_note_val = lead.get("linkedin_note") or outreach_data.get("linkedin_note") or ""
-    follow_up_block   = {"day3": "", "day7": ""}
+    system_prompt = body.system_prompt or _DEFAULT_OUTREACH_SYSTEM
 
-    # AI-generated outreach if system_prompt provided
+    # Always call LLM to generate fresh outreach
     ai_outreach = None
-    if body.system_prompt and lead.get("name"):
-        # If system_prompt already has completed copy, extract it directly (no LLM call needed)
-        ai_outreach = _extract_outreach_from_prompt(body.system_prompt)
-        if not ai_outreach:
-            # Pure instructions prompt — call LLM with rich lead context
-            try:
-                career = "; ".join(
-                    f"{c.get('title')} at {c.get('company')}"
-                    for c in (lead.get("career_history") or [])[:3]
-                    if c.get("title")
-                )
-                lead_ctx = (
-                    f"Name: {lead.get('name')} | Title: {lead.get('title','')} | "
-                    f"Company: {lead.get('company','')} | Seniority: {lead.get('seniority_level','')} | "
-                    f"Industry/Tags: {lead.get('industry','')} {', '.join(lead.get('tags') or [])} | "
-                    f"Location: {lead.get('location','')} | Score: {lead.get('lead_score','')} ({lead.get('score_tier','')}) | "
-                    f"Followers: {lead.get('followers','')} | Connections: {lead.get('connections','')} | "
-                    f"Warm signal: {lead.get('warm_signal','')} | "
-                    f"Engages with: {lead.get('engages_with','')} | "
-                    f"Decision pattern: {lead.get('decision_pattern','')} | "
-                    f"Communication style: {lead.get('communication_style','')} | "
-                    f"Pitch: {lead.get('pitch_intelligence','')} | "
-                    f"Recent activity: {lead.get('recent_activity','')} | "
-                    f"Career: {career} | "
-                    f"About: {str(lead.get('about',''))[:300]}"
-                )
-                raw = await _quick_llm(
-                    body.system_prompt,
-                    f"Generate personalised B2B outreach for this lead.\n\n{lead_ctx}\n\n"
-                    "Return JSON: {{\"cold_email\": {{\"subject\": \"...\", \"body\": \"...\"}}, "
-                    "\"linkedin_note\": \"...\", \"best_channel\": \"...\", \"best_time\": \"...\", \"outreach_angle\": \"...\"}}",
-                    max_tokens=2000,
-                )
-                # _quick_llm returns raw string — parse JSON before dict access
-                try:
-                    cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-                    ai_outreach = json.loads(cleaned)
-                except Exception:
-                    ai_outreach = None
-            except Exception as _e:
-                logger.warning("[OutreachView] AI generation failed: %s", _e)
+    try:
+        lead_ctx = _build_outreach_lead_ctx(lead)
+        raw = await _quick_llm(
+            system_prompt,
+            f"Generate personalised B2B outreach for this lead.\n\n{lead_ctx}\n\n"
+            "Return ONLY a valid JSON object — no explanation, no markdown — with this exact schema: "
+            "{\"cold_email\": {\"subject\": \"...\", \"body\": \"...\"}, "
+            "\"linkedin_note\": \"...\", \"best_channel\": \"...\", \"best_time\": \"...\", \"outreach_angle\": \"...\"}",
+            max_tokens=2000,
+        )
+        try:
+            # Strip markdown fences if present
+            cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            # If LLM added text before/after the JSON block, extract the first {...} object
+            import re as _re
+            _match = _re.search(r'\{[\s\S]*\}', cleaned)
+            if _match:
+                cleaned = _match.group(0)
+            ai_outreach = json.loads(cleaned)
+        except Exception as _je:
+            logger.warning("[OutreachView] JSON parse failed: %s | raw=%s", _je, raw[:300])
+            ai_outreach = None
+    except Exception as _e:
+        logger.warning("[OutreachView] AI generation failed: %s", _e)
 
-    # When ai_outreach is available (system_prompt provided), override top-level fields
+    # Save generated outreach back to DB if lead has an ID
+    if ai_outreach and lead.get("id"):
+        ai_email = ai_outreach.get("cold_email") or {}
+        try:
+            async with _get_pool().acquire() as _conn:
+                await _conn.execute(
+                    "UPDATE enriched_leads SET email_subject=$1, cold_email=$2, linkedin_note=$3 WHERE id=$4",
+                    ai_email.get("subject", ""),
+                    ai_email.get("body", ""),
+                    ai_outreach.get("linkedin_note", ""),
+                    lead["id"],
+                )
+        except Exception as _e:
+            logger.warning("[OutreachView] DB update failed for lead=%s: %s", lead.get("id"), _e)
+
+    # Build response from generated outreach
     if ai_outreach:
         ai_email = ai_outreach.get("cold_email") or {}
         ai_body = ai_email.get("body", "")
@@ -1847,7 +1969,25 @@ async def outreach_enrichment(body: ViewOutreachRequest):
             "sign_off":   "",
             "full_email": ai_body,
         }
-        linkedin_note_val = ai_outreach.get("linkedin_note", linkedin_note_val)
+        linkedin_note_val = ai_outreach.get("linkedin_note", "")
+    else:
+        # LLM failed — fall back to stored DB values
+        full = _get_full_data(lead)
+        outreach_data = full.get("outreach") or {}
+        _stored_body = lead.get("cold_email") or outreach_data.get("cold_email") or ""
+        cold_email_block = {
+            "subject":    lead.get("email_subject") or outreach_data.get("email_subject") or "",
+            "greeting":   "",
+            "opening":    "",
+            "body":       _stored_body,
+            "cta":        "",
+            "sign_off":   "",
+            "full_email": _stored_body,
+        }
+        linkedin_note_val = lead.get("linkedin_note") or outreach_data.get("linkedin_note") or ""
+
+    full = _get_full_data(lead)
+    outreach_data = full.get("outreach") or {}
 
     return {
         "lead_id":      lead.get("id"),
@@ -1857,17 +1997,17 @@ async def outreach_enrichment(body: ViewOutreachRequest):
         "company":      lead.get("company"),
         "score_tier":   lead.get("score_tier"),
 
-        "cold_email":         cold_email_block,
-        "linkedin_note":      linkedin_note_val,
-        "follow_up":          follow_up_block,
+        "cold_email":     cold_email_block,
+        "linkedin_note":  linkedin_note_val,
+        "follow_up":      {"day3": "", "day7": ""},
 
-        "sequence":           _parse_json_field(lead, "outreach_sequence", {}),
-        "best_time":          (ai_outreach.get("best_time") if ai_outreach else None) or outreach_data.get("best_time") or lead.get("best_send_time"),
-        "best_channel":       (ai_outreach.get("best_channel") if ai_outreach else None) or lead.get("best_channel"),
-        "outreach_angle":     (ai_outreach.get("outreach_angle") if ai_outreach else None) or lead.get("outreach_angle"),
-        "warm_signal":        lead.get("warm_signal"),
+        "sequence":       _parse_json_field(lead, "outreach_sequence", {}),
+        "best_time":      (ai_outreach.get("best_time") if ai_outreach else None) or outreach_data.get("best_time") or lead.get("best_send_time"),
+        "best_channel":   (ai_outreach.get("best_channel") if ai_outreach else None) or lead.get("best_channel"),
+        "outreach_angle": (ai_outreach.get("outreach_angle") if ai_outreach else None) or lead.get("outreach_angle"),
+        "warm_signal":    lead.get("warm_signal"),
 
-        "ai_generated": {"outreach": ai_outreach} if ai_outreach else None,
+        "ai_generated":   {"outreach": ai_outreach} if ai_outreach else None,
     }
 
 
