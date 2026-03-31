@@ -5643,8 +5643,9 @@ async def enrich_bulk(
 
             async def _trigger_bd_chunk(idx: int, sjid: str, chunk: list) -> str:
                 if app_url:
+                    # BD sends full data to chunk_webhook — no need for notify (avoids double-processing)
                     chunk_webhook = f"{app_url}/api/leads/webhook/brightdata?job_id={job_id}&sub_job_id={sjid}"
-                    chunk_notify  = f"{app_url}/api/leads/webhook/notify?job_id={job_id}&sub_job_id={sjid}"
+                    chunk_notify  = None
                 elif webhook_url:
                     sep = "&" if "?" in webhook_url else "?"
                     chunk_webhook = f"{webhook_url}{sep}sub_job_id={sjid}"

@@ -1075,6 +1075,7 @@ async def webhook_notify(request: Request, background_tasks: BackgroundTasks):
     status = data.get("status") or data.get("state", "")
     snapshot_id = data.get("snapshot_id") or data.get("id")
     job_id = request.query_params.get("job_id")
+    sub_job_id = request.query_params.get("sub_job_id")
 
     if status == "ready" and snapshot_id:
         # ── Idempotency: skip already-processed snapshots ──────────────────────
@@ -1087,7 +1088,7 @@ async def webhook_notify(request: Request, background_tasks: BackgroundTasks):
         async def _download_and_process():
             try:
                 profiles = await svc.poll_snapshot(snapshot_id, interval=5, timeout=120)
-                await svc.process_webhook_profiles(profiles, job_id=job_id)
+                await svc.process_webhook_profiles(profiles, job_id=job_id, sub_job_id=sub_job_id)
                 if job_id:
                     await svc._update_job(job_id, status="completed")
             except Exception as e:
