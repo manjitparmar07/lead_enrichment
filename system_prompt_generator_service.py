@@ -676,83 +676,198 @@ async def prompt_contact(raw: dict) -> str:
 
 
 async def prompt_scores(raw: dict) -> str:
+    tenant_name     = raw.get("company_name") or ""
+    tenant_desc     = raw.get("company_description") or ""
+    tenant_industry = raw.get("industry") or ""
+    tenant_audience = raw.get("target_audience") or ""
+    tenant_services = ", ".join(raw.get("services") or raw.get("specialties") or [])
+
+    tenant_context = (
+        f"TENANT (the company doing the scoring):\n"
+        f"- Company: {tenant_name}\n"
+        f"- What they sell: {tenant_desc}\n"
+        f"- Industry: {tenant_industry}\n"
+        f"- Services: {tenant_services}\n"
+        f"- Their target audience: {tenant_audience}\n"
+    )
+
     system = (
         "You are a B2B lead scoring expert. "
-        "Your job is to score a prospect across four dimensions and explain your reasoning. "
-        "Scoring breakdown: ICP Fit (0–40) — role, seniority, company size, industry match; "
-        "Intent Score (0–30) — hiring activity, funding, job change, tech adoption signals; "
-        "Timing Score (0–20) — recency of signals, urgency indicators; "
-        "Engagement Score (0–10) — LinkedIn activity, content engagement, responsiveness signals. "
+        "Your job is to score a prospect across four dimensions specifically for the tenant company provided. "
+        "Scoring breakdown:\n"
+        "  ICP Fit (0–40) — how well the lead's role, seniority, company size, and industry matches "
+        "the TENANT'S target audience and services — not a generic ICP.\n"
+        "  Intent Score (0–30) — hiring activity, funding, job change, tech adoption signals relevant "
+        "to what the TENANT sells.\n"
+        "  Timing Score (0–20) — recency of signals that indicate NOW is a good time for the tenant to reach out.\n"
+        "  Engagement Score (0–10) — LinkedIn activity and responsiveness signals.\n"
         "Assign a tier: Hot (80–100) / Warm (55–79) / Cool (30–54) / Cold (0–29). "
-        "Be data-driven. Ground every score in observable facts from the profile. "
+        "Every score must be grounded in the tenant's specific business context — not a universal rubric. "
         "Output ONLY the system prompt text — no preamble, no explanation, no markdown fences."
     )
     user = (
-        "Using the profile data below, write a system prompt that instructs an AI to score this specific "
-        "lead. Embed the observable signals from this lead's data (role, company size, hiring signals, "
-        "activity) so the AI produces a score that reflects reality — not a generic rubric.\n\n"
-        f"Profile data:\n{_compact(raw)}"
+        f"{tenant_context}\n"
+        "The data above describes the TENANT — the company whose sales team will use this system prompt. "
+        "Write a system prompt that instructs an AI to score a B2B LEAD (a different person/company, "
+        "whose profile will be injected at runtime) specifically for this tenant's product and ICP.\n\n"
+        "The system prompt must:\n"
+        "- Define ICP Fit criteria based on the tenant's actual target audience and services above\n"
+        "- Define which intent signals matter for this tenant (relevant to what they sell)\n"
+        "- Instruct the AI to ground every score in the lead's observable data — not assumptions\n"
+        "- Output instructions only — NOT pre-filled scores\n\n"
+        "Do NOT score the tenant's own data. Write a reusable system prompt template."
     )
     return await _call_llm_generate(system, user)
 
 
 async def prompt_icp_match(raw: dict) -> str:
+    tenant_name     = raw.get("company_name") or ""
+    tenant_desc     = raw.get("company_description") or ""
+    tenant_industry = raw.get("industry") or ""
+    tenant_audience = raw.get("target_audience") or ""
+    tenant_services = ", ".join(raw.get("services") or raw.get("specialties") or [])
+    tenant_location = raw.get("hq_location") or ""
+
+    tenant_context = (
+        f"TENANT (the company whose ICP we are matching against):\n"
+        f"- Company: {tenant_name}\n"
+        f"- What they sell: {tenant_desc}\n"
+        f"- Industry: {tenant_industry}\n"
+        f"- Services: {tenant_services}\n"
+        f"- Their target audience: {tenant_audience}\n"
+        f"- HQ / primary market: {tenant_location}\n"
+    )
+
     system = (
-        "You are an ICP (Ideal Customer Profile) analyst for a B2B SaaS company. "
-        "Your job is to assess how well a prospect matches the ideal customer. "
-        "Evaluate: seniority and decision-making authority, company size and growth stage, "
-        "industry and vertical fit, tech stack alignment, budget signals, and geographic fit. "
+        "You are an ICP (Ideal Customer Profile) analyst. "
+        "Your job is to assess how well a prospect matches the TENANT'S ideal customer — not a generic B2B ICP. "
+        "The tenant's ICP is defined by who they sell to, what they sell, and where they operate. "
+        "Evaluate the lead against the tenant's specific criteria:\n"
+        "  - Seniority and decision-making authority relative to what the tenant sells\n"
+        "  - Company size and growth stage that the tenant typically serves\n"
+        "  - Industry and vertical fit with the tenant's services\n"
+        "  - Geographic fit with the tenant's primary market\n"
+        "  - Budget signals relevant to the tenant's price point\n"
+        "  - Tech stack or operational signals that indicate need for the tenant's solution\n"
         "Assign a match tier: Strong Fit / Moderate Fit / Weak Fit / No Fit. "
-        "List the top 3 fit reasons and top 2 gaps. Be honest about mismatches. "
+        "List the top 3 fit reasons and top 2 gaps specific to this tenant. "
+        "Be honest — a weak fit for this tenant is not a weak lead universally. "
         "Output ONLY the system prompt text — no preamble, no explanation, no markdown fences."
     )
     user = (
-        "Using the profile data below, write a system prompt that instructs an AI to assess this lead's "
-        "ICP fit. Anchor the assessment in this person's actual role, company, and signals — not generic "
-        "criteria. The output should tell a sales rep exactly why to prioritise or deprioritise this lead.\n\n"
-        f"Profile data:\n{_compact(raw)}"
+        f"{tenant_context}\n"
+        "The data above describes the TENANT — the company whose sales team will use this system prompt. "
+        "Write a system prompt that instructs an AI to assess whether a B2B LEAD "
+        "(a different person/company whose profile will be injected at runtime) is a good fit "
+        "for THIS specific tenant.\n\n"
+        "The system prompt must:\n"
+        "- Embed the tenant's ICP criteria from above so the AI knows exactly what a good customer looks like for this tenant\n"
+        "- Instruct the AI to evaluate the LEAD's seniority, company size, industry, geography, and budget signals "
+        "against these criteria — not generic B2B standards\n"
+        "- Instruct the AI to assign: Strong Fit / Moderate Fit / Weak Fit / No Fit\n"
+        "- Instruct the AI to list top 3 fit reasons and top 2 gaps anchored in the tenant's services\n"
+        "- Output instructions only — NOT a pre-filled ICP verdict for any specific lead\n\n"
+        "Do NOT evaluate the tenant's own profile. Write a reusable system prompt template."
     )
     return await _call_llm_generate(system, user)
 
 
 async def prompt_behavioural_signals(raw: dict) -> str:
+    tenant_name     = raw.get("company_name") or ""
+    tenant_desc     = raw.get("company_description") or ""
+    tenant_services = ", ".join(raw.get("services") or raw.get("specialties") or [])
+    tenant_audience = raw.get("target_audience") or ""
+
+    tenant_context = (
+        f"TENANT (the company evaluating these signals):\n"
+        f"- Company: {tenant_name}\n"
+        f"- What they sell: {tenant_desc}\n"
+        f"- Services: {tenant_services}\n"
+        f"- Their target audience: {tenant_audience}\n"
+    )
+
     system = (
         "You are a B2B intent data analyst. "
-        "Your job is to surface buying signals and behavioural triggers that indicate purchase readiness. "
-        "Detect and categorise: funding events (Series A/B/C, grants), hiring surges (roles and departments), "
-        "leadership changes (new CTO/VP/Head), product launches or rebrands, competitor mentions, "
-        "LinkedIn post topics and engagement patterns, news coverage, and technology adoption signals. "
-        "Rate the overall signal strength: Strong / Moderate / Weak. "
-        "Flag the single most actionable signal at the top. "
+        "Your job is to surface buying signals and behavioural triggers that are relevant to the TENANT'S product — "
+        "not every possible signal that exists. A signal only matters if it indicates the lead may need "
+        "what the tenant sells.\n\n"
+        "Detect and categorise signals in order of relevance to the tenant:\n"
+        "  - Hiring signals (are they hiring roles that the tenant's product supports or replaces?)\n"
+        "  - Funding events (new budget = new vendor decisions)\n"
+        "  - Leadership changes (new decision-maker = new buying window)\n"
+        "  - Product launches or rebrands (growth signals that create new needs)\n"
+        "  - LinkedIn post topics that overlap with the tenant's solution area\n"
+        "  - Technology adoption or competitor mentions relevant to the tenant's space\n"
+        "  - News coverage indicating scale, expansion, or pain\n\n"
+        "Rate overall signal strength for THIS tenant: Strong / Moderate / Weak. "
+        "Flag the single most actionable signal for the tenant's SDR at the top. "
+        "Ignore signals that have no relevance to the tenant's business. "
         "Output ONLY the system prompt text — no preamble, no explanation, no markdown fences."
     )
     user = (
-        "Using the profile data below, write a system prompt that instructs an AI to identify the real "
-        "behavioural and intent signals present for this specific lead. Reference the actual signals "
-        "visible in their data so the AI output is specific and actionable — not a generic checklist.\n\n"
-        f"Profile data:\n{_compact(raw)}"
+        f"{tenant_context}\n"
+        "The data above describes the TENANT — the company whose sales team will use this system prompt. "
+        "Write a system prompt that instructs an AI to analyse a B2B LEAD's behavioural signals "
+        "(a different person/company whose profile will be injected at runtime) and surface only the signals "
+        "relevant to this tenant's product and solution area.\n\n"
+        "The system prompt must:\n"
+        "- Define which signal categories matter for this tenant (based on what they sell above)\n"
+        "- Instruct the AI to filter out irrelevant signals\n"
+        "- Instruct the AI to flag the single most actionable signal for this tenant's SDR\n"
+        "- Instruct the AI to rate signal strength (Strong/Moderate/Weak) for THIS tenant specifically\n"
+        "- Output instructions only — NOT pre-filled signal analysis\n\n"
+        "Do NOT analyse the tenant's own data. Write a reusable system prompt template."
     )
     return await _call_llm_generate(system, user)
 
 
 async def prompt_pitch_intelligence(raw: dict) -> str:
+    tenant_name     = raw.get("company_name") or ""
+    tenant_desc     = raw.get("company_description") or ""
+    tenant_services = ", ".join(raw.get("services") or raw.get("specialties") or [])
+    tenant_audience = raw.get("target_audience") or ""
+    tenant_features = ", ".join(raw.get("key_features") or [])
+
+    tenant_context = (
+        f"TENANT (the company doing the pitching):\n"
+        f"- Company: {tenant_name}\n"
+        f"- What they sell: {tenant_desc}\n"
+        f"- Services: {tenant_services}\n"
+        f"- Key differentiators: {tenant_features}\n"
+        f"- Their target audience: {tenant_audience}\n"
+    )
+
     system = (
         "You are a B2B sales strategist. "
-        "Your job is to build tactical pitch intelligence for a specific prospect. "
-        "Analyse the prospect and produce: "
-        "1. Primary pain point — the #1 business problem they likely face given their role and company stage. "
-        "2. 3 value propositions — each mapped directly to a specific pain, with a one-line ROI/outcome statement. "
-        "3. Best pitch angle — choose one: ROI / Speed to value / Risk reduction / Competitive advantage. "
-        "4. Top 2 likely objections with sharp, specific rebuttals. "
-        "5. 3 conversation starters — questions that open discovery without sounding scripted. "
-        "Be concise, tactical, and sales-ready. No fluff. "
+        "Your job is to build tactical pitch intelligence for a sales rep at the TENANT company "
+        "who is about to contact this specific prospect.\n\n"
+        "All pitch intelligence must be anchored in what the TENANT sells — not generic sales advice:\n"
+        "1. Primary pain point — the #1 problem this lead likely faces that the TENANT's product/service solves. "
+        "   Do not name pains the tenant cannot address.\n"
+        "2. 3 value propositions — each directly maps a lead pain to a specific TENANT service or capability, "
+        "   with a one-line concrete outcome (not 'save time' — a real measurable result).\n"
+        "3. Best pitch angle for this tenant+lead combination — ROI / Speed to value / Risk reduction / Competitive advantage.\n"
+        "4. Top 2 likely objections this lead would raise, with rebuttals specific to the tenant's offering.\n"
+        "5. 3 conversation starters the tenant's SDR can use — questions that feel natural, not scripted, "
+        "   and open discovery about the lead's need for what the tenant sells.\n\n"
+        "Be concise, tactical, and specific to this tenant's business. No generic sales fluff. "
         "Output ONLY the system prompt text — no preamble, no explanation, no markdown fences."
     )
     user = (
-        "Using the profile data below, write a system prompt that instructs an AI to generate pitch "
-        "intelligence for this specific prospect. Embed their actual role, company context, and visible "
-        "signals so every output — pain points, value props, objections — is hyper-personalised.\n\n"
-        f"Profile data:\n{_compact(raw)}"
+        f"{tenant_context}\n"
+        "The data above describes the TENANT — the company whose SDR will use this system prompt. "
+        "Write a system prompt that instructs an AI to generate pitch intelligence for approaching "
+        "a B2B LEAD (a different person/company whose profile will be injected at runtime).\n\n"
+        "The system prompt must:\n"
+        "- Open by identifying the tenant's name and what they sell (embed from above)\n"
+        "- Instruct the AI to identify the lead's #1 pain point that the TENANT's services can address\n"
+        "- Instruct the AI to generate 3 value props mapped to tenant services (from the list above) — "
+        "  not generic props, only services this tenant actually offers\n"
+        "- Instruct the AI to pick the best pitch angle for this tenant+lead combination\n"
+        "- Instruct the AI to anticipate objections specific to the tenant's offering and price point\n"
+        "- Instruct the AI to write conversation starters that feel natural for a rep from this tenant\n"
+        "- Output instructions only — NOT pre-filled pitch intelligence\n\n"
+        "Do NOT generate pitch intelligence for the tenant's own data. Write a reusable system prompt template."
     )
     return await _call_llm_generate(system, user)
 

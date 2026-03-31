@@ -1848,6 +1848,41 @@ async def email_enrichment(body: ViewEmailRequest):
     }
 
 
+# ── Default outreach system prompt (universal — used when tenant passes no system_prompt) ──────
+_DEFAULT_OUTREACH_SYSTEM = (
+    "You are a senior B2B SDR writing cold outreach on behalf of the sender's company.\n\n"
+
+    "WHAT TO WRITE:\n"
+    "1. Email subject — curiosity-driven, under 8 words, no spam triggers, no company names.\n"
+    "2. Cold email body — exactly 3 paragraphs, under 150 words total:\n"
+    "   Para 1 — SPECIFIC HOOK: Reference something real and specific about the lead — "
+    "their company's focus, a recent LinkedIn post they wrote, their career move, or their stated pain point. "
+    "This must NOT be something that applies to every CEO or every company. "
+    "If LinkedIn posts are provided, use a concrete detail from one of them.\n"
+    "   Para 2 — VALUE BRIDGE: State the one problem you solve that is most relevant to this specific lead. "
+    "Give one concrete business outcome — not 'save time' or 'boost efficiency', "
+    "but a real result tied to their context (e.g. 'close the pipeline gap without adding headcount').\n"
+    "   Para 3 — DISCOVERY CTA: Ask one smart question tied to their specific situation. "
+    "It must feel like it comes from someone who already understands their world — not 'what are your biggest challenges?'.\n"
+    "3. LinkedIn note — under 300 chars, references something real about the lead, conversational, zero pitch.\n"
+    "4. Best channel: Email / LinkedIn / Phone — based on the lead's seniority and activity.\n"
+    "5. Best send time — in the lead's local timezone, specific day + time.\n"
+    "6. Primary outreach angle: Pain-based / Trigger / Insight.\n\n"
+
+    "STRICT RULES:\n"
+    "- Never use: 'I hope this finds you well', 'reaching out because', 'I noticed', 'synergy', "
+    "'game-changer', 'innovative solution', 'I came across your profile', 'one outcome is', "
+    "'automate manual work', or any phrase that sounds AI-generated.\n"
+    "- Never fabricate statistics or percentages — only state outcomes you can logically infer.\n"
+    "- If no LinkedIn posts are available, anchor Para 1 in the lead's role, company, or career history.\n"
+    "- Keep the tone direct, human, and professional — like a message from a smart colleague, not a salesperson.\n\n"
+
+    "Return ONLY a valid JSON object — no markdown, no explanation:\n"
+    "{\"cold_email\": {\"subject\": \"...\", \"body\": \"...\"}, "
+    "\"linkedin_note\": \"...\", \"best_channel\": \"...\", \"best_time\": \"...\", \"outreach_angle\": \"...\"}"
+)
+
+
 # ── 3. Outreach Enrichment ────────────────────────────────────────────────────
 
 _outreach_enrich_router = APIRouter(
@@ -1901,16 +1936,6 @@ async def outreach_enrichment(body: ViewOutreachRequest):
         if not body.lead_data:
             raise HTTPException(404, f"Lead not found: {body.leadenrich_id}. Provide lead_data as a fallback.")
         lead = _lead_from_ai_information(body.lead_data)
-
-    # Default system prompt used when caller does not supply one
-    _DEFAULT_OUTREACH_SYSTEM = (
-        "You are a world-class B2B SDR. Write hyper-personalised cold outreach from the lead context provided.\n\n"
-        "STRICT OUTPUT RULES:\n"
-        "- Return ONLY a valid JSON object. No markdown, no explanation, no extra keys.\n"
-        "- Every key listed below is MANDATORY. Never omit a key.\n"
-        "Return JSON: {\"cold_email\": {\"subject\": \"...\", \"body\": \"...\"}, "
-        "\"linkedin_note\": \"...\", \"best_channel\": \"...\", \"best_time\": \"...\", \"outreach_angle\": \"...\"}"
-    )
 
     system_prompt = body.system_prompt or _DEFAULT_OUTREACH_SYSTEM
 
