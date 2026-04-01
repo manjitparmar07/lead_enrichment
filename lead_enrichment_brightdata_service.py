@@ -2254,26 +2254,50 @@ def _normalize_bd_profile(raw: dict) -> dict:
 async def fetch_profile_sync(linkedin_url: str) -> dict:
     """
     Primary: Bright Data sync /scrape endpoint → normalize with _normalize_bd_profile.
-    Fallback: Playwright screenshot → OCR → LLM extraction.
+    Handles rate limits (429), circuit breaker, and falls back to OCR on failure.
     """
     url = _normalize_linkedin_url(linkedin_url)
 
     if _bd_api_key():
+        if not _bd_circuit_ok():
+            logger.warning("[BrightData] Circuit breaker OPEN — skipping BD, using OCR fallback")
+            return await _extract_profile_via_ocr(url)
+
         logger.info("[BrightData] Sync scrape: %s", url)
         try:
-            async with httpx.AsyncClient(timeout=90) as client:
+            async with httpx.AsyncClient(timeout=BD_REQUEST_TIMEOUT) as client:
                 resp = await client.post(
                     f"{BD_BASE}/scrape",
                     params={"dataset_id": _bd_profile_dataset(), "format": "json"},
                     headers=_bd_headers(),
                     json=[{"url": url}],
                 )
+
+                if resp.status_code == 429:
+                    wait = _bd_rate_limit_wait(resp)
+                    logger.warning("[BrightData] Sync rate-limited — waiting %.1fs before OCR fallback", wait)
+                    _bd_circuit_failure()
+                    await asyncio.sleep(wait)
+                    return await _extract_profile_via_ocr(url)
+
+                if resp.status_code in (400, 401, 402, 403):
+                    # Account/auth error — do NOT fall back to OCR, abort cleanly
+                    err_text = resp.text[:200]
+                    logger.error("[BrightData] Account/auth error %s: %s — aborting",
+                                 resp.status_code, err_text)
+                    _bd_circuit_failure()
+                    return {"_bd_error": True, "_bd_status": resp.status_code, "_bd_message": err_text}
+
+                if resp.status_code >= 500:
+                    logger.warning("[BrightData] Server error %s — trying OCR fallback", resp.status_code)
+                    _bd_circuit_failure()
+                    return await _extract_profile_via_ocr(url)
+
                 if resp.status_code == 200:
                     data = resp.json()
 
-                    # BrightData returns snapshot_id when the sync request cannot be
-                    # fulfilled immediately (API tier or profile takes too long).
-                    # Fall through to async poll in that case.
+                    # BrightData returns snapshot_id when sync cannot be fulfilled
+                    # immediately (API tier or profile takes too long) — poll async.
                     if isinstance(data, dict) and data.get("snapshot_id") and not data.get("name"):
                         snap_id = data["snapshot_id"]
                         logger.info("[BrightData] Sync returned snapshot_id=%s — polling async", snap_id)
@@ -2289,25 +2313,24 @@ async def fetch_profile_sync(linkedin_url: str) -> dict:
                         raw.get("name") or raw.get("full_name")
                         or raw.get("first_name") or raw.get("linkedin_url")
                     ):
-                        # Normalise full_name → name before further processing
                         if not raw.get("name") and raw.get("full_name"):
                             raw["name"] = raw["full_name"]
                         profile = _normalize_bd_profile(raw)
+                        _bd_circuit_success()
                         logger.info("[BrightData] OK — %s | company=%s | avatar=%s | activity=%d",
                                     profile.get("name"),
                                     profile.get("current_company_name") or "?",
                                     "✓" if profile.get("avatar_url") else "✗",
                                     len(raw.get("activity") or []))
                         return profile
-                    logger.warning("[BrightData] Empty profile, trying OCR fallback")
-                elif resp.status_code in (400, 401, 403, 402, 429):
-                    # Account-level error — do NOT fall back to OCR, abort cleanly
-                    err_text = resp.text[:200]
-                    logger.error("[BrightData] Account/auth error %s: %s — aborting, will not save incomplete data",
-                                 resp.status_code, err_text)
-                    return {"_bd_error": True, "_bd_status": resp.status_code, "_bd_message": err_text}
+
+                    logger.warning("[BrightData] Empty profile — trying OCR fallback")
                 else:
-                    logger.warning("[BrightData] %s: %s — trying OCR fallback", resp.status_code, resp.text[:120])
+                    logger.warning("[BrightData] Unexpected %s — trying OCR fallback", resp.status_code)
+
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            logger.warning("[BrightData] Network error (%s) — trying OCR fallback", e)
+            _bd_circuit_failure()
         except Exception as e:
             logger.warning("[BrightData] Error: %s — trying OCR fallback", e)
     else:
@@ -2387,6 +2410,9 @@ async def trigger_batch_snapshot(
 ) -> str:
     if not _bd_api_key():
         raise ValueError("BRIGHT_DATA_API_KEY not configured")
+    if not _bd_circuit_ok():
+        raise RuntimeError("BD circuit breaker OPEN — skipping trigger")
+
     params: dict[str, str] = {
         "dataset_id": _bd_profile_dataset(), "format": "json", "include_errors": "true",
     }
@@ -2396,35 +2422,143 @@ async def trigger_batch_snapshot(
         params["notify"] = notify_url
     if webhook_auth:
         params["auth_header"] = webhook_auth
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(
-            f"{BD_BASE}/trigger", params=params, headers=_bd_headers(),
-            json=[{"url": _normalize_linkedin_url(u)} for u in urls],
-        )
-        resp.raise_for_status()
-    snapshot_id = resp.json().get("snapshot_id") or resp.json().get("id")
-    if not snapshot_id:
-        raise ValueError(f"No snapshot_id: {resp.text[:200]}")
-    return snapshot_id
+
+    payload = [{"url": _normalize_linkedin_url(u)} for u in urls]
+    last_exc: Exception = RuntimeError("No attempts made")
+
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    f"{BD_BASE}/trigger", params=params,
+                    headers=_bd_headers(), json=payload,
+                )
+            if resp.status_code == 429:
+                wait = _bd_rate_limit_wait(resp)
+                logger.warning("[BD] trigger rate-limited — waiting %.1fs (attempt %d/3)", wait, attempt + 1)
+                _bd_circuit_failure()
+                await asyncio.sleep(wait)
+                continue
+            if resp.status_code >= 500:
+                wait = _bd_backoff(attempt)
+                logger.warning("[BD] trigger %d — retrying in %.1fs (attempt %d/3)", resp.status_code, wait, attempt + 1)
+                _bd_circuit_failure()
+                await asyncio.sleep(wait)
+                continue
+            resp.raise_for_status()
+            snapshot_id = resp.json().get("snapshot_id") or resp.json().get("id")
+            if not snapshot_id:
+                raise ValueError(f"No snapshot_id in response: {resp.text[:200]}")
+            _bd_circuit_success()
+            return snapshot_id
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            wait = _bd_backoff(attempt)
+            logger.warning("[BD] trigger network error (%s) — retrying in %.1fs (attempt %d/3)", e, wait, attempt + 1)
+            _bd_circuit_failure()
+            last_exc = e
+            await asyncio.sleep(wait)
+
+    raise RuntimeError(f"trigger_batch_snapshot failed after 3 attempts: {last_exc}") from last_exc
 
 
 async def poll_snapshot(snapshot_id: str, interval: int = 15, timeout: int = 600) -> list[dict]:
+    """
+    Poll BrightData until snapshot is ready, with exponential backoff on errors,
+    rate-limit handling, partial-response filtering, and circuit-breaker integration.
+    """
     if not _bd_api_key():
         raise ValueError("BRIGHT_DATA_API_KEY not configured")
-    deadline = time.time() + timeout
+    if not _bd_circuit_ok():
+        raise RuntimeError("BD circuit breaker OPEN — skipping poll")
+
+    deadline    = time.time() + timeout
+    poll_errors = 0
+    MAX_POLL_ERRORS = 5
+
     async with httpx.AsyncClient(timeout=60) as client:
         while time.time() < deadline:
-            s = await client.get(f"{BD_BASE}/progress/{snapshot_id}", headers=_bd_headers())
+            # ── Progress check ────────────────────────────────────────────────
+            try:
+                s = await client.get(f"{BD_BASE}/progress/{snapshot_id}", headers=_bd_headers())
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                poll_errors += 1
+                wait = _bd_backoff(poll_errors - 1)
+                logger.warning("[BD] poll network error (%s) — waiting %.1fs (%d/%d)", e, wait, poll_errors, MAX_POLL_ERRORS)
+                _bd_circuit_failure()
+                if poll_errors >= MAX_POLL_ERRORS:
+                    raise RuntimeError(f"poll_snapshot {snapshot_id}: too many network errors") from e
+                await asyncio.sleep(wait)
+                continue
+
+            if s.status_code == 429:
+                wait = _bd_rate_limit_wait(s)
+                logger.warning("[BD] poll rate-limited — waiting %.1fs", wait)
+                await asyncio.sleep(wait)
+                continue
+
+            if s.status_code >= 500:
+                poll_errors += 1
+                wait = _bd_backoff(poll_errors - 1)
+                logger.warning("[BD] poll %d — waiting %.1fs (%d/%d)", s.status_code, wait, poll_errors, MAX_POLL_ERRORS)
+                _bd_circuit_failure()
+                if poll_errors >= MAX_POLL_ERRORS:
+                    raise RuntimeError(f"poll_snapshot {snapshot_id}: too many server errors")
+                await asyncio.sleep(wait)
+                continue
+
             s.raise_for_status()
+            poll_errors = 0   # reset on clean response
+            _bd_circuit_success()
+
             state = s.json().get("status") or s.json().get("state", "")
+
             if state == "ready":
-                d = await client.get(f"{BD_BASE}/snapshot/{snapshot_id}", params={"format": "json"}, headers=_bd_headers())
+                # ── Download snapshot ─────────────────────────────────────────
+                try:
+                    d = await client.get(
+                        f"{BD_BASE}/snapshot/{snapshot_id}",
+                        params={"format": "json"}, headers=_bd_headers(),
+                    )
+                except (httpx.TimeoutException, httpx.ConnectError) as e:
+                    logger.warning("[BD] snapshot download error (%s) — retrying poll", e)
+                    _bd_circuit_failure()
+                    await asyncio.sleep(_bd_backoff(0))
+                    continue
+
+                if d.status_code == 429:
+                    wait = _bd_rate_limit_wait(d)
+                    logger.warning("[BD] snapshot download rate-limited — waiting %.1fs", wait)
+                    await asyncio.sleep(wait)
+                    continue
+
                 d.raise_for_status()
-                result = d.json()
-                return result if isinstance(result, list) else [result]
+                _bd_circuit_success()
+
+                raw = d.json()
+                rows: list[dict] = raw if isinstance(raw, list) else [raw]
+
+                # ── Partial-response handling ─────────────────────────────────
+                # BD may include per-item error objects alongside valid profiles.
+                ok_rows = [r for r in rows if isinstance(r, dict) and not r.get("error") and not r.get("_error")]
+                err_rows = [r for r in rows if r not in ok_rows]
+                if err_rows:
+                    logger.warning("[BD] snapshot %s: %d/%d items had errors: %s",
+                                   snapshot_id, len(err_rows), len(rows),
+                                   [r.get("error") or r.get("_error") for r in err_rows[:3]])
+                if not ok_rows and err_rows:
+                    raise RuntimeError(f"Snapshot {snapshot_id}: all {len(err_rows)} items failed")
+
+                return ok_rows if ok_rows else rows
+
             if state in ("failed", "error"):
-                raise RuntimeError(f"Snapshot {snapshot_id} failed")
-            await asyncio.sleep(interval)
+                _bd_circuit_failure()
+                raise RuntimeError(f"Snapshot {snapshot_id} failed (state={state})")
+
+            # Still processing — backoff grows with elapsed time to avoid hammering
+            elapsed = time.time() - (deadline - timeout)
+            wait = min(interval + elapsed * 0.05, interval * 3)
+            await asyncio.sleep(wait)
+
     raise TimeoutError(f"Snapshot {snapshot_id} not ready after {timeout}s")
 
 
@@ -6282,34 +6416,40 @@ async def enrich_bulk(
     async with get_pool().acquire() as conn:
         await conn.execute(_sql, *_args)
 
-    # Trigger BrightData batch in parallel chunks when API key is available
+    # Trigger BrightData — 1 URL per sub-job, each gets its own snapshot + webhook
+    # Semaphore limits concurrent BD API calls to avoid rate-limiting (max 10 at a time)
     if _bd_api_key():
         try:
-            chunk_size  = _bd_chunk_size(len(urls))
-            url_chunks  = [urls[i: i + chunk_size] for i in range(0, len(urls), chunk_size)]
+            # 1 URL per chunk — 100 URLs = 100 sub-jobs = 100 snapshots
+            url_chunks  = [[u] for u in urls]
             sub_job_ids = [str(uuid.uuid4()) for _ in url_chunks]
+            total_chunks = len(url_chunks)
+
+            # Max 10 concurrent trigger calls to BrightData (avoid 429 rate-limit)
+            _bd_semaphore = asyncio.Semaphore(10)
 
             async def _trigger_bd_chunk(idx: int, sjid: str, chunk: list) -> str:
-                if app_url:
-                    # BD sends full data to chunk_webhook — no need for notify (avoids double-processing)
-                    chunk_webhook = f"{app_url}/api/leads/webhook/brightdata?job_id={job_id}&sub_job_id={sjid}"
-                    chunk_notify  = None
-                elif webhook_url:
-                    sep = "&" if "?" in webhook_url else "?"
-                    chunk_webhook = f"{webhook_url}{sep}sub_job_id={sjid}"
-                    chunk_notify  = notify_url
-                else:
-                    chunk_webhook = None
-                    chunk_notify  = None
-                snap_id = await trigger_batch_snapshot(chunk, chunk_webhook, chunk_notify, webhook_auth)
-                await _create_sub_job(sjid, job_id, idx, len(chunk), org_id, snapshot_id=snap_id)
-                if not chunk_webhook:
-                    asyncio.create_task(_poll_and_process_snapshot(snap_id, job_id, org_id, sub_job_id=sjid))
-                logger.info(
-                    "[BulkEnrich] Chunk %d/%d (%d URLs) → snapshot %s (webhook=%s)",
-                    idx + 1, len(url_chunks), len(chunk), snap_id, chunk_webhook or "polling",
-                )
-                return snap_id
+                async with _bd_semaphore:  # at most 10 in-flight at once
+                    if app_url:
+                        # BD sends full data to chunk_webhook — no need for notify
+                        chunk_webhook = f"{app_url}/api/leads/webhook/brightdata?job_id={job_id}&sub_job_id={sjid}"
+                        chunk_notify  = None
+                    elif webhook_url:
+                        sep = "&" if "?" in webhook_url else "?"
+                        chunk_webhook = f"{webhook_url}{sep}sub_job_id={sjid}"
+                        chunk_notify  = notify_url
+                    else:
+                        chunk_webhook = None
+                        chunk_notify  = None
+                    snap_id = await trigger_batch_snapshot(chunk, chunk_webhook, chunk_notify, webhook_auth)
+                    await _create_sub_job(sjid, job_id, idx, len(chunk), org_id, snapshot_id=snap_id)
+                    if not chunk_webhook:
+                        asyncio.create_task(_poll_and_process_snapshot(snap_id, job_id, org_id, sub_job_id=sjid))
+                    logger.info(
+                        "[BulkEnrich] Sub-job %d/%d | url=%s → snapshot=%s (webhook=%s)",
+                        idx + 1, total_chunks, chunk[0], snap_id, chunk_webhook or "polling",
+                    )
+                    return snap_id
 
             snap_ids    = await asyncio.gather(*[_trigger_bd_chunk(i, sjid, chunk) for i, (sjid, chunk) in enumerate(zip(sub_job_ids, url_chunks))])
             snapshot_id = snap_ids[0] if snap_ids else None  # store first on parent job for compat
@@ -6319,8 +6459,8 @@ async def enrich_bulk(
             status = "running"
             bd_triggered = True
             logger.info(
-                "[BulkEnrich] %d URLs → %d BD chunks triggered for job %s (org=%s)",
-                len(urls), len(url_chunks), job_id, org_id,
+                "[BulkEnrich] %d URLs → %d sub-jobs triggered for job %s (org=%s)",
+                len(urls), total_chunks, job_id, org_id,
             )
         except Exception as e:
             logger.error("[BulkEnrich] BD chunk trigger failed: %s — falling back to queue", e)
@@ -6480,27 +6620,40 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
     try:
         url = _normalize_linkedin_url(_clean_bd_linkedin_url(raw_url))
 
+        # ── Data validation ───────────────────────────────────────────────────────
+        # A usable profile must have at least a name (or first+last) and must not
+        # carry an explicit BD error flag. Partial profiles (no position/company)
+        # are accepted and enriched further downstream.
+        def _has_data(p: dict) -> bool:
+            if p.get("error") or p.get("_bd_error") or p.get("_error"):
+                return False
+            has_name = bool(
+                p.get("name") or p.get("full_name")
+                or (p.get("first_name") and p.get("last_name"))
+            )
+            if not has_name:
+                missing = [f for f in ("name", "full_name", "first_name") if not p.get(f)]
+                logger.debug("[Validation] Profile missing identity fields: %s", missing)
+                return False
+            return True
+
         # ── Retry if BrightData returned empty/partial/error profile ─────────────
-        # Triggers when: no name/title/company, OR BD returned an explicit error field.
-        # Up to 3 re-scrape attempts with 5s/10s/15s back-off before giving up.
-        _has_data = lambda p: (
-            bool(p.get("name") or p.get("full_name") or p.get("position") or p.get("current_company_name"))
-            and not p.get("error")
-            and not p.get("_bd_error")
-        )
+        # Up to 3 re-scrape attempts with exponential back-off (2s, 4s, 8s).
         if not _has_data(profile):
-            if profile.get("error"):
-                logger.warning("[Pipeline] BD returned error for %s: %s", url, profile.get("error"))
-            for _attempt in range(1, 4):
-                logger.warning("[Pipeline] Empty BD profile for %s — retry %d/3", url, _attempt)
-                await asyncio.sleep(5 * _attempt)
+            if profile.get("error") or profile.get("_error"):
+                logger.warning("[Pipeline] BD returned error for %s: %s", url,
+                               profile.get("error") or profile.get("_error"))
+            for _attempt in range(3):
+                wait = _bd_backoff(_attempt)
+                logger.warning("[Pipeline] Empty BD profile for %s — retry %d/3 in %.1fs", url, _attempt + 1, wait)
+                await asyncio.sleep(wait)
                 retried = await fetch_profile_sync(url)
-                if retried and not retried.get("_bd_error") and _has_data(retried):
+                if retried and _has_data(retried):
                     profile = retried
-                    logger.info("[Pipeline] Retry %d succeeded for %s", _attempt, url)
+                    logger.info("[Pipeline] Retry %d succeeded for %s", _attempt + 1, url)
                     break
             else:
-                logger.error("[Pipeline] All 3 retries returned empty profile for %s — skipping", url)
+                logger.error("[Pipeline] All 3 retries returned empty/invalid profile for %s — skipping", url)
                 return None
 
         name = profile.get("name", "")
