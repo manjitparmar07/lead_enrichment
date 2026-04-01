@@ -4736,6 +4736,7 @@ async def enrich_company_url(
     job_id: Optional[str] = None,
     org_id: str = "default",
     forward_to_lio: bool = False,
+    sso_id: str = "",
 ) -> dict:
     """
     Enrich a LinkedIn Company URL directly.
@@ -5020,7 +5021,7 @@ async def enrich_company_url(
         final_name, total_score, score_tier, company_email or "—", website or "—",
     )
     if not forward_to_lio and lead.get("name"):
-        asyncio.create_task(send_to_lio(lead))
+        asyncio.create_task(send_to_lio(lead, sso_id=sso_id))
     return lead
 
 
@@ -5067,7 +5068,7 @@ async def enrich_single(
     # ── Route: company URL → dedicated company pipeline ───────────────────────
     if _is_company_url(url):
         logger.info("[Enrich] Company URL detected — routing to company pipeline: %s", url)
-        return await enrich_company_url(url, job_id=job_id, org_id=org_id, forward_to_lio=forward_to_lio)
+        return await enrich_company_url(url, job_id=job_id, org_id=org_id, forward_to_lio=forward_to_lio, sso_id=sso_id)
 
     # ── Cache check: return existing enrichment if already in DB ─────────────
     cached = await get_lead(lead_id)
