@@ -6463,6 +6463,12 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             "connections": _safe_int(profile.get("connections")),
             "email_source": contact.get("source") if isinstance(contact, dict) else None,
             "email_confidence": contact.get("confidence") if isinstance(contact, dict) else None,
+            # ── CRM brief — LLM-generated, save as JSON string ────────────────
+            "crm_brief": (
+                json.dumps(enrichment["crm_brief"], default=str)
+                if isinstance(enrichment.get("crm_brief"), dict)
+                else enrichment.get("crm_brief")
+            ),
             # ── Stage 3: COMPLETED — LLM done, full data saved ───────────────
             "status": "completed",
             "job_id": job_id,
