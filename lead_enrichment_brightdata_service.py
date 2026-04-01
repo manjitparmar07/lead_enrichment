@@ -3172,7 +3172,7 @@ STRICT RULES:
 - Do NOT copy text verbatim — always synthesize into insight.
 - Keep outputs concise, specific, and high-signal.
 - Avoid generic B2B filler phrases (e.g. "results-driven", "passionate about").
-- All arrays MUST contain at least 2 real items.
+- All arrays MUST contain 4 to 5 real, distinct items — never fewer.
 - All strings MUST be non-empty, meaningful, and specific.
 
 ANALYSIS LOGIC:
@@ -3185,8 +3185,8 @@ ANALYSIS LOGIC:
 - Trigger events = recent role changes, company news, posts about challenges.
 - Seniority and decision_maker fields MUST be inferred from title + experience.
 
-OUTPUT — return ONLY this JSON with ALL fields fully populated:
-{"who_they_are":{"name":"","title":"","company":"","location":"","linkedin_url":"","profile_image":"","company_logo":"","followers":"","connections":"","persona":"","seniority":"","trajectory":"","decision_maker":""},"their_company":{"type":"","industry":"","stage":"","company_size":"","founded":"","website":"","company_tags":["",""],"relevance_score":"","relevance_reason":""},"what_they_care_about":{"primary_interests":["",""],"secondary_interests":["",""],"passion_signals":["",""]},"online_behaviour":{"activity_level":"","content_style":"","recurring_themes":["",""],"primary_platform":""},"communication":{"tone":"","writing_style":"","emotional_mode":"","archetype":"","mirror_strategy":""},"what_drives_them":{"core_values":["",""],"motivators":["",""],"pain_points":["",""],"career_ambitions":["",""]},"buying_signals":{"intent_level":"","trigger_events":["",""],"tools_used":["",""],"decision_style":"","intent_tags":["",""]},"smart_tags":["","",""],"outreach_blueprint":{"best_channel":"","approach_strategy":"","opening_hooks":["",""],"recommended_content":"","avoid_topics":["",""],"one_line_strategy":""},"crm_scores":{"icp_fit":"","engagement_score":"","timing_score":"","priority_level":""},"crm_import_fields":{"buyer_type":"","buying_signal":"","outreach_tone":"","hook_theme":"","avoidance":"","tags":["","",""],"analyst_summary":""},"recent_activity":{"posts":[{"topic":"","tone":"","key_message":"","engagement":"","intent_signal":""}],"interactions":[{"interaction_type":"","topic":"","insight":"","intent_signal":""}]}}"""
+OUTPUT — return ONLY this JSON with ALL fields fully populated (arrays must have 4–5 items each):
+{"who_they_are":{"name":"","title":"","company":"","location":"","linkedin_url":"","profile_image":"","company_logo":"","followers":"","connections":"","persona":"","seniority":"","trajectory":"","decision_maker":""},"their_company":{"type":"","industry":"","stage":"","company_size":"","founded":"","website":"","company_tags":["","","","",""],"relevance_score":"","relevance_reason":""},"what_they_care_about":{"primary_interests":["","","","",""],"secondary_interests":["","","","",""],"passion_signals":["","","","",""]},"online_behaviour":{"activity_level":"","content_style":"","recurring_themes":["","","","",""],"primary_platform":""},"communication":{"tone":"","writing_style":"","emotional_mode":"","archetype":"","mirror_strategy":""},"what_drives_them":{"core_values":["","","","",""],"motivators":["","","","",""],"pain_points":["","","","",""],"career_ambitions":["","","","",""]},"buying_signals":{"intent_level":"","trigger_events":["","","","",""],"tools_used":["","","","",""],"decision_style":"","intent_tags":["","","","",""]},"smart_tags":["","","","",""],"outreach_blueprint":{"best_channel":"","approach_strategy":"","opening_hooks":["","","","",""],"recommended_content":"","avoid_topics":["","","","",""],"one_line_strategy":""},"crm_scores":{"icp_fit":"","engagement_score":"","timing_score":"","priority_level":""},"crm_import_fields":{"buyer_type":"","buying_signal":"","outreach_tone":"","hook_theme":"","avoidance":"","tags":["","","","",""],"analyst_summary":""},"recent_activity":{"posts":[{"topic":"","tone":"","key_message":"","engagement":"","intent_signal":""},{"topic":"","tone":"","key_message":"","engagement":"","intent_signal":""},{"topic":"","tone":"","key_message":"","engagement":"","intent_signal":""}],"interactions":[{"interaction_type":"","topic":"","insight":"","intent_signal":""},{"interaction_type":"","topic":"","insight":"","intent_signal":""},{"interaction_type":"","topic":"","insight":"","intent_signal":""}]}}"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3941,7 +3941,7 @@ async def build_comprehensive_enrichment(
             brief = await _call_llm([
                 {"role": "system", "content": effective_crm_prompt},
                 {"role": "user",   "content": crm_brief_user},
-            ], max_tokens=3500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override)
+            ], max_tokens=4500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override)
             if not brief:
                 logger.warning("[Enrichment] CRM brief — all LLM providers returned None (hf=%s groq=%s)", hf_ok, grq_ok)
             else:
@@ -6755,7 +6755,7 @@ async def regenerate_crm_brief_for_lead(lead_id: str, org_id: str = "") -> Optio
     brief = await _call_llm([
         {"role": "system", "content": crm_brief_prompt},
         {"role": "user",   "content": f"Analyze this LinkedIn prospect data and return the JSON exactly as specified:\n\n{optimized_str}"},
-    ], max_tokens=3500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override)
+    ], max_tokens=4500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override)
 
     if not brief:
         raise RuntimeError("LLM unavailable or returned no content.")
