@@ -6202,10 +6202,17 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
     try:
         url = _normalize_linkedin_url(_clean_bd_linkedin_url(raw_url))
 
-        # ── Retry if BrightData returned empty/partial profile (no name/title/company) ──
-        # Up to 3 re-scrape attempts with 5s back-off before giving up.
-        _has_data = lambda p: bool(p.get("name") or p.get("full_name") or p.get("position") or p.get("current_company_name"))
+        # ── Retry if BrightData returned empty/partial/error profile ─────────────
+        # Triggers when: no name/title/company, OR BD returned an explicit error field.
+        # Up to 3 re-scrape attempts with 5s/10s/15s back-off before giving up.
+        _has_data = lambda p: (
+            bool(p.get("name") or p.get("full_name") or p.get("position") or p.get("current_company_name"))
+            and not p.get("error")
+            and not p.get("_bd_error")
+        )
         if not _has_data(profile):
+            if profile.get("error"):
+                logger.warning("[Pipeline] BD returned error for %s: %s", url, profile.get("error"))
             for _attempt in range(1, 4):
                 logger.warning("[Pipeline] Empty BD profile for %s — retry %d/3", url, _attempt)
                 await asyncio.sleep(5 * _attempt)
