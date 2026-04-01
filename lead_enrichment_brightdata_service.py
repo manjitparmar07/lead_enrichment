@@ -6040,32 +6040,28 @@ async def enrich_bulk(
             sub_job_ids = [str(uuid.uuid4()) for _ in url_chunks]
 
             async def _trigger_bd_chunk(idx: int, sjid: str, chunk: list) -> str:
-                if app_url:
-                    # BD sends full data to chunk_webhook — no need for notify (avoids double-processing)
-                    chunk_webhook = f"{app_url}/api/leads/webhook/brightdata?job_id={job_id}&sub_job_id={sjid}"
-                    chunk_notify  = None
-                elif webhook_url:
-                    sep = "&" if "?" in webhook_url else "?"
-                    chunk_webhook = f"{webhook_url}{sep}sub_job_id={sjid}"
-                    chunk_notify  = notify_url
-                else:
-                    chunk_webhook = None
-                    chunk_notify  = None
+                # Webhook delivery disabled — always poll BrightData for results
+                # (webhook path had reliability issues; polling is simpler and self-healing)
+                # if app_url:
+                #     chunk_webhook = f"{app_url}/api/leads/webhook/brightdata?job_id={job_id}&sub_job_id={sjid}"
+                #     chunk_notify  = None
+                # elif webhook_url:
+                #     sep = "&" if "?" in webhook_url else "?"
+                #     chunk_webhook = f"{webhook_url}{sep}sub_job_id={sjid}"
+                #     chunk_notify  = notify_url
+                chunk_webhook = None
+                chunk_notify  = None
                 snap_id = await trigger_batch_snapshot(chunk, chunk_webhook, chunk_notify, webhook_auth)
                 await _create_sub_job(sjid, job_id, idx, len(chunk), org_id, snapshot_id=snap_id)
-                if not chunk_webhook:
-                    asyncio.create_task(_poll_and_process_snapshot(snap_id, job_id, org_id, sub_job_id=sjid))
+                asyncio.create_task(_poll_and_process_snapshot(snap_id, job_id, org_id, sub_job_id=sjid))
                 logger.info(
-                    "[BulkEnrich] Chunk %d/%d (%d URLs) → snapshot %s (webhook=%s)",
-                    idx + 1, len(url_chunks), len(chunk), snap_id, chunk_webhook or "polling",
+                    "[BulkEnrich] Chunk %d/%d (%d URLs) → snapshot %s (polling)",
+                    idx + 1, len(url_chunks), len(chunk), snap_id,
                 )
                 return snap_id
 
             snap_ids    = await asyncio.gather(*[_trigger_bd_chunk(i, sjid, chunk) for i, (sjid, chunk) in enumerate(zip(sub_job_ids, url_chunks))])
             snapshot_id = snap_ids[0] if snap_ids else None  # store first on parent job for compat
-            # Set webhook_url on parent job row so stop/rerun routes can find it
-            if not webhook_url and app_url:
-                webhook_url = f"{app_url}/api/leads/webhook/brightdata?job_id={job_id}"
             status = "running"
             bd_triggered = True
             logger.info(
