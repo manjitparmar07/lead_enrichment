@@ -793,7 +793,7 @@ async def init_leads_db() -> None:
             ("account_pitch", "TEXT"), ("wappalyzer_tech", "TEXT"),
             ("news_mentions", "TEXT"), ("crunchbase_data", "TEXT"),
             ("linkedin_posts", "TEXT"), ("company_score_tier", "TEXT"),
-            ("crm_brief", "TEXT"),
+            ("crm_brief", "TEXT"), ("raw_brightdata", "JSONB"),
         ]
         for col, col_type in _NEW_COLS:
             await conn.execute(f"ALTER TABLE enriched_leads ADD COLUMN IF NOT EXISTS {col} {col_type}")
@@ -6276,7 +6276,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             "title": profile.get("position", ""),
             "company": company,
             "avatar_url": _extract_avatar(profile),
-            "raw_profile": json.dumps(profile, default=str),
+            "raw_brightdata": profile,
             "about": (profile.get("about") or "")[:1000],
             "followers": _safe_int(profile.get("followers")),
             "connections": _safe_int(profile.get("connections")),
@@ -6462,7 +6462,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
                 "linkedin_posts": profile.get("_posts") or [],
                 "hiring_signals": profile.get("_hiring_signals") or [],
             }, default=str),
-            "raw_profile": json.dumps(profile, default=str),
+            "raw_brightdata": profile,
             "about": (profile.get("about") or "")[:1000],
             "followers": _safe_int(profile.get("followers")),
             "connections": _safe_int(profile.get("connections")),
@@ -6721,14 +6721,18 @@ async def regenerate_crm_brief_for_lead(lead_id: str, org_id: str = "") -> Optio
     # Prefer org_id from JWT (request), fall back to what's stored on the lead
     org_id = org_id or lead.get("organization_id") or "default"
 
-    # Read raw_profile from DB
-    raw_profile_raw = lead.get("raw_profile")
-    if not raw_profile_raw:
-        raise RuntimeError("No raw_profile found for this lead — cannot regenerate CRM brief.")
-    try:
-        profile = json.loads(raw_profile_raw) if isinstance(raw_profile_raw, str) else raw_profile_raw
-    except Exception:
-        profile = {}
+    # Read raw BrightData profile from DB (raw_brightdata JSONB preferred, raw_profile TEXT fallback)
+    raw_bd = lead.get("raw_brightdata")
+    if raw_bd:
+        profile = raw_bd if isinstance(raw_bd, dict) else (json.loads(raw_bd) if isinstance(raw_bd, str) else {})
+    else:
+        raw_profile_raw = lead.get("raw_profile")
+        if not raw_profile_raw:
+            raise RuntimeError("No raw BrightData profile found for this lead — cannot regenerate CRM brief.")
+        try:
+            profile = json.loads(raw_profile_raw) if isinstance(raw_profile_raw, str) else raw_profile_raw
+        except Exception:
+            profile = {}
 
     # Read config from workspace_configs
     try:
