@@ -94,7 +94,7 @@ async def _lead_cache_delete(lead_id: str) -> None:
     except Exception:
         pass
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, HttpUrl, field_validator
 
 import lead_enrichment_brightdata_service as svc
@@ -110,6 +110,10 @@ router = APIRouter(prefix="/leads", tags=["Lead Enrichment"])
 
 # Webhook secret — set LEAD_WEBHOOK_SECRET in .env to protect incoming webhooks
 WEBHOOK_SECRET = os.getenv("LEAD_WEBHOOK_SECRET", "")
+
+# ── Webhook backpressure ───────────────────────────────────────────────────────
+MAX_WEBHOOK_INFLIGHT: int = 100   # max concurrent background webhook tasks
+_webhook_inflight: int = 0        # current count of in-flight background tasks
 
 
 def _get_org_id(request: Request) -> str:
@@ -864,6 +868,32 @@ async def get_job(job_id: str):
     return {**job, "leads_count": leads_count, "sub_jobs": [dict(r) for r in sub_rows]}
 
 
+# ── LIO Dead-Letter Queue ─────────────────────────────────────────────────────
+
+@router.get("/lio/dlq/count")
+async def lio_dlq_count():
+    """Return number of failed LIO deliveries waiting in the dead-letter queue."""
+    try:
+        import redis.asyncio as aioredis
+        redis_url = os.getenv("REDIS_URL", "")
+        if not redis_url:
+            return {"count": 0, "error": "REDIS_URL not configured"}
+        r = aioredis.from_url(redis_url, decode_responses=True)
+        count = await r.llen("lio:dlq")
+        await r.close()
+        return {"count": count}
+    except Exception as e:
+        return {"count": 0, "error": str(e)}
+
+
+@router.post("/lio/dlq/replay")
+async def lio_dlq_replay(max_items: int = 50):
+    """Replay up to max_items failed LIO deliveries from the dead-letter queue."""
+    result = await svc.lio_dlq_replay(max_items=max_items)
+    return result
+
+
+
 @router.post(
     "/jobs/{job_id}/stop",
     summary="Stop / cancel a running job",
@@ -1042,20 +1072,46 @@ async def webhook_brightdata(request: Request, background_tasks: BackgroundTasks
         profiles = [profiles]
 
     # Extract routing params from query string
-    job_id     = request.query_params.get("job_id")
-    sub_job_id = request.query_params.get("sub_job_id")
+    job_id      = request.query_params.get("job_id")
+    sub_job_id  = request.query_params.get("sub_job_id")
     snapshot_id = request.query_params.get("snapshot_id")
 
-    # ── Idempotency: skip already-processed snapshots ─────────────────────────
-    if snapshot_id:
-        if await svc.is_snapshot_processed(snapshot_id):
-            logger.info("[Webhook] snapshot %s already processed — skipping", snapshot_id)
-            return {"ok": True, "duplicate": True, "message": "Snapshot already processed"}
-        org_id = _get_org_id(request)
-        await svc.mark_snapshot_processed(snapshot_id, job_id, org_id)
+    # ── Backpressure guard ────────────────────────────────────────────────────
+    global _webhook_inflight
+    if _webhook_inflight >= MAX_WEBHOOK_INFLIGHT:
+        logger.warning("[Webhook] inflight limit reached (%d) — returning 429", _webhook_inflight)
+        return JSONResponse(status_code=429, content={"ok": False, "error": "too many in-flight webhooks"})
 
-    # Process in background so webhook returns quickly (Bright Data timeout is 10s)
-    background_tasks.add_task(svc.process_webhook_profiles, profiles, job_id, sub_job_id)
+    # ── Idempotency check: guard DB calls within BrightData's 10s window ─────
+    async def _pre_response() -> dict:
+        if snapshot_id:
+            if await svc.is_snapshot_processed(snapshot_id):
+                logger.info("[Webhook] snapshot %s already processed — skipping", snapshot_id)
+                return {"ok": True, "duplicate": True, "message": "Snapshot already processed"}
+            org_id = _get_org_id(request)
+            await svc.mark_snapshot_processed(snapshot_id, job_id, org_id)
+        return {}
+
+    try:
+        early = await asyncio.wait_for(_pre_response(), timeout=9.0)
+    except asyncio.TimeoutError:
+        logger.warning("[Webhook] pre-response timed out for snapshot %s — accepting anyway", snapshot_id)
+        return JSONResponse(status_code=202, content={"ok": True, "timeout": True, "received": len(profiles)})
+
+    if early.get("duplicate"):
+        return early
+
+    # Process in background so webhook returns quickly (Bright Data timeout is 10s).
+    # _bg_task owns the inflight counter so it reflects true in-flight work.
+    async def _bg_task():
+        global _webhook_inflight
+        _webhook_inflight += 1
+        try:
+            await svc.process_webhook_profiles(profiles, job_id, sub_job_id)
+        finally:
+            _webhook_inflight -= 1
+
+    background_tasks.add_task(_bg_task)
 
     return {"ok": True, "received": len(profiles)}
 
@@ -1078,14 +1134,33 @@ async def webhook_notify(request: Request, background_tasks: BackgroundTasks):
     sub_job_id = request.query_params.get("sub_job_id")
 
     if status == "ready" and snapshot_id:
-        # ── Idempotency: skip already-processed snapshots ──────────────────────
-        if await svc.is_snapshot_processed(snapshot_id):
-            logger.info("[WebhookNotify] snapshot %s already processed — skipping", snapshot_id)
-            return {"ok": True, "duplicate": True, "message": "Snapshot already processed"}
-        org_id = _get_org_id(request)
-        await svc.mark_snapshot_processed(snapshot_id, job_id, org_id)
+        # ── Backpressure guard ────────────────────────────────────────────────
+        global _webhook_inflight
+        if _webhook_inflight >= MAX_WEBHOOK_INFLIGHT:
+            logger.warning("[WebhookNotify] inflight limit reached (%d) — returning 429", _webhook_inflight)
+            return JSONResponse(status_code=429, content={"ok": False, "error": "too many in-flight webhooks"})
+
+        # ── Idempotency check within BrightData's 10s window ─────────────────
+        async def _pre_response_notify() -> dict:
+            if await svc.is_snapshot_processed(snapshot_id):
+                logger.info("[WebhookNotify] snapshot %s already processed — skipping", snapshot_id)
+                return {"ok": True, "duplicate": True, "message": "Snapshot already processed"}
+            org_id = _get_org_id(request)
+            await svc.mark_snapshot_processed(snapshot_id, job_id, org_id)
+            return {}
+
+        try:
+            early = await asyncio.wait_for(_pre_response_notify(), timeout=9.0)
+        except asyncio.TimeoutError:
+            logger.warning("[WebhookNotify] pre-response timed out for snapshot %s — accepting anyway", snapshot_id)
+            return JSONResponse(status_code=202, content={"ok": True, "timeout": True})
+
+        if early.get("duplicate"):
+            return early
 
         async def _download_and_process():
+            global _webhook_inflight
+            _webhook_inflight += 1
             try:
                 profiles = await svc.poll_snapshot(snapshot_id, interval=5, timeout=120)
                 await svc.process_webhook_profiles(profiles, job_id=job_id, sub_job_id=sub_job_id)
@@ -1095,6 +1170,8 @@ async def webhook_notify(request: Request, background_tasks: BackgroundTasks):
                 logger.error("[Notify] Download failed for %s: %s", snapshot_id, e)
                 if job_id:
                     await svc._update_job(job_id, status="failed", error=str(e))
+            finally:
+                _webhook_inflight -= 1
 
         background_tasks.add_task(_download_and_process)
 

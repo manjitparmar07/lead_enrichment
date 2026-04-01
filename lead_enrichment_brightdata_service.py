@@ -37,6 +37,12 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# ── Per-job webhook serialisation ──────────────────────────────────────────────
+# Serialises concurrent webhook calls that share the same job_id so that
+# DB progress updates and sub_job bookkeeping do not race.
+# Different job_ids acquire independent locks — no cross-job blocking.
+_job_webhook_locks: dict[str, asyncio.Lock] = {}
+
 # ── Bright Data ───────────────────────────────────────────────────────────────
 # All keys read lazily from keys_service so admin hot-reload works at request time.
 BD_BASE = "https://api.brightdata.com/datasets/v3"
@@ -282,6 +288,9 @@ _web_client: Optional[httpx.AsyncClient] = None   # Website scraping (follow red
 
 _HTTP_LIMITS = httpx.Limits(max_connections=40, max_keepalive_connections=20)
 
+# ── Bright Data timeout — override via BD_REQUEST_TIMEOUT env var ──────────────
+BD_REQUEST_TIMEOUT: int = int(os.getenv("BD_REQUEST_TIMEOUT", "90"))
+
 
 def _get_lio_client() -> httpx.AsyncClient:
     global _lio_client
@@ -307,7 +316,7 @@ def _get_bd_client() -> httpx.AsyncClient:
     """Shared client for Bright Data API calls."""
     global _bd_client
     if _bd_client is None or _bd_client.is_closed:
-        _bd_client = httpx.AsyncClient(timeout=90.0, limits=_HTTP_LIMITS)
+        _bd_client = httpx.AsyncClient(timeout=float(BD_REQUEST_TIMEOUT), limits=_HTTP_LIMITS)
     return _bd_client
 
 
@@ -319,6 +328,138 @@ def _get_web_client() -> httpx.AsyncClient:
             timeout=30.0, limits=_HTTP_LIMITS, follow_redirects=True,
         )
     return _web_client
+
+
+# ── Bright Data circuit breaker ────────────────────────────────────────────────
+# States: "closed" (normal) → "open" (rejecting) → "half_open" (one test req)
+BD_CIRCUIT_FAILURE_THRESHOLD: int = 5   # consecutive failures before opening
+BD_CIRCUIT_RESET_TIMEOUT: int     = 60  # seconds in OPEN before moving to HALF-OPEN
+
+_bd_circuit_state: str    = "closed"
+_bd_circuit_failures: int = 0
+_bd_circuit_open_until: float = 0.0     # epoch seconds
+
+
+def _bd_circuit_ok() -> bool:
+    """Return True if a BD request is allowed (circuit closed or half-open)."""
+    global _bd_circuit_state, _bd_circuit_open_until
+    if _bd_circuit_state == "closed":
+        return True
+    if _bd_circuit_state == "open":
+        if time.time() >= _bd_circuit_open_until:
+            _bd_circuit_state = "half_open"
+            logger.info("[Circuit] BD circuit breaker → HALF-OPEN (testing recovery)")
+            return True
+        return False
+    # half_open: allow the probe request through
+    return True
+
+
+def _bd_circuit_success() -> None:
+    """Record a successful BD response; resets the circuit to CLOSED."""
+    global _bd_circuit_state, _bd_circuit_failures
+    if _bd_circuit_state != "closed":
+        logger.info("[Circuit] BD circuit breaker → CLOSED (recovered)")
+    _bd_circuit_state    = "closed"
+    _bd_circuit_failures = 0
+
+
+def _bd_circuit_failure() -> None:
+    """Record a BD failure; opens the circuit once threshold is reached."""
+    global _bd_circuit_state, _bd_circuit_failures, _bd_circuit_open_until
+    _bd_circuit_failures += 1
+    if _bd_circuit_failures >= BD_CIRCUIT_FAILURE_THRESHOLD or _bd_circuit_state == "half_open":
+        _bd_circuit_state      = "open"
+        _bd_circuit_open_until = time.time() + BD_CIRCUIT_RESET_TIMEOUT
+        logger.error(
+            "[Circuit] BD circuit breaker → OPEN for %ds (%d consecutive failures)",
+            BD_CIRCUIT_RESET_TIMEOUT, _bd_circuit_failures,
+        )
+
+
+# ── Rate-limit wait helper ─────────────────────────────────────────────────────
+
+def _bd_rate_limit_wait(resp: httpx.Response) -> float:
+    """
+    Extract how long to wait from a 429 response.
+    Checks X-RateLimit-Reset (epoch) then Retry-After (delta seconds).
+    Falls back to 30s if neither header is present.
+    """
+    for header in ("X-RateLimit-Reset", "Retry-After", "x-ratelimit-reset", "retry-after"):
+        val = resp.headers.get(header)
+        if val:
+            try:
+                f = float(val)
+                if f > 1_000_000_000:   # epoch timestamp → convert to delta
+                    f = max(0.0, f - time.time())
+                return min(f, 120.0)    # cap at 2 minutes
+            except (ValueError, TypeError):
+                pass
+    return 30.0
+
+
+# ── Exponential backoff helper ─────────────────────────────────────────────────
+
+def _bd_backoff(attempt: int, base: float = 2.0, cap: float = 60.0) -> float:
+    """Return wait seconds for attempt (0-indexed): 2s, 4s, 8s, … capped at cap."""
+    return min(base ** (attempt + 1), cap)
+
+
+# ── LIO Dead-Letter Queue ─────────────────────────────────────────────────────
+_LIO_DLQ_KEY = "lio:dlq"
+
+async def _lio_dlq_push(lead_id: str, payload: dict, reason: str = "") -> None:
+    """Push a failed LIO delivery to Redis dead-letter queue for later replay."""
+    try:
+        import redis.asyncio as aioredis
+        redis_url = os.getenv("REDIS_URL", "")
+        if not redis_url:
+            return
+        r = aioredis.from_url(redis_url, decode_responses=True)
+        entry = json.dumps({
+            "lead_id":    lead_id,
+            "payload":    payload,
+            "reason":     reason,
+            "failed_at":  datetime.now(timezone.utc).isoformat(),
+        })
+        await r.lpush(_LIO_DLQ_KEY, entry)
+        await r.close()
+        logger.info("[LIO-DLQ] Lead %s pushed to DLQ (reason=%s)", lead_id, reason)
+    except Exception as e:
+        logger.error("[LIO-DLQ] Failed to push lead %s to DLQ: %s", lead_id, e)
+
+
+async def lio_dlq_replay(max_items: int = 50) -> dict:
+    """Replay up to max_items entries from the LIO dead-letter queue."""
+    try:
+        import redis.asyncio as aioredis
+        redis_url = os.getenv("REDIS_URL", "")
+        if not redis_url:
+            return {"replayed": 0, "failed": 0, "error": "REDIS_URL not set"}
+        r = aioredis.from_url(redis_url, decode_responses=True)
+        replayed = failed = 0
+        for _ in range(max_items):
+            raw = await r.rpop(_LIO_DLQ_KEY)
+            if not raw:
+                break
+            try:
+                entry = json.loads(raw)
+                payload = entry.get("payload", {})
+                lead_id = entry.get("lead_id", "unknown")
+                client = _get_lio_client()
+                resp = await client.post(LIO_RECEIVE_URL, json=payload)
+                resp.raise_for_status()
+                logger.info("[LIO-DLQ] Replayed lead %s → HTTP %s", lead_id, resp.status_code)
+                replayed += 1
+            except Exception as e:
+                logger.warning("[LIO-DLQ] Replay failed: %s — re-queuing", e)
+                await r.lpush(_LIO_DLQ_KEY, raw)  # put back for next retry
+                failed += 1
+        await r.close()
+        return {"replayed": replayed, "failed": failed}
+    except Exception as e:
+        logger.error("[LIO-DLQ] Replay error: %s", e)
+        return {"replayed": 0, "failed": 0, "error": str(e)}
 
 
 async def send_to_lio(lead: dict, sso_id: str = "") -> None:
@@ -333,6 +474,22 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
         return
 
     lead_id = lead.get("lead_id") or lead.get("id", "unknown")
+
+    # Idempotency: skip if this lead was already successfully sent to LIO
+    # Redis key with 24h TTL — prevents duplicate sends on retries/replays
+    _lio_sent_key = f"lio:sent:{lead_id}"
+    try:
+        import redis.asyncio as aioredis
+        _redis_url = os.getenv("REDIS_URL", "")
+        if _redis_url:
+            _r = aioredis.from_url(_redis_url, decode_responses=True)
+            already_sent = await _r.get(_lio_sent_key)
+            await _r.close()
+            if already_sent:
+                logger.info("[LIO] Lead %s already sent — skipping (idempotent)", lead_id)
+                return
+    except Exception:
+        pass  # Redis unavailable — proceed without idempotency check
 
     # work_email is the DB column name; email is legacy/nested key — prefer work_email
     raw_email = lead.get("work_email") or lead.get("email", "") or ""
@@ -503,22 +660,48 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
     logger.info("[LIO] Sending lead %s to %s | sso_id=%s | org=%s",
                 lead_id, url, sso_id, lead.get("organization_id", ""))
 
-    try:
-        client = _get_lio_client()
-        resp = await client.post(url, json=payload)
-        logger.info("[LIO] Response for lead %s → HTTP %s | body=%s",
-                    lead_id, resp.status_code, resp.text[:500])
-        resp.raise_for_status()
-        logger.info("[LIO] Successfully forwarded lead %s", lead_id)
-    except httpx.TimeoutException:
-        logger.error("[LIO] Timeout sending lead %s to %s", lead_id, url)
-    except httpx.ConnectError as e:
-        logger.error("[LIO] Connection error sending lead %s to %s: %s", lead_id, url, e)
-    except httpx.HTTPStatusError as e:
-        logger.error("[LIO] HTTP error for lead %s → HTTP %s | body=%s",
-                     lead_id, e.response.status_code, e.response.text[:500])
-    except Exception as e:
-        logger.error("[LIO] Unexpected error sending lead %s: %s", lead_id, e, exc_info=True)
+    # Retry with exponential backoff: 3 attempts, 5s / 10s delays between them
+    _LIO_MAX_ATTEMPTS = 3
+    for attempt in range(1, _LIO_MAX_ATTEMPTS + 1):
+        try:
+            client = _get_lio_client()
+            resp = await client.post(url, json=payload)
+            logger.info("[LIO] Response for lead %s → HTTP %s | body=%s",
+                        lead_id, resp.status_code, resp.text[:500])
+            resp.raise_for_status()
+            logger.info("[LIO] Successfully forwarded lead %s (attempt %d)", lead_id, attempt)
+            # Mark as sent in Redis (24h TTL) to prevent duplicate delivery
+            try:
+                import redis.asyncio as aioredis
+                _redis_url = os.getenv("REDIS_URL", "")
+                if _redis_url:
+                    _r = aioredis.from_url(_redis_url, decode_responses=True)
+                    await _r.set(_lio_sent_key, "1", ex=86400)
+                    await _r.close()
+            except Exception:
+                pass
+            return  # success — exit retry loop
+        except httpx.TimeoutException:
+            logger.warning("[LIO] Timeout lead %s (attempt %d/%d)", lead_id, attempt, _LIO_MAX_ATTEMPTS)
+        except httpx.ConnectError as e:
+            logger.warning("[LIO] Connection error lead %s (attempt %d/%d): %s", lead_id, attempt, _LIO_MAX_ATTEMPTS, e)
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            logger.warning("[LIO] HTTP %s lead %s (attempt %d/%d) | body=%s",
+                           status, lead_id, attempt, _LIO_MAX_ATTEMPTS, e.response.text[:300])
+            if status < 500 and status != 429:
+                # 4xx errors (except rate-limit) are not retryable — go straight to DLQ
+                await _lio_dlq_push(lead_id, payload, reason=f"HTTP {status}")
+                return
+        except Exception as e:
+            logger.warning("[LIO] Unexpected error lead %s (attempt %d/%d): %s", lead_id, attempt, _LIO_MAX_ATTEMPTS, e)
+
+        if attempt < _LIO_MAX_ATTEMPTS:
+            await asyncio.sleep(5 * attempt)  # 5s then 10s before final attempt
+
+    # All attempts exhausted — push to dead-letter queue for manual replay
+    logger.error("[LIO] All %d attempts failed for lead %s — pushing to DLQ", _LIO_MAX_ATTEMPTS, lead_id)
+    await _lio_dlq_push(lead_id, payload, reason="max_retries_exceeded")
 
 
 _redis_pool: Any = None
@@ -1458,13 +1641,78 @@ async def _call_llm(
 
 
 def _parse_json_from_llm(raw: str) -> dict:
-    """Extract first JSON object from LLM response."""
+    """
+    Robustly extract a JSON object from an LLM response.
+
+    Handles all common LLM output patterns in order:
+      1. Strip <think>…</think> reasoning blocks (Qwen/DeepSeek models)
+      2. Direct JSON parse (model returned clean JSON)
+      3. Strip markdown fences (```json … ``` or ``` … ```)
+      4. Extract first {...} block via regex
+      5. Attempt lightweight repair (trailing commas, single quotes)
+    Returns {} if all strategies fail.
+    """
+    if not raw or not isinstance(raw, str):
+        return {}
+
+    text = raw.strip()
+
+    # 1. Strip <think>…</think> blocks produced by reasoning models
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+    # 2. Try direct parse — model returned clean JSON
     try:
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if m:
-            return json.loads(m.group())
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return result
     except Exception:
         pass
+
+    # 3. Strip markdown fences: ```json … ``` or ``` … ```
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fenced:
+        try:
+            result = json.loads(fenced.group(1))
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            pass
+
+    # 4. Extract outermost {...} block
+    start = text.find("{")
+    if start != -1:
+        # Walk to find the matching closing brace
+        depth = 0
+        for i, ch in enumerate(text[start:], start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:i + 1]
+                    try:
+                        result = json.loads(candidate)
+                        if isinstance(result, dict):
+                            return result
+                    except Exception:
+                        pass
+                    break
+
+    # 5. Lightweight repair: trailing commas, single-quoted keys/values
+    try:
+        candidate = text[text.find("{"):] if "{" in text else text
+        # Remove trailing commas before } or ]
+        repaired = re.sub(r",\s*([}\]])", r"\1", candidate)
+        # Replace single-quoted strings with double-quoted (simple cases)
+        repaired = re.sub(r"'([^']*)'", r'"\1"', repaired)
+        result = json.loads(repaired)
+        if isinstance(result, dict):
+            logger.warning("[LLM] JSON required repair — check model output quality")
+            return result
+    except Exception:
+        pass
+
+    logger.warning("[LLM] Could not parse JSON from model response (len=%d)", len(raw))
     return {}
 
 
@@ -6558,11 +6806,18 @@ async def process_webhook_profiles(
             logger.debug("[Webhook] sub_job setup failed: %s", e)
             _sub_job_id = None
 
+    # ── Per-job lock: serialise webhook processing for the same job_id ────────
+    # Prevents progress-counter races when BrightData delivers multiple
+    # partial batches concurrently for a single job.
+    _job_lock = _job_webhook_locks.setdefault(job_id, asyncio.Lock()) if job_id else None
+
     # Process all profiles in parallel — one coroutine per profile
-    results = await asyncio.gather(
-        *[_process_one_webhook_profile(p, job_id, org_id) for p in profiles],
-        return_exceptions=True,
-    )
+    coros = [_process_one_webhook_profile(p, job_id, org_id) for p in profiles]
+    if _job_lock is not None:
+        async with _job_lock:
+            results = await asyncio.gather(*coros, return_exceptions=True)
+    else:
+        results = await asyncio.gather(*coros, return_exceptions=True)
 
     ok_leads = [r for r in results if isinstance(r, dict)]
     processed = len(ok_leads)
