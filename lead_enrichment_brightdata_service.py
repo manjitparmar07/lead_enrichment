@@ -373,9 +373,129 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
             pass
 
     # enrichment_data = LLM-structured output (shaped by lio_system_prompt).
-    # Falls back to linkedin_enrich view if crm_brief is not available.
+    # Fallback maps linkedin_enrich into the same crm_brief JSON structure so LIO
+    # always receives a consistent shape regardless of whether LLM ran.
+    def _linkedin_enrich_to_crm_brief_shape(le: dict) -> dict:
+        ident   = le.get("identity") or {}
+        prof    = ident.get("profile") or {}
+        scores  = le.get("scores") or {}
+        brkdown = scores.get("breakdown") or {}
+        bsig    = le.get("behavioural_signals") or {}
+        pitch   = le.get("pitch_intelligence") or {}
+        act     = le.get("activity") or {}
+        co      = ident.get("profile") or {}
+        tags    = le.get("tags") or []
+        posts   = act.get("linkedin_posts") or []
+        feed    = act.get("feed") or []
+        return {
+            "who_they_are": {
+                "name":           ident.get("name", ""),
+                "title":          ident.get("title", ""),
+                "company":        ident.get("company", ""),
+                "location":       ident.get("location") or ident.get("country", ""),
+                "linkedin_url":   ident.get("linkedin_url", ""),
+                "profile_image":  "",
+                "company_logo":   "",
+                "followers":      ident.get("followers", 0),
+                "connections":    ident.get("connections", 0),
+                "persona":        prof.get("seniority_level", ""),
+                "seniority":      prof.get("seniority_level", ""),
+                "trajectory":     "",
+                "decision_maker": "Yes" if "c-level" in (prof.get("seniority_level") or "").lower() or "vp" in (prof.get("seniority_level") or "").lower() else "Unknown",
+            },
+            "their_company": {
+                "type":             "",
+                "industry":         "",
+                "stage":            "",
+                "company_size":     "",
+                "founded":          "",
+                "website":          "",
+                "company_tags":     [],
+                "relevance_score":  0,
+                "relevance_reason": "",
+            },
+            "what_they_care_about": {
+                "primary_interests":  [bsig.get("posts_about", "")] if bsig.get("posts_about") else [],
+                "also_interested_in": [bsig.get("engages_with", "")] if bsig.get("engages_with") else [],
+                "passion_signals":    [],
+            },
+            "online_behaviour": {
+                "activity_level":   "",
+                "style":            bsig.get("communication_style", ""),
+                "recurring_themes": [],
+                "platform":         "LinkedIn",
+            },
+            "communication": {
+                "tone":          "",
+                "writing_style": bsig.get("communication_style", ""),
+                "emotional_mode": "",
+                "archetype":     "",
+                "mirror_tip":    "",
+            },
+            "what_drives_them": {
+                "values":      [],
+                "motivators":  [],
+                "pain_points": [bsig.get("pain_point_hint", "")] if bsig.get("pain_point_hint") else [],
+                "ambitions":   [],
+            },
+            "buying_signals": {
+                "intent_level":   brkdown.get("score_tier", ""),
+                "trigger_events": [],
+                "tools_used":     [],
+                "decision_style": bsig.get("decision_pattern", ""),
+                "intent_tags":    tags[:5],
+            },
+            "smart_tags": tags[:8],
+            "outreach_blueprint": {
+                "best_channel":      "",
+                "best_approach":     pitch.get("best_angle", ""),
+                "opening_hook_1":    pitch.get("suggested_cta", ""),
+                "opening_hook_2":    "",
+                "content_to_send":   "",
+                "topics_to_avoid":   pitch.get("do_not_pitch") or [],
+                "one_line_strategy": pitch.get("best_value_prop", ""),
+            },
+            "crm_scores": {
+                "icp_fit":    brkdown.get("icp_fit_score", 0),
+                "engagement": brkdown.get("intent_score", 0),
+                "timing":     brkdown.get("timing_score", 0),
+                "priority":   brkdown.get("score_tier", ""),
+            },
+            "crm_import_fields": {
+                "buyer_type":     prof.get("seniority_level", ""),
+                "buying_signal":  bsig.get("warm_signal", "") or "",
+                "outreach_tone":  "",
+                "hook_theme":     pitch.get("best_angle", ""),
+                "key_avoid":      ", ".join(pitch.get("do_not_pitch") or []),
+                "tag_1":          tags[0] if len(tags) > 0 else "",
+                "tag_2":          tags[1] if len(tags) > 1 else "",
+                "tag_3":          tags[2] if len(tags) > 2 else "",
+                "analyst_note":   pitch.get("top_pain_point", ""),
+            },
+            "recent_posts_summary": [
+                {
+                    "topic":         (p.get("text") or p.get("title") or "")[:80],
+                    "tone":          "",
+                    "key_message":   (p.get("text") or "")[:150],
+                    "engagement":    str(p.get("likes") or p.get("num_likes") or 0),
+                    "intent_signal": "",
+                }
+                for p in posts[:5]
+            ] or [{"topic": "", "tone": "", "key_message": "", "engagement": "", "intent_signal": ""}],
+            "recent_interactions_summary": [
+                {
+                    "type":          f.get("interaction", ""),
+                    "content_topic": (f.get("title") or "")[:80],
+                    "why_it_matters": "",
+                    "intent_signal":  "",
+                }
+                for f in feed[:5]
+            ] or [{"type": "", "content_topic": "", "why_it_matters": "", "intent_signal": ""}],
+        }
+
+    enrichment_data = _crm_brief if _crm_brief else _linkedin_enrich_to_crm_brief_shape(linkedin_enrich)
     payload = {
-        "enrichment_data": _crm_brief if _crm_brief else linkedin_enrich,
+        "enrichment_data": enrichment_data,
         "sso_id":          sso_id,
         "organization_id": lead.get("organization_id", ""),
     }
