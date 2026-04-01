@@ -272,9 +272,11 @@ def _normalise_person_text(lead: dict) -> None:
 
 # ── Shared persistent HTTP clients (reuse TCP/TLS connections across requests) ─
 # Each external service gets its own client so keep-alive pools don't interfere.
-LIO_RECEIVE_URL = os.getenv("LIO_RECEIVE_URL", "https://api-lio.worksbuddy.ai/api/enrich/receive")
-_JWT_SECRET     = os.getenv("JWT_SECRET", "")
-_LIO_TOKEN      = os.getenv("LIO_TOKEN", "")   # dedicated bearer token for LIO auth
+def _lio_receive_url() -> str:
+    return _k("LIO_RECEIVE_URL", "https://api-lio-worksbuddy.lbmdemo.com/api/enrich/receive")
+
+def _lio_token() -> str:
+    return _k("LIO_TOKEN", "") or os.getenv("JWT_SECRET", "")
 _lio_client: Optional[httpx.AsyncClient] = None
 _api_client: Optional[httpx.AsyncClient] = None   # Hunter / Apollo / Dropcontact / PDL / ZeroBounce
 _bd_client: Optional[httpx.AsyncClient] = None    # Bright Data
@@ -287,8 +289,7 @@ def _get_lio_client() -> httpx.AsyncClient:
     global _lio_client
     if _lio_client is None or _lio_client.is_closed:
         headers = {}
-        # Use dedicated LIO_TOKEN if set, otherwise fall back to JWT_SECRET
-        lio_auth = _LIO_TOKEN or _JWT_SECRET
+        lio_auth = _lio_token()
         if lio_auth:
             headers["Authorization"] = f"Bearer {lio_auth}"
         _lio_client = httpx.AsyncClient(timeout=30.0, limits=_HTTP_LIMITS, headers=headers)
@@ -327,7 +328,7 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
     Called as asyncio.create_task() — never blocks enrich_single().
     Logs a warning on failure but does not raise.
     """
-    url = LIO_RECEIVE_URL
+    url = _lio_receive_url()
     if not url:
         logger.warning("[LIO] LIO_RECEIVE_URL is not set — skipping forward")
         return
