@@ -798,6 +798,8 @@ async def init_leads_db() -> None:
         for col, col_type in _NEW_COLS:
             await conn.execute(f"ALTER TABLE enriched_leads ADD COLUMN IF NOT EXISTS {col} {col_type}")
         await conn.execute("ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS organization_id TEXT DEFAULT 'default'")
+        await conn.execute("ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS sso_id TEXT NOT NULL DEFAULT ''")
+        await conn.execute("ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS forward_to_lio BOOLEAN NOT NULL DEFAULT FALSE")
         await conn.execute("ALTER TABLE enrichment_audit_log ADD COLUMN IF NOT EXISTS step TEXT")
         await conn.execute("ALTER TABLE enrichment_audit_log ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'ok'")
         await conn.execute("ALTER TABLE enrichment_audit_log ADD COLUMN IF NOT EXISTS duration_ms INTEGER")
@@ -6019,12 +6021,14 @@ async def enrich_bulk(
         "status": "pending", "error": None,
         "webhook_url": webhook_url,
         "organization_id": org_id,
+        "sso_id": sso_id,
+        "forward_to_lio": forward_to_lio,
         "created_at": now, "updated_at": now,
     }
     _sql, _args = named_args(
         """INSERT INTO enrichment_jobs
-           (id,snapshot_id,total_urls,processed,failed,status,error,webhook_url,organization_id,created_at,updated_at)
-           VALUES (:id,:snapshot_id,:total_urls,:processed,:failed,:status,:error,:webhook_url,:organization_id,:created_at,:updated_at)""",
+           (id,snapshot_id,total_urls,processed,failed,status,error,webhook_url,organization_id,sso_id,forward_to_lio,created_at,updated_at)
+           VALUES (:id,:snapshot_id,:total_urls,:processed,:failed,:status,:error,:webhook_url,:organization_id,:sso_id,:forward_to_lio,:created_at,:updated_at)""",
         job,
     )
     async with get_pool().acquire() as conn:
@@ -6520,8 +6524,10 @@ async def process_webhook_profiles(
     job_id: Optional[str] = None,
     sub_job_id: Optional[str] = None,
 ) -> dict:
-    # Resolve org_id from job record (needed for Ably events + sub_job)
+    # Resolve org_id, sso_id, forward_to_lio from job record
     org_id = "default"
+    sso_id = ""
+    forward_to_lio = False
     if job_id:
         job = await get_job(job_id)
         if job:
@@ -6530,6 +6536,8 @@ async def process_webhook_profiles(
                 logger.info("[Webhook] job %s is cancelled — discarding %d profiles", job_id, len(profiles))
                 return {"processed": 0, "failed": 0, "cancelled": True}
             org_id = job.get("organization_id") or "default"
+            sso_id = job.get("sso_id") or ""
+            forward_to_lio = bool(job.get("forward_to_lio", False))
 
     # Use pre-created sub_job (chunked BD path) or create one (legacy/webhook path)
     _sub_job_id = sub_job_id
@@ -6602,6 +6610,13 @@ async def process_webhook_profiles(
     if job_id and ok_leads:
         for lead in ok_leads:
             await _publish_lead_done(org_id, job_id, lead)
+
+    # Forward to LIO — mirror the single-enrich behaviour (send unless forward_to_lio=True)
+    if not forward_to_lio and ok_leads:
+        for lead in ok_leads:
+            if lead.get("name"):
+                lead.setdefault("linkedin_enrich", _format_linkedin_enrich(lead))
+                asyncio.create_task(send_to_lio(lead, sso_id=sso_id))
 
     return {"processed": processed, "failed": failed}
 
