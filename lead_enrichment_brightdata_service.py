@@ -6471,7 +6471,8 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
         logger.info("[Pipeline] %s → completed", url)
         return lead
     except Exception as e:
-        logger.warning("[Webhook] %s: %s", raw_url, e)
+        import traceback as _tb
+        logger.error("[Webhook] FAILED %s: %s\n%s", raw_url, e, _tb.format_exc())
         # Mark lead as failed if it was already saved in scraping/enriching stage
         try:
             lead_id = _lead_id(_normalize_linkedin_url(_clean_bd_linkedin_url(raw_url)))
