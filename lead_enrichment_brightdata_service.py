@@ -3166,29 +3166,27 @@ _DEFAULT_CRM_BRIEF_PROMPT = """You are a high-performance B2B sales intelligence
 Your task is to analyze LinkedIn raw data (profile + posts + interactions + company context) and generate structured, insight-rich lead intelligence.
 
 STRICT RULES:
-- Return ONLY valid JSON (no markdown, no extra text).
-- Never leave any field empty.
-- If exact data is missing → generate a reasonable inference and mark it with "[inferred]".
-- Do NOT copy text verbatim — always synthesize.
+- Return ONLY valid JSON — no markdown, no code fences, no extra text before or after.
+- NEVER leave any field empty ("", [], 0 are all forbidden as final values — always fill with real data or a specific inference).
+- If exact data is missing → generate a confident, specific inference based on available signals.
+- Do NOT copy text verbatim — always synthesize into insight.
 - Keep outputs concise, specific, and high-signal.
-- Avoid generic B2B phrases.
+- Avoid generic B2B filler phrases (e.g. "results-driven", "passionate about").
+- All arrays MUST contain at least 2 real items.
+- All strings MUST be non-empty, meaningful, and specific.
 
 ANALYSIS LOGIC:
-- Authored posts → define expertise, identity, and authority.
-- Likes/comments/reposts → indicate interest and buying intent.
-- Company context → derive challenges, stage, and priorities.
-- If experience data is missing → reconstruct using activity + company.
-- Pain points MUST be derived (not generic).
-- Buying signals MUST come from behavior, not assumptions.
+- authored_posts → define expertise, identity, and authority.
+- interactions (likes/comments/reposts) → indicate buying intent and interest areas.
+- company_context → derive business challenges, growth stage, and priorities.
+- If experience data is missing → reconstruct from activity patterns and company context.
+- Pain points MUST be specific and derived from the data — not generic.
+- Buying signals MUST come from observed behaviour, not assumptions.
+- Trigger events = recent role changes, company news, posts about challenges.
+- Seniority and decision_maker fields MUST be inferred from title + experience.
 
-OUTPUT CONSTRAINTS:
-- All arrays MUST contain at least 1 item.
-- All strings MUST be non-empty.
-- Numeric fields MUST be valid numbers (no null).
-- Keep summaries short (1–2 lines max per item).
-
-OUTPUT JSON:
-{"who_they_are":{"name":"","title":"","company":"","location":"","linkedin_url":"","profile_image":"","company_logo":"","followers":0,"connections":0,"persona":"","seniority":"","trajectory":"","decision_maker":""},"their_company":{"type":"","industry":"","stage":"","company_size":"","founded":"","website":"","company_tags":[],"relevance_score":0,"relevance_reason":""},"what_they_care_about":{"primary_interests":[],"also_interested_in":[],"passion_signals":[]},"online_behaviour":{"activity_level":"","style":"","recurring_themes":[],"platform":""},"communication":{"tone":"","writing_style":"","emotional_mode":"","archetype":"","mirror_tip":""},"what_drives_them":{"values":[],"motivators":[],"pain_points":[],"ambitions":[]},"buying_signals":{"intent_level":"","trigger_events":[],"tools_used":[],"decision_style":"","intent_tags":[]},"smart_tags":[],"outreach_blueprint":{"best_channel":"","best_approach":"","opening_hook_1":"","opening_hook_2":"","content_to_send":"","topics_to_avoid":[],"one_line_strategy":""},"crm_scores":{"icp_fit":0,"engagement":0,"timing":0,"priority":""},"crm_import_fields":{"buyer_type":"","buying_signal":"","outreach_tone":"","hook_theme":"","key_avoid":"","tag_1":"","tag_2":"","tag_3":"","analyst_note":""},"recent_posts_summary":[{"topic":"","tone":"","key_message":"","engagement":"","intent_signal":""}],"recent_interactions_summary":[{"type":"","content_topic":"","why_it_matters":"","intent_signal":""}]}"""
+OUTPUT — return ONLY this JSON with ALL fields fully populated:
+{"who_they_are":{"name":"","title":"","company":"","location":"","linkedin_url":"","profile_image":"","company_logo":"","followers":"","connections":"","persona":"","seniority":"","trajectory":"","decision_maker":""},"their_company":{"type":"","industry":"","stage":"","company_size":"","founded":"","website":"","company_tags":["",""],"relevance_score":"","relevance_reason":""},"what_they_care_about":{"primary_interests":["",""],"secondary_interests":["",""],"passion_signals":["",""]},"online_behaviour":{"activity_level":"","content_style":"","recurring_themes":["",""],"primary_platform":""},"communication":{"tone":"","writing_style":"","emotional_mode":"","archetype":"","mirror_strategy":""},"what_drives_them":{"core_values":["",""],"motivators":["",""],"pain_points":["",""],"career_ambitions":["",""]},"buying_signals":{"intent_level":"","trigger_events":["",""],"tools_used":["",""],"decision_style":"","intent_tags":["",""]},"smart_tags":["","",""],"outreach_blueprint":{"best_channel":"","approach_strategy":"","opening_hooks":["",""],"recommended_content":"","avoid_topics":["",""],"one_line_strategy":""},"crm_scores":{"icp_fit":"","engagement_score":"","timing_score":"","priority_level":""},"crm_import_fields":{"buyer_type":"","buying_signal":"","outreach_tone":"","hook_theme":"","avoidance":"","tags":["","",""],"analyst_summary":""},"recent_activity":{"posts":[{"topic":"","tone":"","key_message":"","engagement":"","intent_signal":""}],"interactions":[{"interaction_type":"","topic":"","insight":"","intent_signal":""}]}}"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3943,7 +3941,7 @@ async def build_comprehensive_enrichment(
             brief = await _call_llm([
                 {"role": "system", "content": effective_crm_prompt},
                 {"role": "user",   "content": crm_brief_user},
-            ], max_tokens=2500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override)
+            ], max_tokens=3500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override)
             if not brief:
                 logger.warning("[Enrichment] CRM brief — all LLM providers returned None (hf=%s groq=%s)", hf_ok, grq_ok)
             else:
@@ -6022,6 +6020,24 @@ async def enrich_bulk(
 
     bd_triggered = False  # tracks whether BD path succeeded — prevents queue double-run
 
+    # Insert the parent job row FIRST so FK constraints on enrichment_sub_jobs are satisfied
+    job = {
+        "id": job_id, "snapshot_id": None,
+        "total_urls": len(urls), "processed": 0, "failed": 0,
+        "status": "pending", "error": None,
+        "webhook_url": webhook_url,
+        "organization_id": org_id,
+        "created_at": now, "updated_at": now,
+    }
+    _sql, _args = named_args(
+        """INSERT INTO enrichment_jobs
+           (id,snapshot_id,total_urls,processed,failed,status,error,webhook_url,organization_id,created_at,updated_at)
+           VALUES (:id,:snapshot_id,:total_urls,:processed,:failed,:status,:error,:webhook_url,:organization_id,:created_at,:updated_at)""",
+        job,
+    )
+    async with get_pool().acquire() as conn:
+        await conn.execute(_sql, *_args)
+
     # Trigger BrightData batch in parallel chunks when API key is available
     if _bd_api_key():
         try:
@@ -6066,6 +6082,8 @@ async def enrich_bulk(
             logger.error("[BulkEnrich] BD chunk trigger failed: %s — falling back to queue", e)
             error_msg = str(e)
 
+    # Update parent job with results from BD trigger (snapshot_id, status, error, webhook_url)
+    await _update_job(job_id, snapshot_id=snapshot_id, status=status, error=error_msg, webhook_url=webhook_url)
     job = {
         "id": job_id, "snapshot_id": snapshot_id,
         "total_urls": len(urls), "processed": 0, "failed": 0,
@@ -6074,14 +6092,6 @@ async def enrich_bulk(
         "organization_id": org_id,
         "created_at": now, "updated_at": now,
     }
-    sql, args = named_args(
-        """INSERT INTO enrichment_jobs
-           (id,snapshot_id,total_urls,processed,failed,status,error,webhook_url,organization_id,created_at,updated_at)
-           VALUES (:id,:snapshot_id,:total_urls,:processed,:failed,:status,:error,:webhook_url,:organization_id,:created_at,:updated_at)""",
-        job,
-    )
-    async with get_pool().acquire() as conn:
-        await conn.execute(sql, *args)
 
     if not webhook_url and not bd_triggered:
         # Fair multi-tenant queue (per-tenant queues + round-robin scheduler)
@@ -6745,7 +6755,7 @@ async def regenerate_crm_brief_for_lead(lead_id: str, org_id: str = "") -> Optio
     brief = await _call_llm([
         {"role": "system", "content": crm_brief_prompt},
         {"role": "user",   "content": f"Analyze this LinkedIn prospect data and return the JSON exactly as specified:\n\n{optimized_str}"},
-    ], max_tokens=2500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override)
+    ], max_tokens=3500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override)
 
     if not brief:
         raise RuntimeError("LLM unavailable or returned no content.")
