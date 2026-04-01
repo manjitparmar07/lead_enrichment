@@ -272,11 +272,9 @@ def _normalise_person_text(lead: dict) -> None:
 
 # ── Shared persistent HTTP clients (reuse TCP/TLS connections across requests) ─
 # Each external service gets its own client so keep-alive pools don't interfere.
-def _lio_receive_url() -> str:
-    return _k("LIO_RECEIVE_URL", "https://api-lio-worksbuddy.lbmdemo.com/api/enrich/receive")
-
-def _lio_token() -> str:
-    return _k("LIO_TOKEN", "") or os.getenv("JWT_SECRET", "")
+LIO_RECEIVE_URL = os.getenv("LIO_RECEIVE_URL", "https://api-lio.worksbuddy.ai/api/enrich/receive")
+_JWT_SECRET     = os.getenv("JWT_SECRET", "")
+_LIO_TOKEN      = os.getenv("LIO_TOKEN", "")   # dedicated bearer token for LIO auth
 _lio_client: Optional[httpx.AsyncClient] = None
 _api_client: Optional[httpx.AsyncClient] = None   # Hunter / Apollo / Dropcontact / PDL / ZeroBounce
 _bd_client: Optional[httpx.AsyncClient] = None    # Bright Data
@@ -289,7 +287,8 @@ def _get_lio_client() -> httpx.AsyncClient:
     global _lio_client
     if _lio_client is None or _lio_client.is_closed:
         headers = {}
-        lio_auth = _lio_token()
+        # Use dedicated LIO_TOKEN if set, otherwise fall back to JWT_SECRET
+        lio_auth = _LIO_TOKEN or _JWT_SECRET
         if lio_auth:
             headers["Authorization"] = f"Bearer {lio_auth}"
         _lio_client = httpx.AsyncClient(timeout=30.0, limits=_HTTP_LIMITS, headers=headers)
@@ -328,7 +327,7 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
     Called as asyncio.create_task() — never blocks enrich_single().
     Logs a warning on failure but does not raise.
     """
-    url = _lio_receive_url()
+    url = LIO_RECEIVE_URL
     if not url:
         logger.warning("[LIO] LIO_RECEIVE_URL is not set — skipping forward")
         return
@@ -893,7 +892,7 @@ async def _upsert_lead(lead: dict) -> None:
 async def _update_job(job_id: str, **kwargs) -> None:
     if not kwargs:
         return
-    kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
+    kwargs["updated_at"] = datetime.now(timezone.utc)
     keys = list(kwargs.keys())
     sets = ", ".join(f"{k}=${i + 1}" for i, k in enumerate(keys))
     args = [kwargs[k] for k in keys] + [job_id]
@@ -905,7 +904,7 @@ async def _create_sub_job(
     sub_job_id: str, job_id: str, chunk_index: int, total_urls: int, org_id: str,
     snapshot_id: Optional[str] = None,
 ) -> None:
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
     async with get_pool().acquire() as conn:
         await conn.execute(
             """INSERT INTO enrichment_sub_jobs
@@ -919,7 +918,7 @@ async def _create_sub_job(
 async def _update_sub_job(sub_job_id: str, **kwargs) -> None:
     if not kwargs:
         return
-    kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
+    kwargs["updated_at"] = datetime.now(timezone.utc)
     keys = list(kwargs.keys())
     sets = ", ".join(f"{k}=${i + 1}" for i, k in enumerate(keys))
     args = [kwargs[k] for k in keys] + [sub_job_id]
@@ -4736,7 +4735,6 @@ async def enrich_company_url(
     job_id: Optional[str] = None,
     org_id: str = "default",
     forward_to_lio: bool = False,
-    sso_id: str = "",
 ) -> dict:
     """
     Enrich a LinkedIn Company URL directly.
@@ -5021,7 +5019,7 @@ async def enrich_company_url(
         final_name, total_score, score_tier, company_email or "—", website or "—",
     )
     if not forward_to_lio and lead.get("name"):
-        asyncio.create_task(send_to_lio(lead, sso_id=sso_id))
+        asyncio.create_task(send_to_lio(lead))
     return lead
 
 
@@ -5068,7 +5066,7 @@ async def enrich_single(
     # ── Route: company URL → dedicated company pipeline ───────────────────────
     if _is_company_url(url):
         logger.info("[Enrich] Company URL detected — routing to company pipeline: %s", url)
-        return await enrich_company_url(url, job_id=job_id, org_id=org_id, forward_to_lio=forward_to_lio, sso_id=sso_id)
+        return await enrich_company_url(url, job_id=job_id, org_id=org_id, forward_to_lio=forward_to_lio)
 
     # ── Cache check: return existing enrichment if already in DB ─────────────
     cached = await get_lead(lead_id)
@@ -6004,7 +6002,7 @@ async def enrich_bulk(
     - Otherwise → in-process sequential asyncio task (guaranteed progress, single-server only)
     """
     job_id = str(uuid.uuid4())
-    now    = datetime.now(timezone.utc).isoformat()
+    now    = datetime.now(timezone.utc)
     snapshot_id = None
     status = "pending"
     error_msg = None
@@ -6040,28 +6038,32 @@ async def enrich_bulk(
             sub_job_ids = [str(uuid.uuid4()) for _ in url_chunks]
 
             async def _trigger_bd_chunk(idx: int, sjid: str, chunk: list) -> str:
-                # Webhook delivery disabled — always poll BrightData for results
-                # (webhook path had reliability issues; polling is simpler and self-healing)
-                # if app_url:
-                #     chunk_webhook = f"{app_url}/api/leads/webhook/brightdata?job_id={job_id}&sub_job_id={sjid}"
-                #     chunk_notify  = None
-                # elif webhook_url:
-                #     sep = "&" if "?" in webhook_url else "?"
-                #     chunk_webhook = f"{webhook_url}{sep}sub_job_id={sjid}"
-                #     chunk_notify  = notify_url
-                chunk_webhook = None
-                chunk_notify  = None
+                if app_url:
+                    # BD sends full data to chunk_webhook — no need for notify (avoids double-processing)
+                    chunk_webhook = f"{app_url}/api/leads/webhook/brightdata?job_id={job_id}&sub_job_id={sjid}"
+                    chunk_notify  = None
+                elif webhook_url:
+                    sep = "&" if "?" in webhook_url else "?"
+                    chunk_webhook = f"{webhook_url}{sep}sub_job_id={sjid}"
+                    chunk_notify  = notify_url
+                else:
+                    chunk_webhook = None
+                    chunk_notify  = None
                 snap_id = await trigger_batch_snapshot(chunk, chunk_webhook, chunk_notify, webhook_auth)
                 await _create_sub_job(sjid, job_id, idx, len(chunk), org_id, snapshot_id=snap_id)
-                asyncio.create_task(_poll_and_process_snapshot(snap_id, job_id, org_id, sub_job_id=sjid))
+                if not chunk_webhook:
+                    asyncio.create_task(_poll_and_process_snapshot(snap_id, job_id, org_id, sub_job_id=sjid))
                 logger.info(
-                    "[BulkEnrich] Chunk %d/%d (%d URLs) → snapshot %s (polling)",
-                    idx + 1, len(url_chunks), len(chunk), snap_id,
+                    "[BulkEnrich] Chunk %d/%d (%d URLs) → snapshot %s (webhook=%s)",
+                    idx + 1, len(url_chunks), len(chunk), snap_id, chunk_webhook or "polling",
                 )
                 return snap_id
 
             snap_ids    = await asyncio.gather(*[_trigger_bd_chunk(i, sjid, chunk) for i, (sjid, chunk) in enumerate(zip(sub_job_ids, url_chunks))])
             snapshot_id = snap_ids[0] if snap_ids else None  # store first on parent job for compat
+            # Set webhook_url on parent job row so stop/rerun routes can find it
+            if not webhook_url and app_url:
+                webhook_url = f"{app_url}/api/leads/webhook/brightdata?job_id={job_id}"
             status = "running"
             bd_triggered = True
             logger.info(
@@ -6226,10 +6228,6 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
     try:
         url = _normalize_linkedin_url(_clean_bd_linkedin_url(raw_url))
 
-        # Normalize raw BrightData batch profile — flattens nested current_company,
-        # maps full_name→name, avatar→avatar_url, headline→position, etc.
-        profile = _normalize_bd_profile(profile)
-
         # ── Retry if BrightData returned empty/partial/error profile ─────────────
         # Triggers when: no name/title/company, OR BD returned an explicit error field.
         # Up to 3 re-scrape attempts with 5s/10s/15s back-off before giving up.
@@ -6270,13 +6268,12 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             "title": profile.get("position", ""),
             "company": company,
             "avatar_url": _extract_avatar(profile),
-            "raw_brightdata": json.dumps(profile, default=str),
+            "raw_brightdata": profile,
             "about": (profile.get("about") or "")[:1000],
             "followers": _safe_int(profile.get("followers")),
             "connections": _safe_int(profile.get("connections")),
             "status": "scraping",
             "job_id": job_id,
-            "organization_id": org_id,
             "enriched_at": datetime.now(timezone.utc).isoformat(),
         })
         logger.info("[Pipeline] %s → scraping", url)
@@ -6308,7 +6305,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
         # ── Stage 2: ENRICHING — about to call LLM ────────────────────────────
         async with get_pool().acquire() as _conn:
             await _conn.execute(
-                "UPDATE enriched_leads SET status='enriching' WHERE id=$1",
+                "UPDATE enriched_leads SET status='enriching', updated_at=NOW() WHERE id=$1",
                 lead_id,
             )
         logger.info("[Pipeline] %s → enriching", url)
@@ -6457,37 +6454,28 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
                 "linkedin_posts": profile.get("_posts") or [],
                 "hiring_signals": profile.get("_hiring_signals") or [],
             }, default=str),
-            "raw_brightdata": json.dumps(profile, default=str),
+            "raw_brightdata": profile,
             "about": (profile.get("about") or "")[:1000],
             "followers": _safe_int(profile.get("followers")),
             "connections": _safe_int(profile.get("connections")),
             "email_source": contact.get("source") if isinstance(contact, dict) else None,
             "email_confidence": contact.get("confidence") if isinstance(contact, dict) else None,
-            # ── CRM brief — LLM-generated, save as JSON string ────────────────
-            "crm_brief": (
-                json.dumps(enrichment["crm_brief"], default=str)
-                if isinstance(enrichment.get("crm_brief"), dict)
-                else enrichment.get("crm_brief")
-            ),
             # ── Stage 3: COMPLETED — LLM done, full data saved ───────────────
             "status": "completed",
             "job_id": job_id,
-            "organization_id": org_id,
             "enriched_at": now,
         }
         await _upsert_lead(lead)
         logger.info("[Pipeline] %s → completed", url)
-        asyncio.create_task(send_to_lio(lead, sso_id=""))
         return lead
     except Exception as e:
-        import traceback as _tb
-        logger.error("[Webhook] FAILED %s: %s\n%s", raw_url, e, _tb.format_exc())
+        logger.warning("[Webhook] %s: %s", raw_url, e)
         # Mark lead as failed if it was already saved in scraping/enriching stage
         try:
             lead_id = _lead_id(_normalize_linkedin_url(_clean_bd_linkedin_url(raw_url)))
             async with get_pool().acquire() as _conn:
                 await _conn.execute(
-                    "UPDATE enriched_leads SET status='failed' WHERE id=$1 AND status IN ('scraping','enriching')",
+                    "UPDATE enriched_leads SET status='failed', updated_at=NOW() WHERE id=$1 AND status IN ('scraping','enriching')",
                     lead_id,
                 )
         except Exception:
@@ -6597,7 +6585,7 @@ async def process_webhook_profiles(
                           updated_at  = $3
                     WHERE id = $4
                 RETURNING processed, failed, total_urls, organization_id, status""",
-                processed, failed, datetime.now(timezone.utc).isoformat(), job_id,
+                processed, failed, datetime.now(timezone.utc), job_id,
             )
         if row:
             org_id = row["organization_id"] or org_id
