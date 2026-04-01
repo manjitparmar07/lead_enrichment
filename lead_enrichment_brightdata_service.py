@@ -3161,17 +3161,31 @@ Return ONLY valid JSON with these exact keys. Use null for missing data, never h
 # Default CRM Brief system prompt — used when lio_system_prompt is not set in DB
 # ─────────────────────────────────────────────────────────────────────────────
 
-_DEFAULT_CRM_BRIEF_PROMPT = """You are a B2B sales analyst. Analyze LinkedIn data. Return ONLY valid JSON, no markdown, no text outside JSON.
+_DEFAULT_CRM_BRIEF_PROMPT = """You are a high-performance B2B sales intelligence analyst.
 
-RULES:
-- Synthesize, never copy verbatim. Never use the word [inferred] in any output value.
-- analyst_note: 2-3 sentences from profile+posts+company+pain points — what they do and what they struggle with.
-- pain_points: derive from profile/posts/company context, not generic.
-- Liked/commented/reposted = intent signals. Authored posts = professional identity.
-- If experience missing, reconstruct from activity and company context.
-- recent_posts_summary: authored posts only, max 5.
-- recent_interactions_summary: likes/comments/reposts only, max 5.
-- All arrays: min 1 item. All strings: non-empty.
+Your task is to analyze LinkedIn raw data (profile + posts + interactions + company context) and generate structured, insight-rich lead intelligence.
+
+STRICT RULES:
+- Return ONLY valid JSON (no markdown, no extra text).
+- Never leave any field empty.
+- If exact data is missing → generate a reasonable inference and mark it with "[inferred]".
+- Do NOT copy text verbatim — always synthesize.
+- Keep outputs concise, specific, and high-signal.
+- Avoid generic B2B phrases.
+
+ANALYSIS LOGIC:
+- Authored posts → define expertise, identity, and authority.
+- Likes/comments/reposts → indicate interest and buying intent.
+- Company context → derive challenges, stage, and priorities.
+- If experience data is missing → reconstruct using activity + company.
+- Pain points MUST be derived (not generic).
+- Buying signals MUST come from behavior, not assumptions.
+
+OUTPUT CONSTRAINTS:
+- All arrays MUST contain at least 1 item.
+- All strings MUST be non-empty.
+- Numeric fields MUST be valid numbers (no null).
+- Keep summaries short (1–2 lines max per item).
 
 OUTPUT JSON:
 {"who_they_are":{"name":"","title":"","company":"","location":"","linkedin_url":"","profile_image":"","company_logo":"","followers":0,"connections":0,"persona":"","seniority":"","trajectory":"","decision_maker":""},"their_company":{"type":"","industry":"","stage":"","company_size":"","founded":"","website":"","company_tags":[],"relevance_score":0,"relevance_reason":""},"what_they_care_about":{"primary_interests":[],"also_interested_in":[],"passion_signals":[]},"online_behaviour":{"activity_level":"","style":"","recurring_themes":[],"platform":""},"communication":{"tone":"","writing_style":"","emotional_mode":"","archetype":"","mirror_tip":""},"what_drives_them":{"values":[],"motivators":[],"pain_points":[],"ambitions":[]},"buying_signals":{"intent_level":"","trigger_events":[],"tools_used":[],"decision_style":"","intent_tags":[]},"smart_tags":[],"outreach_blueprint":{"best_channel":"","best_approach":"","opening_hook_1":"","opening_hook_2":"","content_to_send":"","topics_to_avoid":[],"one_line_strategy":""},"crm_scores":{"icp_fit":0,"engagement":0,"timing":0,"priority":""},"crm_import_fields":{"buyer_type":"","buying_signal":"","outreach_tone":"","hook_theme":"","key_avoid":"","tag_1":"","tag_2":"","tag_3":"","analyst_note":""},"recent_posts_summary":[{"topic":"","tone":"","key_message":"","engagement":"","intent_signal":""}],"recent_interactions_summary":[{"type":"","content_topic":"","why_it_matters":"","intent_signal":""}]}"""
@@ -4083,19 +4097,28 @@ def _build_llm_profile(profile: dict) -> dict:
         }
 
     # ── Build maximally signal-dense profile ──────────────────────────────────────
+    # Keys are named to match the prompt's ANALYSIS LOGIC terminology:
+    #   authored_posts      → expertise, identity, authority
+    #   interactions        → buying intent (liked/commented/reposted)
+    #   company_context     → challenges, stage, priorities
     _current_co = profile.get("current_company") or {}
     return {
+        # ── Identity ────────────────────────────────────────────────────────────
         "name":            profile.get("name", ""),
-        "first_name":      profile.get("first_name", ""),
-        "last_name":       profile.get("last_name", ""),
         "headline":        profile.get("headline") or profile.get("position") or profile.get("title", ""),
         "location":        profile.get("location") or profile.get("city", ""),
-        "country":         profile.get("country_code", ""),
+        "country":         profile.get("country_code") or profile.get("country", ""),
         "linkedin_url":    profile.get("url") or profile.get("input_url", ""),
-        "about":           profile.get("about") or "",   # full bio — primary intent signal
+        "profile_image":   profile.get("avatar_url") or profile.get("profile_pic_url", ""),
+        "about":           profile.get("about") or "",
         "followers":       profile.get("followers", 0),
         "connections":     profile.get("connections", 0),
-        "current_company": _clean_company(_current_co),
+        # ── Company context → derive challenges, stage, priorities ───────────
+        "company_context": {
+            **_clean_company(_current_co),
+            "logo": _current_co.get("logo") or _current_co.get("logo_url", ""),
+        },
+        # ── Career history ───────────────────────────────────────────────────
         "experience":      _clean_exp(profile.get("experience")),
         "education":       _clean_edu(profile.get("education") or []),
         "skills":          [
@@ -4106,20 +4129,21 @@ def _build_llm_profile(profile: dict) -> dict:
             (c.get("title") or str(c))[:120]
             for c in (profile.get("certifications") or [])
         ][:15],
-        "honors_awards":   profile.get("honors_and_awards") or None,
         "languages": [
             {"lang": (l.get("title") or l.get("name") or str(l)), "level": l.get("subtitle", "")}
             if isinstance(l, dict) else {"lang": str(l)}
             for l in (profile.get("languages") or [])
         ],
-        "groups": [
+        "groups":          [
             g.get("name") or g.get("title") or str(g)
             for g in (profile.get("groups") or [])
         ][:20],
         "volunteer":       _clean_volunteer(profile.get("volunteer_experience") or profile.get("volunteer") or []),
         "recommendations": _clean_recs(profile.get("recommendations")),
-        "posts":           _clean_posts(profile.get("posts") or profile.get("recent_posts") or []),
-        "activity":        _clean_activity(profile.get("activity")),
+        # ── Authored posts → expertise, identity, authority (HIGHEST SIGNAL) ─
+        "authored_posts":  _clean_posts(profile.get("posts") or profile.get("recent_posts") or []),
+        # ── Interactions → buying intent (liked / commented / reposted) ──────
+        "interactions":    _clean_activity(profile.get("activity")),
     }
 
 
@@ -4139,18 +4163,18 @@ def _trim_profile_to_budget(optimized: dict, char_budget: int) -> dict:
         lambda d: d.update({"recommendations": d.get("recommendations", [])[:3]}) or d,
         # Step 3 — halve certifications + languages
         lambda d: d.update({"certifications": d.get("certifications", [])[:5], "languages": d.get("languages", [])[:3]}) or d,
-        # Step 4 — trim activity
-        lambda d: d.update({"activity": d.get("activity", [])[:15]}) or d,
-        # Step 5 — trim posts
-        lambda d: d.update({"posts": d.get("posts", [])[:10]}) or d,
+        # Step 4 — trim interactions (buying intent signals)
+        lambda d: d.update({"interactions": d.get("interactions", [])[:15]}) or d,
+        # Step 5 — trim authored posts (identity signals)
+        lambda d: d.update({"authored_posts": d.get("authored_posts", [])[:10]}) or d,
         # Step 6 — trim experience descriptions
         lambda d: d.update({"experience": [{**e, "description": (e.get("description") or "")[:400]} for e in d.get("experience", [])]}) or d,
         # Step 7 — drop recommendations entirely
         lambda d: d.update({"recommendations": []}) or d,
-        # Step 8 — trim activity further
-        lambda d: d.update({"activity": d.get("activity", [])[:8]}) or d,
-        # Step 9 — trim posts further
-        lambda d: d.update({"posts": d.get("posts", [])[:5]}) or d,
+        # Step 8 — trim interactions further
+        lambda d: d.update({"interactions": d.get("interactions", [])[:8]}) or d,
+        # Step 9 — trim authored posts further
+        lambda d: d.update({"authored_posts": d.get("authored_posts", [])[:5]}) or d,
         # Step 10 — trim about
         lambda d: d.update({"about": (d.get("about") or "")[:500]}) or d,
         # Step 11 — trim experience descriptions hard
