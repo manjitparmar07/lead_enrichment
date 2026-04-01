@@ -5970,21 +5970,10 @@ async def _poll_and_process_snapshot(
 
 def _bd_chunk_size(total: int) -> int:
     """
-    Chunk size for BrightData batch API calls.
-    Keeps each BD snapshot small enough for fast delivery and granular progress.
-
-      total ≤ 20   → all at once  (no benefit splitting tiny batches)
-      total ≤ 100  → 25/chunk     (≤4 parallel snapshots)
-      total ≤ 300  → 50/chunk     (≤6 parallel snapshots)
-      total > 300  → 100/chunk    (capped — avoid BD concurrency limits)
+    1 URL per chunk — each lead gets its own BrightData snapshot for granular progress.
+    Max 200 leads per job, so max 200 parallel snapshots.
     """
-    if total <= 20:
-        return total
-    if total <= 100:
-        return 25
-    if total <= 300:
-        return 50
-    return 100
+    return 1
 
 
 def _dynamic_chunk_size(total: int) -> int:
