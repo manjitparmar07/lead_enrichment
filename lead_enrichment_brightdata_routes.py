@@ -1365,11 +1365,10 @@ async def regenerate_company(lead_id: str):
 
 
 @router.post("/{lead_id}/crm-brief", include_in_schema=False)
-async def regenerate_crm_brief(lead_id: str, request: Request, background_tasks: BackgroundTasks):
+async def regenerate_crm_brief(lead_id: str, request: Request):
     """
     Re-run the CRM brief LLM call for an already-enriched lead.
     Uses raw_profile from DB + lio_system_prompt + lio_model from workspace_configs.
-    Fires as a background task so Railway's 30s gateway limit is never hit.
     """
     org_id = _get_org_id(request)
 
@@ -1381,14 +1380,13 @@ async def regenerate_crm_brief(lead_id: str, request: Request, background_tasks:
     if not lead.get("raw_profile"):
         raise HTTPException(status_code=422, detail="No raw_profile saved for this lead — re-enrich first")
 
-    async def _run():
-        try:
-            await svc.regenerate_crm_brief_for_lead(lead_id, org_id=org_id)
-        except Exception as exc:
-            logger.error("[RegenerateCrmBrief] Background task failed for lead=%s: %s", lead_id, exc)
+    try:
+        result = await svc.regenerate_crm_brief_for_lead(lead_id, org_id=org_id)
+    except Exception as exc:
+        logger.error("[RegenerateCrmBrief] Failed for lead=%s: %s", lead_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc))
 
-    background_tasks.add_task(_run)
-    return {"success": True, "status": "processing", "lead_id": lead_id}
+    return {"success": True, "lead_id": lead_id, "crm_brief": result.get("crm_brief") if result else None}
 
 
 @router.delete("/{lead_id}", include_in_schema=False)

@@ -793,6 +793,7 @@ async def init_leads_db() -> None:
             ("account_pitch", "TEXT"), ("wappalyzer_tech", "TEXT"),
             ("news_mentions", "TEXT"), ("crunchbase_data", "TEXT"),
             ("linkedin_posts", "TEXT"), ("company_score_tier", "TEXT"),
+            ("crm_brief", "TEXT"),
         ]
         for col, col_type in _NEW_COLS:
             await conn.execute(f"ALTER TABLE enriched_leads ADD COLUMN IF NOT EXISTS {col} {col_type}")
@@ -970,68 +971,68 @@ def _format_linkedin_enrich(lead: dict, include_contact: bool = True) -> dict:
         "enriched_at":  lead.get("enriched_at"),
         "cache_hit":    bool(lead.get("_cache_hit")),
 
-        "identity": {
-            "first_name":   lead.get("first_name"),
-            "last_name":    lead.get("last_name"),
-            "name":         lead.get("name"),
-            "title":        lead.get("title"),
-            "company":      lead.get("company"),
-            "location":     lead.get("location"),
-            "country":      lead.get("country"),
-            "timezone":     lead.get("timezone"),
-            "about":        lead.get("about"),
-            "linkedin_url": lead.get("linkedin_url"),
-            "twitter_url":  lead.get("twitter_url"),
-            "followers":    lead.get("followers"),
-            "connections":  lead.get("connections"),
-            "skills":       _parse_json_safe(lead.get("skills"), []),
-            "profile":      full.get("person_profile", {}),
-        },
+        # "identity": {
+        #     "first_name":   lead.get("first_name"),
+        #     "last_name":    lead.get("last_name"),
+        #     "name":         lead.get("name"),
+        #     "title":        lead.get("title"),
+        #     "company":      lead.get("company"),
+        #     "location":     lead.get("location"),
+        #     "country":      lead.get("country"),
+        #     "timezone":     lead.get("timezone"),
+        #     "about":        lead.get("about"),
+        #     "linkedin_url": lead.get("linkedin_url"),
+        #     "twitter_url":  lead.get("twitter_url"),
+        #     "followers":    lead.get("followers"),
+        #     "connections":  lead.get("connections"),
+        #     "skills":       _parse_json_safe(lead.get("skills"), []),
+        #     "profile":      full.get("person_profile", {}),
+        # },
 
-        **({"contact": {
-            "work_email":        lead.get("work_email"),
-            "email":             lead.get("email"),
-            "phone":             lead.get("phone"),
-            "email_source":      lead.get("email_source"),
-            "email_confidence":  lead.get("email_confidence"),
-            "email_verified":    bool(lead.get("email_verified")),
-            "bounce_risk":       lead.get("bounce_risk"),
-            "enrichment_source": lead.get("enrichment_source"),
-        }} if include_contact else {}),
+        # **({"contact": {
+        #     "work_email":        lead.get("work_email"),
+        #     "email":             lead.get("email"),
+        #     "phone":             lead.get("phone"),
+        #     "email_source":      lead.get("email_source"),
+        #     "email_confidence":  lead.get("email_confidence"),
+        #     "email_verified":    bool(lead.get("email_verified")),
+        #     "bounce_risk":       lead.get("bounce_risk"),
+        #     "enrichment_source": lead.get("enrichment_source"),
+        # }} if include_contact else {}),
 
-        "scores": {
-            "total_score":       lead.get("total_score"),
-            "icp_score":         lead.get("icp_score"),
-            "intent_score":      lead.get("intent_score"),
-            "timing_score":      lead.get("timing_score"),
-            "data_completeness": lead.get("data_completeness"),
-            "score_tier":        lead.get("score_tier"),
-            "combined_score":    lead.get("combined_score"),
-            "score_reasons":     _parse_json_safe(lead.get("score_reasons"), []),
-            "breakdown":         lead_scoring,
-        },
+        # "scores": {
+        #     "total_score":       lead.get("total_score"),
+        #     "icp_score":         lead.get("icp_score"),
+        #     "intent_score":      lead.get("intent_score"),
+        #     "timing_score":      lead.get("timing_score"),
+        #     "data_completeness": lead.get("data_completeness"),
+        #     "score_tier":        lead.get("score_tier"),
+        #     "combined_score":    lead.get("combined_score"),
+        #     "score_reasons":     _parse_json_safe(lead.get("score_reasons"), []),
+        #     "breakdown":         lead_scoring,
+        # },
 
-        "icp_match": {
-            "icp_score":        lead.get("icp_score"),
-            "product_category": lead.get("product_category"),
-            "score_tier":       lead.get("score_tier"),
-            "icp_detail":       lead_scoring.get("icp_fit") or {},
-        },
+        # "icp_match": {
+        #     "icp_score":        lead.get("icp_score"),
+        #     "product_category": lead.get("product_category"),
+        #     "score_tier":       lead.get("score_tier"),
+        #     "icp_detail":       lead_scoring.get("icp_fit") or {},
+        # },
 
-        "behavioural_signals": _parse_json_safe(lead.get("behavioural_signals"), {}),
-        "pitch_intelligence":  _parse_json_safe(lead.get("pitch_intelligence"), {}),
+        # "behavioural_signals": _parse_json_safe(lead.get("behavioural_signals"), {}),
+        # "pitch_intelligence":  _parse_json_safe(lead.get("pitch_intelligence"), {}),
 
-        "activity": {
-            "feed":           _parse_json_safe(lead.get("activity_feed"), []),
-            "warm_signal":    lead.get("warm_signal"),
-            "hiring_signals": full.get("hiring_signals", []),
-            "linkedin_posts": full.get("linkedin_posts", []),
-        },
+        # "activity": {
+        #     "feed":           _parse_json_safe(lead.get("activity_feed"), []),
+        #     "warm_signal":    lead.get("warm_signal"),
+        #     "hiring_signals": full.get("hiring_signals", []),
+        #     "linkedin_posts": full.get("linkedin_posts", []),
+        # },
 
-        "tags": (
-            _parse_json_safe(lead.get("auto_tags"), []) or
-            _parse_json_safe(lead.get("tags"), [])
-        ),
+        # "tags": (
+        #     _parse_json_safe(lead.get("auto_tags"), []) or
+        #     _parse_json_safe(lead.get("tags"), [])
+        # ),
 
         "crm_brief": _parse_json_safe(lead.get("crm_brief"), None),
     }
