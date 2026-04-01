@@ -372,11 +372,12 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
         except Exception:
             pass
 
+    # enrichment_data = LLM-structured output (shaped by lio_system_prompt).
+    # Falls back to linkedin_enrich view if crm_brief is not available.
     payload = {
-        "enrichment_data": linkedin_enrich,
+        "enrichment_data": _crm_brief if _crm_brief else linkedin_enrich,
         "sso_id":          sso_id,
         "organization_id": lead.get("organization_id", ""),
-        "crm_brief":       _crm_brief,
     }
 
     logger.info("[LIO] Sending lead %s to %s | sso_id=%s | org=%s",
@@ -3798,11 +3799,16 @@ async def build_comprehensive_enrichment(
             _optimized = _build_llm_profile(profile)
             raw_profile_str = json.dumps(_optimized, separators=(",", ":"), ensure_ascii=False, default=str)
             crm_brief_user = f"Analyze this LinkedIn prospect data and return the JSON exactly as specified:\n\n{raw_profile_str}"
+            hf_ok  = bool(_hf_token())
+            grq_ok = bool(_groq_key())
+            logger.info("[Enrichment] CRM brief LLM call — hf=%s groq=%s org=%s", hf_ok, grq_ok, org_id)
             brief = await _call_llm([
                 {"role": "system", "content": effective_crm_prompt},
                 {"role": "user",   "content": crm_brief_user},
             ], max_tokens=2500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override, hf_first=True)
-            if brief:
+            if not brief:
+                logger.warning("[Enrichment] CRM brief — all LLM providers returned None (hf=%s groq=%s)", hf_ok, grq_ok)
+            else:
                 import re as _re
                 # Strip ALL <think>...</think> blocks (qwen3, deepseek, etc.)
                 brief = _re.sub(r"<think>.*?</think>", "", brief, flags=_re.DOTALL)
