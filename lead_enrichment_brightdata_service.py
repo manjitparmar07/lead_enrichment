@@ -6308,7 +6308,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
         # ── Stage 2: ENRICHING — about to call LLM ────────────────────────────
         async with get_pool().acquire() as _conn:
             await _conn.execute(
-                "UPDATE enriched_leads SET status='enriching', updated_at=NOW() WHERE id=$1",
+                "UPDATE enriched_leads SET status='enriching' WHERE id=$1",
                 lead_id,
             )
         logger.info("[Pipeline] %s → enriching", url)
@@ -6481,7 +6481,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             lead_id = _lead_id(_normalize_linkedin_url(_clean_bd_linkedin_url(raw_url)))
             async with get_pool().acquire() as _conn:
                 await _conn.execute(
-                    "UPDATE enriched_leads SET status='failed', updated_at=NOW() WHERE id=$1 AND status IN ('scraping','enriching')",
+                    "UPDATE enriched_leads SET status='failed' WHERE id=$1 AND status IN ('scraping','enriching')",
                     lead_id,
                 )
         except Exception:
