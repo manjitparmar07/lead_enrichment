@@ -6276,6 +6276,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             "connections": _safe_int(profile.get("connections")),
             "status": "scraping",
             "job_id": job_id,
+            "organization_id": org_id,
             "enriched_at": datetime.now(timezone.utc).isoformat(),
         })
         logger.info("[Pipeline] %s → scraping", url)
@@ -6465,10 +6466,12 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             # ── Stage 3: COMPLETED — LLM done, full data saved ───────────────
             "status": "completed",
             "job_id": job_id,
+            "organization_id": org_id,
             "enriched_at": now,
         }
         await _upsert_lead(lead)
         logger.info("[Pipeline] %s → completed", url)
+        asyncio.create_task(send_to_lio(lead, sso_id=""))
         return lead
     except Exception as e:
         import traceback as _tb
