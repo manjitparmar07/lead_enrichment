@@ -1365,29 +1365,30 @@ async def regenerate_company(lead_id: str):
 
 
 @router.post("/{lead_id}/crm-brief", include_in_schema=False)
-async def regenerate_crm_brief(lead_id: str, request: Request):
+async def regenerate_crm_brief(lead_id: str, request: Request, background_tasks: BackgroundTasks):
     """
     Re-run the CRM brief LLM call for an already-enriched lead.
     Uses raw_profile from DB + lio_system_prompt + lio_model from workspace_configs.
+    Fires as a background task so Railway's 30s gateway limit is never hit.
     """
     org_id = _get_org_id(request)
-    try:
-        # 25s hard cap so Railway's gateway (30s) never kills the connection with a 502
-        result = await asyncio.wait_for(
-            svc.regenerate_crm_brief_for_lead(lead_id, org_id=org_id),
-            timeout=25.0,
-        )
-    except asyncio.TimeoutError:
-        logger.error("[RegenerateCrmBrief] Timed out after 25s for lead=%s", lead_id)
-        raise HTTPException(status_code=503, detail="LLM generation timed out — please try again in a moment")
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        logger.error("[RegenerateCrmBrief] Unexpected error for lead=%s: %s", lead_id, exc)
-        raise HTTPException(status_code=500, detail=f"Regeneration failed: {exc}")
-    if not result:
+
+    # Verify lead exists before accepting job
+    lead = await svc.get_lead(lead_id)
+    if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
-    return {"success": True, "lead": _format_lead(result, full=True)}
+
+    if not lead.get("raw_profile"):
+        raise HTTPException(status_code=422, detail="No raw_profile saved for this lead — re-enrich first")
+
+    async def _run():
+        try:
+            await svc.regenerate_crm_brief_for_lead(lead_id, org_id=org_id)
+        except Exception as exc:
+            logger.error("[RegenerateCrmBrief] Background task failed for lead=%s: %s", lead_id, exc)
+
+    background_tasks.add_task(_run)
+    return {"success": True, "status": "processing", "lead_id": lead_id}
 
 
 @router.delete("/{lead_id}", include_in_schema=False)

@@ -3043,7 +3043,7 @@ Return ONLY valid JSON with these exact keys. Use null for missing data, never h
 _DEFAULT_CRM_BRIEF_PROMPT = """You are a B2B sales analyst. Analyze LinkedIn data. Return ONLY valid JSON, no markdown, no text outside JSON.
 
 RULES:
-- Synthesize, never copy verbatim. Mark guesses [inferred].
+- Synthesize, never copy verbatim. Never use the word [inferred] in any output value.
 - analyst_note: 2-3 sentences from profile+posts+company+pain points — what they do and what they struggle with.
 - pain_points: derive from profile/posts/company context, not generic.
 - Liked/commented/reposted = intent signals. Authored posts = professional identity.
@@ -3797,6 +3797,9 @@ async def build_comprehensive_enrichment(
     if effective_crm_prompt:
         try:
             _optimized = _build_llm_profile(profile)
+            # Budget: leave at least 8K chars for the system prompt + headroom; cap profile at remainder
+            _profile_budget = max(20000, 80000 - len(effective_crm_prompt))
+            _optimized = _trim_profile_to_budget(_optimized, _profile_budget)
             raw_profile_str = json.dumps(_optimized, separators=(",", ":"), ensure_ascii=False, default=str)
             crm_brief_user = f"Analyze this LinkedIn prospect data and return the JSON exactly as specified:\n\n{raw_profile_str}"
             hf_ok  = bool(_hf_token())
@@ -3814,6 +3817,8 @@ async def build_comprehensive_enrichment(
                 brief = _re.sub(r"<think>.*?</think>", "", brief, flags=_re.DOTALL)
                 # Strip any unclosed <think> block at end
                 brief = _re.sub(r"<think>.*", "", brief, flags=_re.DOTALL).strip()
+                # Strip any [inferred] markers the model may have added
+                brief = brief.replace("[inferred]", "").replace("[Inferred]", "")
                 # Extract first complete JSON object using brace counting
                 _start = brief.find("{")
                 if _start != -1:
@@ -3995,6 +4000,51 @@ def _build_llm_profile(profile: dict) -> dict:
         "posts":           _clean_posts(profile.get("posts") or profile.get("recent_posts") or []),
         "activity":        _clean_activity(profile.get("activity")),
     }
+
+
+def _trim_profile_to_budget(optimized: dict, char_budget: int) -> dict:
+    """
+    Progressively reduce the optimized profile until it fits within char_budget.
+    Order: remove low-signal sections first, then reduce caps on high-signal ones.
+    The JSON structure is never changed — only content lengths/counts are reduced.
+    """
+    import copy
+    p = copy.deepcopy(optimized)
+
+    steps = [
+        # Step 1 — drop lowest signal sections entirely
+        lambda d: d.update({"volunteer": [], "groups": [], "honors_awards": None}) or d,
+        # Step 2 — halve recommendations
+        lambda d: d.update({"recommendations": d.get("recommendations", [])[:3]}) or d,
+        # Step 3 — halve certifications + languages
+        lambda d: d.update({"certifications": d.get("certifications", [])[:5], "languages": d.get("languages", [])[:3]}) or d,
+        # Step 4 — trim activity
+        lambda d: d.update({"activity": d.get("activity", [])[:15]}) or d,
+        # Step 5 — trim posts
+        lambda d: d.update({"posts": d.get("posts", [])[:10]}) or d,
+        # Step 6 — trim experience descriptions
+        lambda d: d.update({"experience": [{**e, "description": (e.get("description") or "")[:400]} for e in d.get("experience", [])]}) or d,
+        # Step 7 — drop recommendations entirely
+        lambda d: d.update({"recommendations": []}) or d,
+        # Step 8 — trim activity further
+        lambda d: d.update({"activity": d.get("activity", [])[:8]}) or d,
+        # Step 9 — trim posts further
+        lambda d: d.update({"posts": d.get("posts", [])[:5]}) or d,
+        # Step 10 — trim about
+        lambda d: d.update({"about": (d.get("about") or "")[:500]}) or d,
+        # Step 11 — trim experience descriptions hard
+        lambda d: d.update({"experience": [{**e, "description": (e.get("description") or "")[:150]} for e in d.get("experience", [])]}) or d,
+        # Step 12 — cap skills
+        lambda d: d.update({"skills": d.get("skills", [])[:15]}) or d,
+    ]
+
+    for step in steps:
+        current = json.dumps(p, separators=(",", ":"), ensure_ascii=False, default=str)
+        if len(current) <= char_budget:
+            break
+        step(p)
+
+    return p
 
 
 def _rule_based_enrichment(
@@ -6530,12 +6580,14 @@ async def regenerate_crm_brief_for_lead(lead_id: str, org_id: str = "") -> Optio
     if not crm_brief_prompt:
         crm_brief_prompt = _DEFAULT_CRM_BRIEF_PROMPT
 
-    # Build optimized, noise-free profile for the LLM
+    # Build optimized, noise-free profile for the LLM; trim if combined content is too large
     optimized = _build_llm_profile(profile)
+    _profile_budget = max(20000, 80000 - len(crm_brief_prompt))
+    optimized = _trim_profile_to_budget(optimized, _profile_budget)
     optimized_str = json.dumps(optimized, separators=(",", ":"), ensure_ascii=False, default=str)
     logger.info(
-        "[RegenerateCrmBrief] Optimized profile: %d chars (raw was %d chars) ~%d tokens",
-        len(optimized_str), len(json.dumps(profile, default=str)), len(optimized_str) // 4,
+        "[RegenerateCrmBrief] Optimized profile: %d chars (budget %d) ~%d tokens",
+        len(optimized_str), _profile_budget, len(optimized_str) // 4,
     )
 
     brief = await _call_llm([
@@ -6549,6 +6601,8 @@ async def regenerate_crm_brief_for_lead(lead_id: str, org_id: str = "") -> Optio
     # Strip <think>...</think> blocks (qwen3, deepseek, etc.)
     brief = _re.sub(r"<think>.*?</think>", "", brief, flags=_re.DOTALL)
     brief = _re.sub(r"<think>.*", "", brief, flags=_re.DOTALL).strip()
+    # Strip any [inferred] markers the model may have added
+    brief = brief.replace("[inferred]", "").replace("[Inferred]", "")
 
     # Extract first complete JSON object
     _start = brief.find("{")
