@@ -798,6 +798,9 @@ async def init_leads_db() -> None:
         for col, col_type in _NEW_COLS:
             await conn.execute(f"ALTER TABLE enriched_leads ADD COLUMN IF NOT EXISTS {col} {col_type}")
         await conn.execute("ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS organization_id TEXT DEFAULT 'default'")
+        await conn.execute("ALTER TABLE enrichment_audit_log ADD COLUMN IF NOT EXISTS step TEXT")
+        await conn.execute("ALTER TABLE enrichment_audit_log ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'ok'")
+        await conn.execute("ALTER TABLE enrichment_audit_log ADD COLUMN IF NOT EXISTS duration_ms INTEGER")
         for idx_sql in [
             "CREATE INDEX IF NOT EXISTS idx_leads_org        ON enriched_leads(organization_id, total_score DESC)",
             "CREATE INDEX IF NOT EXISTS idx_jobs_org         ON enrichment_jobs(organization_id, created_at DESC)",
