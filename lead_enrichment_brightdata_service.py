@@ -893,7 +893,7 @@ async def _upsert_lead(lead: dict) -> None:
 async def _update_job(job_id: str, **kwargs) -> None:
     if not kwargs:
         return
-    kwargs["updated_at"] = datetime.now(timezone.utc)
+    kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
     keys = list(kwargs.keys())
     sets = ", ".join(f"{k}=${i + 1}" for i, k in enumerate(keys))
     args = [kwargs[k] for k in keys] + [job_id]
@@ -905,7 +905,7 @@ async def _create_sub_job(
     sub_job_id: str, job_id: str, chunk_index: int, total_urls: int, org_id: str,
     snapshot_id: Optional[str] = None,
 ) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).isoformat()
     async with get_pool().acquire() as conn:
         await conn.execute(
             """INSERT INTO enrichment_sub_jobs
@@ -919,7 +919,7 @@ async def _create_sub_job(
 async def _update_sub_job(sub_job_id: str, **kwargs) -> None:
     if not kwargs:
         return
-    kwargs["updated_at"] = datetime.now(timezone.utc)
+    kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
     keys = list(kwargs.keys())
     sets = ", ".join(f"{k}=${i + 1}" for i, k in enumerate(keys))
     args = [kwargs[k] for k in keys] + [sub_job_id]
@@ -6004,7 +6004,7 @@ async def enrich_bulk(
     - Otherwise → in-process sequential asyncio task (guaranteed progress, single-server only)
     """
     job_id = str(uuid.uuid4())
-    now    = datetime.now(timezone.utc)
+    now    = datetime.now(timezone.utc).isoformat()
     snapshot_id = None
     status = "pending"
     error_msg = None
@@ -6225,6 +6225,10 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
         return None
     try:
         url = _normalize_linkedin_url(_clean_bd_linkedin_url(raw_url))
+
+        # Normalize raw BrightData batch profile — flattens nested current_company,
+        # maps full_name→name, avatar→avatar_url, headline→position, etc.
+        profile = _normalize_bd_profile(profile)
 
         # ── Retry if BrightData returned empty/partial/error profile ─────────────
         # Triggers when: no name/title/company, OR BD returned an explicit error field.
@@ -6593,7 +6597,7 @@ async def process_webhook_profiles(
                           updated_at  = $3
                     WHERE id = $4
                 RETURNING processed, failed, total_urls, organization_id, status""",
-                processed, failed, datetime.now(timezone.utc), job_id,
+                processed, failed, datetime.now(timezone.utc).isoformat(), job_id,
             )
         if row:
             org_id = row["organization_id"] or org_id
