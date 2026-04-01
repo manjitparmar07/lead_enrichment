@@ -265,6 +265,7 @@ async def run_pipeline_test(raw_data: dict):
             temperature=0.3,
             model_override=model_override,
             wb_llm_model_override=model_override,
+            hf_first=True,
         )
         llm_ms = round((time.monotonic() - t_llm) * 1000)
 

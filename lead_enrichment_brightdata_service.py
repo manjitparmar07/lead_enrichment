@@ -3944,7 +3944,7 @@ async def build_comprehensive_enrichment(
             brief = await _call_llm([
                 {"role": "system", "content": effective_crm_prompt},
                 {"role": "user",   "content": crm_brief_user},
-            ], max_tokens=4500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override)
+            ], max_tokens=4500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override, hf_first=True)
             if not brief:
                 logger.warning("[Enrichment] CRM brief — all LLM providers returned None (hf=%s groq=%s)", hf_ok, grq_ok)
             else:
@@ -6762,7 +6762,7 @@ async def regenerate_crm_brief_for_lead(lead_id: str, org_id: str = "") -> Optio
     brief = await _call_llm([
         {"role": "system", "content": crm_brief_prompt},
         {"role": "user",   "content": f"Analyze this LinkedIn prospect data and return the JSON exactly as specified:\n\n{optimized_str}"},
-    ], max_tokens=4500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override)
+    ], max_tokens=4500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override, hf_first=True)
 
     if not brief:
         raise RuntimeError("LLM unavailable or returned no content.")
