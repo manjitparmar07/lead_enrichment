@@ -692,14 +692,12 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
             },
             "crm_import_fields": {
                 "buyer_type":     prof.get("seniority_level", ""),
-                "buying_signal":  bsig.get("warm_signal", "") or "",
-                "outreach_tone":  "",
-                "hook_theme":     pitch.get("best_angle", ""),
-                "key_avoid":      ", ".join(pitch.get("do_not_pitch") or []),
-                "tag_1":          tags[0] if len(tags) > 0 else "",
-                "tag_2":          tags[1] if len(tags) > 1 else "",
-                "tag_3":          tags[2] if len(tags) > 2 else "",
-                "analyst_note":   pitch.get("top_pain_point", ""),
+                "buying_signal":   bsig.get("warm_signal", "") or "",
+                "outreach_tone":   "",
+                "hook_theme":      pitch.get("best_angle", ""),
+                "avoidance":       ", ".join(pitch.get("do_not_pitch") or []),
+                "tags":            tags[:5],
+                "analyst_summary": pitch.get("top_pain_point", ""),
             },
             "recent_posts_summary": [
                 {
