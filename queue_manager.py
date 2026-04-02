@@ -76,7 +76,9 @@ CHUNK_REFRESH_SECS = int(os.getenv("CHUNK_REFRESH_SECS", "30"))
 
 # ── Retry / DLQ config ────────────────────────────────────────────────────────
 MAX_TASK_ATTEMPTS  = int(os.getenv("QUEUE_MAX_ATTEMPTS", "3"))   # retries before DLQ
-CHUNK_LOCK_TTL     = 3600                                         # exactly-once lock TTL (s)
+# Lock TTL: chunk_size(25) × max_url_time(20s) = 500s — 600s gives buffer.
+# Env-override for large chunks. Lower value means faster recovery on worker crash.
+CHUNK_LOCK_TTL     = int(os.getenv("CHUNK_LOCK_TTL", "600"))      # exactly-once lock TTL (s)
 
 # ── Autoscaler config ─────────────────────────────────────────────────────────
 WORKER_MAX           = int(os.getenv("LEAD_WORKER_MAX", str(NUM_WORKERS * 3)))

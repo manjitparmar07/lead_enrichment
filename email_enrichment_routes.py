@@ -70,6 +70,11 @@ def _extract_domain(url: str) -> str:
 
 _job_store: dict = {}   # fallback when Redis unavailable
 
+# Max concurrent email enrichment jobs — prevents event loop starvation and
+# external API (Hunter.io/Apollo) rate-limit exhaustion under high load.
+_EMAIL_JOB_CONCURRENCY = int(os.getenv("EMAIL_JOB_CONCURRENCY", "10"))
+_email_job_sem: asyncio.Semaphore = asyncio.Semaphore(_EMAIL_JOB_CONCURRENCY)
+
 
 async def _get_redis():
     try:
@@ -205,6 +210,17 @@ async def _run_email_enrichment_job(
     org_id: str,
     leads: list[dict],
 ) -> None:
+    # Acquire slot — at most _EMAIL_JOB_CONCURRENCY jobs run concurrently.
+    # Extra jobs queue here (in the event loop) rather than blasting the external APIs.
+    async with _email_job_sem:
+        await _run_email_enrichment_job_inner(job_id, org_id, leads)
+
+
+async def _run_email_enrichment_job_inner(
+    job_id: str,
+    org_id: str,
+    leads: list[dict],
+) -> None:
     total = len(leads)
     found = 0
     failed = 0
@@ -240,12 +256,26 @@ async def _run_email_enrichment_job(
                 failed += 1
                 continue
 
-            contact = await svc.find_contact_info(
-                first=first,
-                last=last,
-                domain=domain,
-                linkedin_url=lead.get("linkedin_url") or "",
-            )
+            # Retry up to 3 times — guards against transient Hunter.io/Apollo errors
+            contact = {}
+            _last_exc: Exception | None = None
+            for _attempt in range(3):
+                try:
+                    contact = await svc.find_contact_info(
+                        first=first,
+                        last=last,
+                        domain=domain,
+                        linkedin_url=lead.get("linkedin_url") or "",
+                    )
+                    _last_exc = None
+                    break
+                except Exception as exc:
+                    _last_exc = exc
+                    if _attempt < 2:
+                        await asyncio.sleep(2 ** _attempt)   # 1s, 2s backoff
+
+            if _last_exc is not None:
+                raise _last_exc
 
             if contact.get("email"):
                 await _save_email_result(lead_id, org_id, contact)

@@ -59,6 +59,18 @@ def _plog(job_id: str, url: str, stage: str, msg: str, level: str = "info") -> N
 # Different job_ids acquire independent locks — no cross-job blocking.
 _job_webhook_locks: dict[str, asyncio.Lock] = {}
 
+# ── Global BrightData trigger semaphore ────────────────────────────────────────
+# Shared across ALL enrich_bulk calls — prevents BD API rate-limit exhaustion.
+# Per-call semaphore (old approach) allowed N_orgs × 50 concurrent calls.
+_BD_TRIGGER_CONCURRENCY = int(os.getenv("BD_TRIGGER_CONCURRENCY", "50"))
+_bd_trigger_semaphore: asyncio.Semaphore = asyncio.Semaphore(_BD_TRIGGER_CONCURRENCY)
+
+# ── Sequential fallback concurrency cap ────────────────────────────────────────
+# When Redis is unavailable, enrich_bulk falls back to asyncio.create_task().
+# This semaphore prevents unbounded concurrent background tasks under that path.
+_SEQUENTIAL_FALLBACK_CONCURRENCY = int(os.getenv("SEQUENTIAL_FALLBACK_CONCURRENCY", "10"))
+_sequential_fallback_sem: asyncio.Semaphore = asyncio.Semaphore(_SEQUENTIAL_FALLBACK_CONCURRENCY)
+
 # ── Bright Data ───────────────────────────────────────────────────────────────
 # All keys read lazily from keys_service so admin hot-reload works at request time.
 BD_BASE = "https://api.brightdata.com/datasets/v3"
@@ -6931,11 +6943,8 @@ async def enrich_bulk(
             sub_job_ids = [str(uuid.uuid4()) for _ in url_chunks]
             total_chunks = len(url_chunks)
 
-            # Max 50 concurrent trigger calls to BrightData (BD standard plan safe limit)
-            _bd_semaphore = asyncio.Semaphore(50)
-
             async def _trigger_bd_chunk(idx: int, sjid: str, chunk: list) -> str:
-                async with _bd_semaphore:  # at most 10 in-flight at once
+                async with _bd_trigger_semaphore:  # global cap across all orgs
                     if app_url:
                         # BD sends full data to chunk_webhook — no need for notify
                         chunk_webhook = f"{app_url}/api/leads/webhook/brightdata?job_id={job_id}&sub_job_id={sjid}"
@@ -7029,7 +7038,11 @@ async def enrich_bulk(
             "[BulkEnrich] Starting in-process batch for %d URLs → %d chunks (org=%s)",
             len(urls), len(url_chunks), org_id,
         )
-        asyncio.create_task(_process_sequential_batch(job_id, url_chunks, sub_job_ids, org_id=org_id, sso_id=sso_id, forward_to_lio=forward_to_lio, system_prompt=system_prompt))
+        async def _sequential_with_cap():
+            async with _sequential_fallback_sem:
+                await _process_sequential_batch(job_id, url_chunks, sub_job_ids, org_id=org_id, sso_id=sso_id, forward_to_lio=forward_to_lio, system_prompt=system_prompt)
+
+        asyncio.create_task(_sequential_with_cap())
 
     return job
 
