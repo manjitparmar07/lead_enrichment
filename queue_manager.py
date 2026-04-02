@@ -127,7 +127,7 @@ AI_WORKERS       = int(os.getenv("AI_WORKER_COUNT",   "3"))
 AI_CHUNK         = int(os.getenv("AI_CHUNK_SIZE",     "5"))
 AI_LOCK_TTL      = int(os.getenv("AI_LOCK_TTL",       "600"))   # seconds
 MAX_AI_ATTEMPTS  = int(os.getenv("AI_MAX_ATTEMPTS",   "3"))
-HF_CONCURRENCY   = int(os.getenv("HF_CONCURRENCY",    "8"))     # max parallel HF calls
+HF_CONCURRENCY   = int(os.getenv("HF_CONCURRENCY",    "20"))    # max parallel HF calls
 
 KEY_AI_ACTIVE    = "wb:ai:active_orgs"   # ZSet: org_id → last_served_ts
 KEY_AI_WORK      = "wb:ai:work"          # List: scheduler → AI workers
@@ -1002,7 +1002,7 @@ async def _ai_scheduler_loop(r: Any) -> None:
             else:
                 logger.debug("[AI-Scheduler] Org %s AI queue exhausted", org_id)
 
-            await asyncio.sleep(0.05)  # 50ms yield — AI jobs are slower than URL jobs
+            await asyncio.sleep(0.01)  # 10ms yield — AI jobs are slower than URL jobs
 
         except asyncio.CancelledError:
             logger.info("[AI-Scheduler] Stopped")
@@ -1407,6 +1407,43 @@ async def stop_ai_workers() -> None:
         t.cancel()
     await asyncio.gather(*all_tasks, return_exceptions=True)
     logger.info("[AI-Workers] All stopped")
+
+
+async def scale_up_ai_workers(extra: int) -> int:
+    """
+    Spawn up to `extra` additional AI workers beyond the current pool.
+    Called proactively at the start of a large bulk job so the AI pipeline
+    is ready before enriched leads start arriving.
+    Returns the number of workers actually spawned.
+    """
+    global _ai_worker_tasks, _ai_next_worker_id
+
+    if not _ai_worker_tasks and not _ai_scheduler_task:
+        # AI system not started yet — nothing to scale
+        return 0
+
+    _ai_worker_tasks = [t for t in _ai_worker_tasks if not t.done()]
+    current = len(_ai_worker_tasks)
+    ai_worker_max = int(os.getenv("AI_WORKER_MAX", str(AI_WORKERS * 4)))
+    headroom = max(0, ai_worker_max - current)
+    to_spawn = min(extra, headroom)
+
+    for _ in range(to_spawn):
+        _ai_next_worker_id += 1
+        wid = _ai_next_worker_id
+        r_worker = await _make_redis()
+        task = asyncio.create_task(
+            _ai_worker(wid, r_worker),
+            name=f"ai-worker-{wid}",
+        )
+        _ai_worker_tasks.append(task)
+
+    if to_spawn:
+        logger.info(
+            "[AI-Workers] Proactive scale-up: +%d workers → %d total (max=%d)",
+            to_spawn, current + to_spawn, ai_worker_max,
+        )
+    return to_spawn
 
 
 # ─────────────────────────────────────────────────────────────────────────────

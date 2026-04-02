@@ -908,7 +908,7 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
             logger.warning("[LIO] Unexpected error lead %s (attempt %d/%d): %s", lead_id, attempt, _LIO_MAX_ATTEMPTS, e)
 
         if attempt < _LIO_MAX_ATTEMPTS:
-            await asyncio.sleep(5 * attempt)  # 5s then 10s before final attempt
+            await asyncio.sleep(1 * attempt)  # 1s then 2s before final attempt
 
     # All attempts exhausted — push to dead-letter queue for manual replay
     logger.error("[LIO] All %d attempts failed for lead %s — pushing to DLQ", _LIO_MAX_ATTEMPTS, lead_id)
@@ -6996,6 +6996,10 @@ async def enrich_bulk(
                 )
                 await _update_job(job_id, status="running")
                 job["status"] = "running"
+                # Proactively scale AI workers so the LLM pipeline keeps up with
+                # incoming enriched leads — 1 extra worker per 10 URLs, capped by AI_WORKER_MAX
+                extra_ai = max(1, len(urls) // 10)
+                await queue_manager.scale_up_ai_workers(extra_ai)
                 logger.info(
                     "[BulkEnrich] %d URLs → %d chunks queued for job %s (org=%s)",
                     len(urls), num_chunks, job_id, org_id,
