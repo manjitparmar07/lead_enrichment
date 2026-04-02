@@ -842,12 +842,7 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
         return
 
     payload = {
-        "lead_id":         lead_id,
-        "linkedin_url":    lead.get("linkedin_url", ""),
-        "enriched_at":     lead.get("enriched_at", ""),
-        "cache_hit":       bool(lead.get("_cache_hit", False)),
         "crm_brief":       _crm_brief,
-        "enrichment_data": _crm_brief,   # LIO requires this field — same as crm_brief
         "sso_id":          sso_id,
         "organization_id": lead.get("organization_id", ""),
     }
