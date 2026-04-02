@@ -554,6 +554,17 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
             if not who.get("company_logo"):
                 who["company_logo"] = lead.get("company_logo") or ""
 
+        # Ensure crm_scores are integers — LLM sometimes returns strings like "High", "80%"
+        scores = _crm_brief.get("crm_scores")
+        if isinstance(scores, dict):
+            for _sf in ("icp_fit", "engagement_score", "timing_score"):
+                v = scores.get(_sf)
+                if not isinstance(v, int):
+                    try:
+                        scores[_sf] = int(str(v).replace("%", "").strip())
+                    except Exception:
+                        scores[_sf] = 0
+
     # enrichment_data = LLM-structured output (shaped by lio_system_prompt).
     # Fallback maps linkedin_enrich into the same crm_brief JSON structure so LIO
     # always receives a consistent shape regardless of whether LLM ran.
@@ -4038,9 +4049,10 @@ ANALYSIS LOGIC:
 - Buying signals MUST come from observed behaviour, not assumptions.
 - Trigger events = recent role changes, company news, posts about challenges.
 - Seniority and decision_maker fields MUST be inferred from title + experience.
+- crm_scores MUST use INTEGER values (0–100) for icp_fit, engagement_score, timing_score. priority_level MUST be one of: "High", "Medium", "Low".
 
 OUTPUT — return ONLY this JSON with ALL fields fully populated (arrays must have 4–5 items each):
-{"who_they_are":{"name":"","title":"","company":"","location":"","linkedin_url":"","profile_image":"","company_logo":"","followers":"","connections":"","persona":"","seniority":"","trajectory":"","decision_maker":""},"their_company":{"type":"","industry":"","stage":"","company_size":"","founded":"","website":"","company_tags":["","","","",""],"relevance_score":"","relevance_reason":""},"what_they_care_about":{"primary_interests":["","","","",""],"secondary_interests":["","","","",""],"passion_signals":["","","","",""]},"online_behaviour":{"activity_level":"","content_style":"","recurring_themes":["","","","",""],"primary_platform":""},"communication":{"tone":"","writing_style":"","emotional_mode":"","archetype":"","mirror_strategy":""},"what_drives_them":{"core_values":["","","","",""],"motivators":["","","","",""],"pain_points":["","","","",""],"career_ambitions":["","","","",""]},"buying_signals":{"intent_level":"","trigger_events":["","","","",""],"tools_used":["","","","",""],"decision_style":"","intent_tags":["","","","",""]},"smart_tags":["","","","",""],"outreach_blueprint":{"best_channel":"","approach_strategy":"","opening_hooks":["","","","",""],"recommended_content":"","avoid_topics":["","","","",""],"one_line_strategy":""},"crm_scores":{"icp_fit":"","engagement_score":"","timing_score":"","priority_level":""},"crm_import_fields":{"buyer_type":"","buying_signal":"","outreach_tone":"","hook_theme":"","avoidance":"","tags":["","","","",""],"analyst_summary":""},"recent_activity":{"posts":[{"topic":"","tone":"","key_message":"","engagement":"","intent_signal":""},{"topic":"","tone":"","key_message":"","engagement":"","intent_signal":""},{"topic":"","tone":"","key_message":"","engagement":"","intent_signal":""}],"interactions":[{"interaction_type":"","topic":"","insight":"","intent_signal":""},{"interaction_type":"","topic":"","insight":"","intent_signal":""},{"interaction_type":"","topic":"","insight":"","intent_signal":""}]}}"""
+{"who_they_are":{"name":"","title":"","company":"","location":"","linkedin_url":"","profile_image":"","company_logo":"","followers":"","connections":"","persona":"","seniority":"","trajectory":"","decision_maker":""},"their_company":{"type":"","industry":"","stage":"","company_size":"","founded":"","website":"","company_tags":["","","","",""],"relevance_score":"","relevance_reason":""},"what_they_care_about":{"primary_interests":["","","","",""],"secondary_interests":["","","","",""],"passion_signals":["","","","",""]},"online_behaviour":{"activity_level":"","content_style":"","recurring_themes":["","","","",""],"primary_platform":""},"communication":{"tone":"","writing_style":"","emotional_mode":"","archetype":"","mirror_strategy":""},"what_drives_them":{"core_values":["","","","",""],"motivators":["","","","",""],"pain_points":["","","","",""],"career_ambitions":["","","","",""]},"buying_signals":{"intent_level":"","trigger_events":["","","","",""],"tools_used":["","","","",""],"decision_style":"","intent_tags":["","","","",""]},"smart_tags":["","","","",""],"outreach_blueprint":{"best_channel":"","approach_strategy":"","opening_hooks":["","","","",""],"recommended_content":"","avoid_topics":["","","","",""],"one_line_strategy":""},"crm_scores":{"icp_fit":0,"engagement_score":0,"timing_score":0,"priority_level":""},"crm_import_fields":{"buyer_type":"","buying_signal":"","outreach_tone":"","hook_theme":"","avoidance":"","tags":["","","","",""],"analyst_summary":""},"recent_activity":{"posts":[{"topic":"","tone":"","key_message":"","engagement":"","intent_signal":""},{"topic":"","tone":"","key_message":"","engagement":"","intent_signal":""},{"topic":"","tone":"","key_message":"","engagement":"","intent_signal":""}],"interactions":[{"interaction_type":"","topic":"","insight":"","intent_signal":""},{"interaction_type":"","topic":"","insight":"","intent_signal":""},{"interaction_type":"","topic":"","insight":"","intent_signal":""}]}}"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
