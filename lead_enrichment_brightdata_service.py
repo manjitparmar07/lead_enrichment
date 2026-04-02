@@ -545,6 +545,15 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
         except Exception:
             pass
 
+    # Patch profile_image and company_logo from DB — LLM never has actual image URLs
+    if _crm_brief and isinstance(_crm_brief, dict):
+        who = _crm_brief.get("who_they_are")
+        if isinstance(who, dict):
+            if not who.get("profile_image"):
+                who["profile_image"] = lead.get("avatar_url") or ""
+            if not who.get("company_logo"):
+                who["company_logo"] = lead.get("company_logo") or ""
+
     # enrichment_data = LLM-structured output (shaped by lio_system_prompt).
     # Fallback maps linkedin_enrich into the same crm_brief JSON structure so LIO
     # always receives a consistent shape regardless of whether LLM ran.
