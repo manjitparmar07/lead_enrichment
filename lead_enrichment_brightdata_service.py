@@ -571,6 +571,15 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
                     except Exception:
                         scores[_sf] = 0
 
+            # Fallback to DB-calculated scores when LLM returned 0
+            # (LLM copies the template placeholder; DB scoring is the ground truth)
+            if not scores.get("icp_fit"):
+                scores["icp_fit"] = int(lead.get("icp_fit_score") or 0)
+            if not scores.get("engagement_score"):
+                scores["engagement_score"] = int(lead.get("intent_score") or 0)
+            if not scores.get("timing_score"):
+                scores["timing_score"] = int(lead.get("timing_score") or 0)
+
         # Inject lead_id into who_they_are — LLM output never has this
         if isinstance(_crm_brief.get("who_they_are"), dict):
             _crm_brief["who_they_are"].setdefault("lead_id", lead_id)
