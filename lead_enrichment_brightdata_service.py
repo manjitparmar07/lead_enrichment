@@ -319,6 +319,9 @@ _web_client: Optional[httpx.AsyncClient] = None   # Website scraping (follow red
 _llm_semaphore: asyncio.Semaphore = asyncio.Semaphore(10)
 # Max 20 simultaneous full enrichment pipelines (DB pool size limit)
 _enrichment_semaphore: asyncio.Semaphore = asyncio.Semaphore(20)
+# In-flight deduplication: tracks URLs currently being enriched
+# Key = lead_id, Value = asyncio.Event (set when enrichment finishes)
+_in_flight_leads: dict[str, asyncio.Event] = {}
 
 _HTTP_LIMITS = httpx.Limits(max_connections=40, max_keepalive_connections=20)
 
@@ -5970,6 +5973,24 @@ async def enrich_single(
             asyncio.create_task(send_to_lio(cached, sso_id=sso_id))
         return cached
 
+    # ── In-flight deduplication: same URL already being processed by another request ──
+    if lead_id in _in_flight_leads:
+        logger.info("[Enrich] URL %s already in-flight — waiting for first request to finish", url)
+        await _in_flight_leads[lead_id].wait()
+        # First request done — read result from DB
+        result = await get_lead(lead_id)
+        if result and result.get("status") == "enriched":
+            result["_cache_hit"] = True
+            result["linkedin_enrich"] = _format_linkedin_enrich(result, include_contact=not skip_contact)
+            if not forward_to_lio:
+                asyncio.create_task(send_to_lio(result, sso_id=sso_id))
+            return result
+        # First request failed — fall through and try own enrichment
+
+    # Register this URL as in-flight so concurrent requests wait instead of duplicating
+    _in_flight_event = asyncio.Event()
+    _in_flight_leads[lead_id] = _in_flight_event
+
     logger.info("[Enrich] Cache MISS for %s — fetching from Bright Data", url)
 
     # ── Tool availability (from enrichment config) ────────────────────────────
@@ -6450,6 +6471,10 @@ async def enrich_single(
     # Forward to LIO — only if BrightData returned real data (lead has a name)
     if not forward_to_lio and lead.get("name"):
         asyncio.create_task(send_to_lio(lead, sso_id=sso_id))
+
+    # Release in-flight lock — wake up all waiters for this URL
+    _in_flight_leads.pop(lead_id, None)
+    _in_flight_event.set()
 
     return lead
 
