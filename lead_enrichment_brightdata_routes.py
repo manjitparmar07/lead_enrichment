@@ -754,7 +754,7 @@ async def enrich_bulk(request: Request):
             lead_id = svc._lead_id(svc._normalize_linkedin_url(url))
             existing = existing_map.get(lead_id)
             lead_status = (existing or {}).get("status", "")
-            if existing and not existing.get("_stale") and lead_status == "completed":
+            if existing and not existing.get("_stale") and lead_status in ("completed", "enriched"):
                 # Lead already fully enriched — send to LIO under concurrency cap
                 existing["linkedin_enrich"] = svc._format_linkedin_enrich(existing)
                 _lead = dict(existing)
