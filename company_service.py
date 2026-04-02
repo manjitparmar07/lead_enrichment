@@ -129,6 +129,8 @@ async def init_company_db() -> None:
             ("company_slogan",      "TEXT"),
             ("similar_companies",   "TEXT DEFAULT '[]'"),
             ("organization_type",   "TEXT"),
+            ("crm_brief",           "TEXT"),   # Qwen2.5-72B full CRM profile (JSON)
+            ("apollo_raw",          "TEXT"),   # Raw Apollo org dict saved from email enrichment
         ]:
             await conn.execute(f"ALTER TABLE company_enrichments ADD COLUMN IF NOT EXISTS {col} {col_type}")
         # Mirror linkedin_followers onto enriched_leads too

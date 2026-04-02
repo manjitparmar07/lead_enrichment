@@ -4,11 +4,28 @@ Manages per-org: tool enable/disable, API keys, credit allocation + usage tracki
 """
 import json
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from db import get_pool
+
+# ── Simple in-process TTL cache for config lookups ─────────────────────────
+# Avoids 2 DB round-trips per lead × N leads in bulk jobs (e.g. 42 leads = 84 hits)
+_CONFIG_CACHE: Dict[str, tuple] = {}   # key → (value, expires_at)
+_CONFIG_TTL = 60  # seconds
+
+
+def _cache_get(key: str):
+    entry = _CONFIG_CACHE.get(key)
+    if entry and time.monotonic() < entry[1]:
+        return entry[0]
+    return None
+
+
+def _cache_set(key: str, value) -> None:
+    _CONFIG_CACHE[key] = (value, time.monotonic() + _CONFIG_TTL)
 
 # ── Tool Registry ──────────────────────────────────────────────────────────────
 
@@ -693,19 +710,25 @@ WORKSPACE_CONTEXT_DEFAULTS = {
 
 async def get_workspace_config(org_id: str = "") -> dict:
     """Return workspace config from the first row in workspace_configs."""
+    cache_key = f"workspace_cfg:{org_id}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
             "SELECT lio_system_prompt, lio_model, lio_prompts_json, workspace_context_json, ai_prompts_json FROM workspace_configs LIMIT 1",
         )
         if not row:
             return {}
-        return {
+        result = {
             "lio_system_prompt":      row["lio_system_prompt"] or "",
             "lio_model":              row["lio_model"] or "",
             "lio_prompts_json":       row["lio_prompts_json"] or "",
             "workspace_context_json": row["workspace_context_json"] or "",
             "ai_prompts_json":        row["ai_prompts_json"] or "",
         }
+    _cache_set(cache_key, result)
+    return result
 
 
 async def save_workspace_config(org_id: str, updates: dict) -> dict:
@@ -1021,6 +1044,10 @@ _SCORING_DEFAULTS = {
 
 async def get_scoring_config(org_id: str) -> dict:
     """Return scoring thresholds + cache TTLs for the org (falls back to defaults)."""
+    cache_key = f"scoring_cfg:{org_id}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
             """SELECT score_hot_threshold, score_warm_threshold, score_cool_threshold,
@@ -1029,7 +1056,7 @@ async def get_scoring_config(org_id: str) -> dict:
             org_id,
         )
     if row:
-        return {
+        result = {
             "hot":                   row["score_hot_threshold"]     or _SCORING_DEFAULTS["hot"],
             "warm":                  row["score_warm_threshold"]    or _SCORING_DEFAULTS["warm"],
             "cool":                  row["score_cool_threshold"]    or _SCORING_DEFAULTS["cool"],
@@ -1037,7 +1064,10 @@ async def get_scoring_config(org_id: str) -> dict:
             "lead_cache_ttl":        row["lead_cache_ttl"]          or _SCORING_DEFAULTS["lead_cache_ttl"],
             "company_cache_ttl_days":row["company_cache_ttl_days"]  or _SCORING_DEFAULTS["company_cache_ttl_days"],
         }
-    return dict(_SCORING_DEFAULTS)
+    else:
+        result = dict(_SCORING_DEFAULTS)
+    _cache_set(cache_key, result)
+    return result
 
 
 async def save_scoring_config(org_id: str, data: dict) -> dict:

@@ -1195,6 +1195,107 @@ async def queue_stats():
     return await get_queue_stats()
 
 
+# ── AI Processing Queue ───────────────────────────────────────────────────────
+
+class _AIProcessRequest(BaseModel):
+    token: str
+    job_id: str
+    lead_ids: list[str]
+    system_prompt: str
+    forward_to_lio: bool = False
+
+    @field_validator("lead_ids")
+    @classmethod
+    def _validate_lead_ids(cls, v):
+        if not v:
+            raise ValueError("lead_ids cannot be empty")
+        if len(v) > 5000:
+            raise ValueError("max 5000 lead_ids per request")
+        return list(dict.fromkeys(v))  # deduplicate, preserve order
+
+
+@router.post("/jobs/ai-process", include_in_schema=False)
+async def enqueue_ai_processing(request: Request):
+    """
+    Enqueue raw_profile leads for AI processing via Qwen 70B / Groq / WB LLM.
+
+    Body:
+      token         — JWT for org_id / sso_id
+      job_id        — existing job to track progress against
+      lead_ids      — list of lead IDs (must have status='scraping' or 'ai_queued')
+      system_prompt — system prompt to use for every lead
+      forward_to_lio — whether to forward completed leads to LIO
+
+    Status transitions: scraping → ai_queued → ai_processing → completed
+
+    Returns: { enqueued: N, chunks: N, workers: N }
+    """
+    import redis.asyncio as aioredis
+    from queue_manager import push_ai_job, get_ai_queue_stats, AI_WORKERS
+
+    body_raw = await request.body()
+    try:
+        body = _AIProcessRequest.model_validate(json.loads(body_raw))
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    # Decode JWT — same pattern as enrich_bulk
+    JWT_SECRET = os.getenv("JWT_SECRET", "")
+    try:
+        decoded = jwt.decode(
+            body.token,
+            JWT_SECRET,
+            algorithms=["HS256"],
+            options={"verify_exp": False},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+
+    org_id = decoded.get("org_id") or decoded.get("organizationId", "")
+    sso_id = decoded.get("sso_id") or decoded.get("userId", "")
+    if not org_id:
+        raise HTTPException(status_code=401, detail="org_id missing from token")
+
+    try:
+        r = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
+        chunks_enqueued = await push_ai_job(
+            job_id=body.job_id,
+            org_id=org_id,
+            lead_ids=body.lead_ids,
+            system_prompt=body.system_prompt,
+            r=r,
+            sso_id=sso_id,
+            forward_to_lio=body.forward_to_lio,
+        )
+        await r.aclose()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Redis error: {e}")
+
+    return {
+        "ok":      True,
+        "enqueued": len(body.lead_ids),
+        "chunks":  chunks_enqueued,
+        "workers": AI_WORKERS,
+        "job_id":  body.job_id,
+        "org_id":  org_id,
+    }
+
+
+@router.get("/queue/ai-stats", include_in_schema=False)
+async def ai_queue_stats():
+    """Real-time AI processing queue snapshot."""
+    from queue_manager import get_ai_queue_stats
+    return await get_ai_queue_stats()
+
+
+@router.post("/queue/ai-dlq/retry", include_in_schema=False)
+async def ai_dlq_retry(index: int = 0):
+    """Retry one item from the AI dead-letter queue by index (default: first item)."""
+    from queue_manager import retry_ai_dlq
+    ok = await retry_ai_dlq(index)
+    return {"ok": ok}
+
+
 @router.get("", include_in_schema=False)
 async def list_leads(
     limit: int = Query(50, ge=1, le=200),
@@ -1454,8 +1555,8 @@ async def regenerate_crm_brief(lead_id: str, request: Request):
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
 
-    if not lead.get("raw_profile"):
-        raise HTTPException(status_code=422, detail="No raw_profile saved for this lead — re-enrich first")
+    if not lead.get("raw_profile") and not lead.get("raw_brightdata"):
+        raise HTTPException(status_code=422, detail="No raw profile saved for this lead — re-enrich first")
 
     try:
         result = await svc.regenerate_crm_brief_for_lead(lead_id, org_id=org_id)
@@ -2264,29 +2365,139 @@ _company_enrich_router = APIRouter(
 )
 
 _COMPANY_DESC = """
-Returns full company enrichment data scraped from the company website and third-party sources (Crunchbase, Wappalyzer, news).
+You are an expert B2B CRM data analyst. Your job is to enrich raw company data
+from LinkedIn into a fully structured, CRM-ready profile.
 
-**How to call:**
-```
-POST /api/leads/view/company
-Content-Type: application/json
+You must return ONLY a valid JSON object — no markdown, no explanation, no preamble.
+Follow the exact schema provided. Infer and derive fields intelligently from the data.
+""".strip()
 
-{ "leadenrich_id": "abc123def456", "system_prompt": "..." }
-```
-`system_prompt` is optional — omit it to get stored company data only.
-When provided, an AI-generated account analysis is returned in `ai_generated.company_analysis`
-with keys: fit_summary, key_pain_points, buying_signals, recommended_approach, icp_score.
+# ── USER PROMPT ────────────────────────────────────────────────────────────────
+def build_prompt(raw_json: str) -> str:
+    return f"""
+Enrich the following LinkedIn company data into a complete CRM profile.
 
-**Sections returned:**
-- **identity** — Company name, domain, website, LinkedIn, logo
-- **profile** — Industry, employee count, revenue, tech stack (Wappalyzer)
-- **website_intelligence** — Scraped homepage / about / features / pricing
-- **market_signals** — Funding rounds, hiring velocity, news mentions, Crunchbase
-- **intent_signals** — Funding events, job changes, competitor signals
-- **scores** — Company score, tier, combined person+company score
-- **tags** — Company persona tags, culture signals, account pitch
-- **ai_generated** — Present only when `system_prompt` is supplied
-"""
+RAW DATA:
+{raw_json}
+
+Return a JSON object with EXACTLY this schema:
+
+{{
+  "company_identity": {{
+    "legal_name": "",
+    "brand_name": "",
+    "tagline": "",
+    "description_short": "",          // 1-sentence, professional tone
+    "description_long": "",           // 3-5 sentences, for CRM about section
+    "founded_year": 0,
+    "company_stage": "",              // Startup / Growth / Mature / Enterprise
+    "organization_type": "",
+    "industry_primary": "",
+    "industry_secondary": [],
+    "hq_city": "",
+    "hq_state": "",
+    "hq_country": "",
+    "hq_full_address": "",
+    "office_locations": [],
+    "global_reach": true,
+    "website": "",
+    "linkedin_url": "",
+    "crunchbase_url": ""
+  }},
+
+  "tags": [],                          // 8-12 broad CRM tags e.g. "SaaS", "B2B", "IT Services"
+
+  "tech_tags": [],                     // 10-15 specific tech tags e.g. "Blockchain", "React Native"
+
+  "services": [
+    {{
+      "name": "",
+      "category": "",                  // e.g. "Development", "Marketing", "Consulting"
+      "description": "",
+      "target_audience": ""
+    }}
+  ],
+
+  "key_people": [
+    {{
+      "name": "",
+      "title": "",
+      "seniority": "",                 // C-Suite / VP / Manager / Individual Contributor
+      "department": "",
+      "linkedin_url": "",
+      "is_decision_maker": false,
+      "contact_confidence": ""        // High / Medium / Low
+    }}
+  ],
+
+  "contact_info": {{
+    "primary_email": "",
+    "emails": [],
+    "phone_primary": "",
+    "phones": [],
+    "whatsapp": "",
+    "preferred_contact_channel": ""
+  }},
+
+  "financials": {{
+    "funding_status": "",             // Bootstrapped / Seed / Series A / etc.
+    "total_funding_usd": 0,
+    "last_round_type": "",
+    "last_round_date": "",
+    "last_round_amount_usd": 0,
+    "revenue_range": "",              // e.g. "$1M-$5M" — infer from size/stage
+    "employee_count_linkedin": 0,
+    "employee_count_range": ""
+  }},
+
+  "social_presence": {{
+    "linkedin_followers": 0,
+    "linkedin_engagement_avg": "",    // Low / Medium / High — from post likes
+    "posting_frequency": "",          // Active / Moderate / Inactive
+    "content_themes": [],             // e.g. "Team Culture", "Tech Insights", "Product"
+    "last_post_date": ""
+  }},
+
+  "activities": [
+    {{
+      "date": "",
+      "type": "",                     // Post / Event / Announcement / Award
+      "summary": "",
+      "engagement_score": 0,          // likes + comments
+      "sentiment": ""                 // Positive / Neutral / Promotional
+    }}
+  ],
+
+  "interests": [],                    // 8-10 topics the company cares about
+                                      // e.g. "AI/ML", "Startup Ecosystem", "Women in Tech"
+
+  "icp_fit": {{
+    "ideal_customer_profile": "",     // Who they typically sell to
+    "target_company_size": "",
+    "target_industries": [],
+    "target_geographies": [],
+    "deal_type": ""                   // Project-based / Retainer / SaaS / Mixed
+  }},
+
+  "competitive_intelligence": {{
+    "direct_competitors": [],
+    "market_position": "",            // Niche / Mid-Market / Enterprise
+    "differentiators": [],
+    "weaknesses_inferred": []         // inferred from data gaps or signals
+  }},
+
+  "crm_metadata": {{
+    "lead_score": 0,                  // 0–100, based on activity, size, funding
+    "lead_temperature": "",           // Hot / Warm / Cold
+    "outreach_priority": "",          // High / Medium / Low
+    "best_outreach_time": "",         // inferred from post timing
+    "recommended_first_message": "",  // 1–2 sentence icebreaker for outreach
+    "crm_tags": [],
+    "data_source": "LinkedIn",
+    "data_scraped_at": "",
+    "enrichment_confidence": ""       // High / Medium / Low
+  }}
+}}"""
 
 
 @_company_enrich_router.post(
@@ -2297,6 +2508,7 @@ with keys: fit_summary, key_pain_points, buying_signals, recommended_approach, i
 async def company_enrichment(body: ViewCompanyRequest):
     import company_service as cs
     from datetime import datetime, timezone
+    from db import get_pool
 
     if not body.leadenrich_id and not body.company_linkedin_url:
         raise HTTPException(
@@ -2307,49 +2519,190 @@ async def company_enrichment(body: ViewCompanyRequest):
     # ── Resolve company LinkedIn URL ─────────────────────────────────────────
     lead: Optional[dict] = None
     if body.leadenrich_id:
-        # Path 1: look up the lead and pull its company_linkedin field
-        lead = await _resolve_lead(body.leadenrich_id)
-        company_linkedin = lead.get("company_linkedin")
+        # Always fetch fresh from DB — Redis cache may lack raw_brightdata / apollo_raw
+        lead = await svc.get_lead(body.leadenrich_id)
+        if not lead:
+            raise HTTPException(status_code=404, detail=f"Lead not found: {body.leadenrich_id}")
+
+        company_linkedin = lead.get("company_linkedin") or ""
+
+        # Always parse raw_brightdata once — used in fallbacks + warning log
+        raw_bd = lead.get("raw_brightdata") or {}
+        if isinstance(raw_bd, str):
+            try:
+                raw_bd = json.loads(raw_bd)
+            except Exception:
+                raw_bd = {}
+
         if not company_linkedin:
+            # ── Fallback 1: raw_brightdata — try all known BD field names ─────
+            for _bd_field in ("current_company_link", "company_linkedin_url", "company_url", "linkedin"):
+                _val = (raw_bd.get(_bd_field) or "").strip()
+                if _val:
+                    if "linkedin.com/company/" in _val:
+                        company_linkedin = _val
+                        break
+                    # BD sometimes returns just the company_id — construct URL
+                    elif _val and "/" not in _val and len(_val) < 80:
+                        company_linkedin = f"https://www.linkedin.com/company/{_val}/"
+                        break
+
+            # BD may store company_id as a separate field
+            if not company_linkedin:
+                _co_id = (raw_bd.get("current_company_company_id") or raw_bd.get("company_id") or "").strip()
+                if _co_id:
+                    company_linkedin = f"https://www.linkedin.com/company/{_co_id}/"
+
+            # BD experience[0] fallback
+            if not company_linkedin:
+                _exp = raw_bd.get("experience") or []
+                if _exp and isinstance(_exp[0], dict):
+                    _e0 = _exp[0]
+                    for _ef in ("url", "company_url", "linkedin_url", "company_linkedin_url"):
+                        _v = (_e0.get(_ef) or "").strip()
+                        if _v and "linkedin.com/company/" in _v:
+                            company_linkedin = _v
+                            break
+                    if not company_linkedin:
+                        _eid = (_e0.get("company_id") or _e0.get("linkedin_company_id") or
+                                _e0.get("company_linkedin_id") or "").strip()
+                        if _eid:
+                            company_linkedin = f"https://www.linkedin.com/company/{_eid}/"
+
+        if not company_linkedin:
+            # ── Fallback 2: apollo_raw organization.linkedin_url ──────────────
+            apollo_raw_str = lead.get("apollo_raw")
+            if apollo_raw_str:
+                try:
+                    apollo_raw_data = json.loads(apollo_raw_str) if isinstance(apollo_raw_str, str) else apollo_raw_str
+                    org = apollo_raw_data.get("organization") or {}
+                    _ap = (org.get("linkedin_url") or "").strip()
+                    if _ap:
+                        if "linkedin.com/company/" in _ap:
+                            company_linkedin = _ap
+                        elif "/" not in _ap and _ap:
+                            company_linkedin = f"https://www.linkedin.com/company/{_ap}/"
+                except Exception:
+                    pass
+
+        if not company_linkedin:
+            # ── Fallback 3: linkedin_enrich company_identity.linkedin_url ─────
+            _li_enrich = lead.get("linkedin_enrich") or {}
+            if isinstance(_li_enrich, str):
+                try:
+                    _li_enrich = json.loads(_li_enrich)
+                except Exception:
+                    _li_enrich = {}
+            _ci_url = ((_li_enrich.get("company_identity") or {}).get("linkedin_url") or "").strip()
+            if _ci_url and "linkedin.com/company/" in _ci_url:
+                company_linkedin = _ci_url
+
+        if not company_linkedin:
+            # ── Fallback 4: full_data ──────────────────────────────────────────
+            _full = lead.get("full_data") or {}
+            if isinstance(_full, str):
+                try:
+                    _full = json.loads(_full)
+                except Exception:
+                    _full = {}
+            for _path in [
+                (_full.get("company_identity") or {}).get("linkedin_url"),
+                (_full.get("company_profile") or {}).get("linkedin_url"),
+            ]:
+                if _path and "linkedin.com/company/" in str(_path):
+                    company_linkedin = str(_path)
+                    break
+
+        if not company_linkedin:
+            # ── Last resort: log what we have so caller can debug ─────────────
+            logger.warning(
+                "[ViewCompany] No company_linkedin for lead %s  "
+                "raw_bd_keys=%s  apollo_raw=%s  company=%s  website=%s",
+                body.leadenrich_id,
+                list(raw_bd.keys())[:10] if isinstance(raw_bd, dict) else "n/a",
+                bool(lead.get("apollo_raw")),
+                lead.get("company"),
+                lead.get("company_website"),
+            )
             raise HTTPException(
                 status_code=400,
-                detail="No company LinkedIn URL found for this lead.",
+                detail=(
+                    f"No company LinkedIn URL found for lead '{lead.get('name', body.leadenrich_id)}'. "
+                    f"Company: {lead.get('company') or 'unknown'}. "
+                    "Please pass company_linkedin_url directly in the request body."
+                ),
             )
-    else:
-        # Path 2: caller supplied the company URL directly
-        company_linkedin = body.company_linkedin_url
 
-    # Fetch fresh company data directly from BrightData
+        # Persist resolved URL — future calls will use company_linkedin directly
+        if company_linkedin and not lead.get("company_linkedin"):
+            try:
+                await svc._upsert_lead({"id": lead["id"], "company_linkedin": company_linkedin})
+                await _lead_cache_delete(body.leadenrich_id)  # invalidate stale cache
+            except Exception:
+                pass
+    else:
+        company_linkedin = body.company_linkedin_url
+        lead = None
+
+    org_id = lead.get("organization_id", "default") if lead else "default"
+
+    # ── Step 1: BrightData scrape ─────────────────────────────────────────────
     bd_data = await cs._fetch_bd_company_profile(company_linkedin)
     if not bd_data:
         raise HTTPException(status_code=502, detail="BrightData did not return company data.")
 
-    # Save to DB
-    org_id = lead.get("organization_id", "default") if lead else "default"
+    # ── Step 2: Fetch Apollo raw from lead DB (saved during email enrichment) ─
+    apollo_raw: dict = {}
+    if lead and lead.get("id"):
+        try:
+            async with get_pool().acquire() as _conn:
+                _row = await _conn.fetchrow(
+                    "SELECT apollo_raw FROM enriched_leads WHERE id=$1 AND apollo_raw IS NOT NULL LIMIT 1",
+                    lead["id"],
+                )
+            if _row and _row["apollo_raw"]:
+                _parsed = json.loads(_row["apollo_raw"]) if isinstance(_row["apollo_raw"], str) else _row["apollo_raw"]
+                if isinstance(_parsed, dict):
+                    apollo_raw = _parsed
+                    logger.info("[ViewCompany] Apollo raw loaded from DB for lead %s", lead["id"])
+        except Exception as _e:
+            logger.debug("[ViewCompany] apollo_raw DB lookup failed: %s", _e)
+
+    # ── Step 3: Qwen2.5-72B CRM enrichment (BD + Apollo) ─────────────────────
+    company_name = bd_data.get("name") or (lead.get("company") if lead else "") or ""
+    crm_brief: Optional[dict] = None
     try:
+        from lead_enrichment_brightdata_service import _enrich_company_with_llm
+        crm_brief = await _enrich_company_with_llm(bd_data, apollo_raw, company_name)
+    except Exception as _e:
+        logger.warning("[ViewCompany] LLM enrichment failed: %s", _e)
+
+    # ── Step 4: Save everything to company_enrichments ────────────────────────
+    try:
+        now = datetime.now(timezone.utc).isoformat()
         record = {
             "id":                   cs._company_id(company_linkedin),
             "company_linkedin_url": company_linkedin,
             "org_id":               org_id,
             "raw_data":             json.dumps(bd_data, default=str),
-            "last_enriched_at":     datetime.now(timezone.utc).isoformat(),
-            "updated_at":           datetime.now(timezone.utc).isoformat(),
+            "apollo_raw":           json.dumps(apollo_raw, default=str) if apollo_raw else None,
+            "crm_brief":            json.dumps(crm_brief, default=str) if crm_brief else None,
+            "last_enriched_at":     now,
+            "updated_at":           now,
         }
         cs._map_bd_company_profile(bd_data, record)
         await cs._upsert_company(record)
-        logger.info("[ViewCompany] Saved company to DB: %s", company_linkedin)
+        logger.info("[ViewCompany] Saved company + crm_brief to DB: %s", company_linkedin)
     except Exception as _e:
         logger.warning("[ViewCompany] DB save failed: %s", _e)
-
-    # AI enrichment from BrightData company data
-    ai_enrichment = await _enrich_company_with_ai(bd_data)
 
     return {
         "lead_id":          lead.get("id") if lead else None,
         "linkedin_url":     lead.get("linkedin_url") if lead else None,
         "company_linkedin": company_linkedin,
         "brightdata":       bd_data,
-        "ai_enrichment":    ai_enrichment,
+        "apollo_raw":       apollo_raw,
+        "crm_brief":        crm_brief,
     }
 
 

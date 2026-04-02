@@ -42,6 +42,7 @@ from security import SecurityMiddleware
 import keys_service
 import lead_enrichment_worker as worker
 import import_worker as _import_worker
+import queue_manager as _queue_manager
 import db as _db
 from lead_enrichment_brightdata_service import init_leads_db
 from workspace_service import init_workspace_db
@@ -141,6 +142,7 @@ async def startup():
     await init_serpapi_db()
     await worker.start_workers()
     await _import_worker.start_import_workers()
+    await _queue_manager.start_ai_workers()
     logger.info("Lead Enrichment API started — http://0.0.0.0:%s", os.getenv("PORT", "8020"))
 
 
@@ -148,6 +150,7 @@ async def startup():
 async def shutdown():
     await worker.stop_workers()
     await _import_worker.stop_import_workers()
+    await _queue_manager.stop_ai_workers()
     await _db.close_pool()
     logger.info("Lead Enrichment API stopped")
 
