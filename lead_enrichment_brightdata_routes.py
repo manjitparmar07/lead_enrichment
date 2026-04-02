@@ -2500,6 +2500,102 @@ Return a JSON object with EXACTLY this schema:
 }}"""
 
 
+@_company_enrich_router.get(
+    "/view/company/status/{job_id}",
+    summary="Poll company enrichment job status",
+)
+async def company_enrichment_status(job_id: str):
+    """Poll background company enrichment job. Returns status + result when done."""
+    import company_service as cs
+    cached = _company_bg_jobs.get(job_id)
+    if not cached:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if cached["status"] == "completed":
+        return {"status": "completed", "result": cached["result"]}
+    if cached["status"] == "failed":
+        return {"status": "failed", "error": cached.get("error")}
+    return {"status": "processing"}
+
+
+# In-memory store for background company enrichment jobs (keyed by job_id)
+_company_bg_jobs: dict = {}
+
+
+async def _run_company_enrichment_bg(
+    job_id: str, company_linkedin: str, lead: Optional[dict], org_id: str
+) -> None:
+    """Background task: scrape BD + LLM enrich + save to DB."""
+    import company_service as cs
+    from datetime import datetime, timezone
+
+    try:
+        _company_bg_jobs[job_id]["status"] = "processing"
+
+        # Step 1: BrightData scrape
+        bd_data = await cs._fetch_bd_company_profile(company_linkedin)
+        if not bd_data:
+            _company_bg_jobs[job_id] = {"status": "failed", "error": "BrightData returned no data"}
+            return
+
+        # Step 2: Apollo raw from DB
+        apollo_raw: dict = {}
+        if lead and lead.get("id"):
+            try:
+                from db import get_pool
+                async with get_pool().acquire() as _conn:
+                    _row = await _conn.fetchrow(
+                        "SELECT apollo_raw FROM enriched_leads WHERE id=$1 AND apollo_raw IS NOT NULL LIMIT 1",
+                        lead["id"],
+                    )
+                if _row and _row["apollo_raw"]:
+                    _parsed = json.loads(_row["apollo_raw"]) if isinstance(_row["apollo_raw"], str) else _row["apollo_raw"]
+                    if isinstance(_parsed, dict):
+                        apollo_raw = _parsed
+            except Exception:
+                pass
+
+        # Step 3: LLM enrichment
+        crm_brief: Optional[dict] = None
+        try:
+            from lead_enrichment_brightdata_service import _enrich_company_with_llm
+            crm_brief = await _enrich_company_with_llm(bd_data, apollo_raw, bd_data.get("name") or (lead.get("company") if lead else "") or "")
+        except Exception as _e:
+            logger.warning("[ViewCompany-BG] LLM failed: %s", _e)
+
+        # Step 4: Save to DB
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            record = {
+                "id":                   cs._company_id(company_linkedin),
+                "company_linkedin_url": company_linkedin,
+                "org_id":               org_id,
+                "raw_data":             json.dumps(bd_data, default=str),
+                "apollo_raw":           json.dumps(apollo_raw, default=str) if apollo_raw else None,
+                "crm_brief":            json.dumps(crm_brief, default=str) if crm_brief else None,
+                "last_enriched_at":     now,
+                "updated_at":           now,
+            }
+            cs._map_bd_company_profile(bd_data, record)
+            await cs._upsert_company(record)
+        except Exception as _e:
+            logger.warning("[ViewCompany-BG] DB save failed: %s", _e)
+
+        result = {
+            "lead_id":          lead.get("id") if lead else None,
+            "linkedin_url":     lead.get("linkedin_url") if lead else None,
+            "company_linkedin": company_linkedin,
+            "brightdata":       bd_data,
+            "apollo_raw":       apollo_raw,
+            "crm_brief":        crm_brief,
+            "cached":           False,
+        }
+        _company_bg_jobs[job_id] = {"status": "completed", "result": result}
+
+    except Exception as e:
+        logger.error("[ViewCompany-BG] job %s failed: %s", job_id, e)
+        _company_bg_jobs[job_id] = {"status": "failed", "error": str(e)}
+
+
 @_company_enrich_router.post(
     "/view/company",
     summary="Company Enrichment",
@@ -2646,63 +2742,50 @@ async def company_enrichment(body: ViewCompanyRequest):
 
     org_id = lead.get("organization_id", "default") if lead else "default"
 
-    # ── Step 1: BrightData scrape ─────────────────────────────────────────────
-    bd_data = await cs._fetch_bd_company_profile(company_linkedin)
-    if not bd_data:
-        raise HTTPException(status_code=502, detail="BrightData did not return company data.")
-
-    # ── Step 2: Fetch Apollo raw from lead DB (saved during email enrichment) ─
-    apollo_raw: dict = {}
-    if lead and lead.get("id"):
-        try:
-            async with get_pool().acquire() as _conn:
-                _row = await _conn.fetchrow(
-                    "SELECT apollo_raw FROM enriched_leads WHERE id=$1 AND apollo_raw IS NOT NULL LIMIT 1",
-                    lead["id"],
-                )
-            if _row and _row["apollo_raw"]:
-                _parsed = json.loads(_row["apollo_raw"]) if isinstance(_row["apollo_raw"], str) else _row["apollo_raw"]
-                if isinstance(_parsed, dict):
-                    apollo_raw = _parsed
-                    logger.info("[ViewCompany] Apollo raw loaded from DB for lead %s", lead["id"])
-        except Exception as _e:
-            logger.debug("[ViewCompany] apollo_raw DB lookup failed: %s", _e)
-
-    # ── Step 3: Qwen2.5-72B CRM enrichment (BD + Apollo) ─────────────────────
-    company_name = bd_data.get("name") or (lead.get("company") if lead else "") or ""
-    crm_brief: Optional[dict] = None
+    # ── Option 1: Cache check — return immediately if already enriched ────────
     try:
-        from lead_enrichment_brightdata_service import _enrich_company_with_llm
-        crm_brief = await _enrich_company_with_llm(bd_data, apollo_raw, company_name)
-    except Exception as _e:
-        logger.warning("[ViewCompany] LLM enrichment failed: %s", _e)
+        cached_company = await cs._get_company(company_linkedin, org_id)
+        if cached_company and cached_company.get("crm_brief"):
+            crm_brief_cached = cached_company.get("crm_brief")
+            if isinstance(crm_brief_cached, str):
+                try:
+                    crm_brief_cached = json.loads(crm_brief_cached)
+                except Exception:
+                    pass
+            raw_data_cached = cached_company.get("raw_data")
+            if isinstance(raw_data_cached, str):
+                try:
+                    raw_data_cached = json.loads(raw_data_cached)
+                except Exception:
+                    raw_data_cached = {}
+            logger.info("[ViewCompany] Cache HIT for %s — returning instantly", company_linkedin)
+            return {
+                "lead_id":          lead.get("id") if lead else None,
+                "linkedin_url":     lead.get("linkedin_url") if lead else None,
+                "company_linkedin": company_linkedin,
+                "brightdata":       raw_data_cached or {},
+                "crm_brief":        crm_brief_cached,
+                "cached":           True,
+                "status":           "completed",
+            }
+    except Exception as _ce:
+        logger.debug("[ViewCompany] Cache check failed: %s", _ce)
 
-    # ── Step 4: Save everything to company_enrichments ────────────────────────
-    try:
-        now = datetime.now(timezone.utc).isoformat()
-        record = {
-            "id":                   cs._company_id(company_linkedin),
-            "company_linkedin_url": company_linkedin,
-            "org_id":               org_id,
-            "raw_data":             json.dumps(bd_data, default=str),
-            "apollo_raw":           json.dumps(apollo_raw, default=str) if apollo_raw else None,
-            "crm_brief":            json.dumps(crm_brief, default=str) if crm_brief else None,
-            "last_enriched_at":     now,
-            "updated_at":           now,
-        }
-        cs._map_bd_company_profile(bd_data, record)
-        await cs._upsert_company(record)
-        logger.info("[ViewCompany] Saved company + crm_brief to DB: %s", company_linkedin)
-    except Exception as _e:
-        logger.warning("[ViewCompany] DB save failed: %s", _e)
+    # ── Option 2: Cache MISS — start background job, return job_id immediately ─
+    import uuid as _uuid
+    job_id = str(_uuid.uuid4())
+    _company_bg_jobs[job_id] = {"status": "queued"}
+    asyncio.create_task(_run_company_enrichment_bg(job_id, company_linkedin, lead, org_id))
+    logger.info("[ViewCompany] Cache MISS for %s — started background job %s", company_linkedin, job_id)
 
     return {
+        "status":           "processing",
+        "job_id":           job_id,
+        "poll_url":         f"/api/leads/view/company/status/{job_id}",
+        "message":          "Company enrichment started. Poll poll_url every 5s for result.",
         "lead_id":          lead.get("id") if lead else None,
-        "linkedin_url":     lead.get("linkedin_url") if lead else None,
         "company_linkedin": company_linkedin,
-        "brightdata":       bd_data,
-        "apollo_raw":       apollo_raw,
-        "crm_brief":        crm_brief,
+        "cached":           False,
     }
 
 
