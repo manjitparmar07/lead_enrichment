@@ -512,8 +512,20 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
 
     lead_id = lead.get("lead_id") or lead.get("id", "unknown")
 
-    # Idempotency: skip if this lead was already successfully sent to LIO
-    # Redis key with 24h TTL — prevents duplicate sends on retries/replays
+    # Idempotency — DB-first (always available), Redis as secondary cache
+    # DB check: lio_sent_at column — set after every successful LIO send
+    try:
+        async with get_pool().acquire() as _conn:
+            _row = await _conn.fetchrow(
+                "SELECT lio_sent_at FROM enriched_leads WHERE id=$1", lead_id
+            )
+            if _row and _row["lio_sent_at"]:
+                logger.info("[LIO] Lead %s already sent at %s — skipping (idempotent)", lead_id, _row["lio_sent_at"])
+                return
+    except Exception:
+        pass  # DB check failed — proceed
+
+    # Redis secondary cache (24h TTL) — fast path if Redis available
     _lio_sent_key = f"lio:sent:{lead_id}"
     try:
         import redis.asyncio as aioredis
@@ -523,10 +535,10 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
             already_sent = await _r.get(_lio_sent_key)
             await _r.close()
             if already_sent:
-                logger.info("[LIO] Lead %s already sent — skipping (idempotent)", lead_id)
+                logger.info("[LIO] Lead %s already sent (Redis) — skipping", lead_id)
                 return
     except Exception:
-        pass  # Redis unavailable — proceed without idempotency check
+        pass  # Redis unavailable — proceed without Redis check
 
     # work_email is the DB column name; email is legacy/nested key — prefer work_email
     raw_email = lead.get("work_email") or lead.get("email", "") or ""
@@ -915,9 +927,13 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
             },
         }
 
-    # Only send to LIO if crm_brief is available — enrichment_data fallback removed
+    # Only send to LIO if crm_brief is available
     if not _crm_brief:
-        logger.warning("[LIO] Skipping lead %s — crm_brief is null, not sending to LIO", lead_id)
+        logger.warning("[LIO] Skipping lead %s — crm_brief is null, scheduling background regeneration", lead_id)
+        # Trigger background regeneration so next send_to_lio call will have crm_brief
+        org_id_for_regen = lead.get("organization_id") or "default"
+        if lead.get("name"):
+            asyncio.create_task(regenerate_crm_brief_for_lead(lead_id, org_id=org_id_for_regen))
         return
 
     payload = {
@@ -940,7 +956,15 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
                         lead_id, resp.status_code, resp.text[:500])
             resp.raise_for_status()
             logger.info("[LIO] Successfully forwarded lead %s (attempt %d)", lead_id, attempt)
-            # Mark as sent in Redis (24h TTL) to prevent duplicate delivery
+            # Mark as sent in DB — primary idempotency record (Redis-independent)
+            try:
+                async with get_pool().acquire() as _conn:
+                    await _conn.execute(
+                        "UPDATE enriched_leads SET lio_sent_at=NOW() WHERE id=$1", lead_id
+                    )
+            except Exception:
+                pass
+            # Mark as sent in Redis (24h TTL) — fast-path cache
             try:
                 import redis.asyncio as aioredis
                 _redis_url = os.getenv("REDIS_URL", "")
@@ -1249,6 +1273,7 @@ async def init_leads_db() -> None:
             ("crm_brief", "TEXT"), ("raw_brightdata", "JSONB"),
             ("apollo_raw", "TEXT"),
             ("updated_at", "TIMESTAMPTZ DEFAULT NOW()"),
+            ("lio_sent_at", "TIMESTAMPTZ"),
         ]
         for col, col_type in _NEW_COLS:
             await conn.execute(f"ALTER TABLE enriched_leads ADD COLUMN IF NOT EXISTS {col} {col_type}")
