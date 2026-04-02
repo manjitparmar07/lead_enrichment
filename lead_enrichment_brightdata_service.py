@@ -7140,6 +7140,34 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
                 return False
             return True
 
+        def _is_private_profile(p: dict) -> bool:
+            """Detect BrightData private/hidden profile responses — no retry needed."""
+            _PRIVATE_SIGNALS = ("hidden or private", "profile is private", "private profile", "profile not found")
+            for _field in ("error", "_error", "_bd_message", "message", "about", "name"):
+                _val = str(p.get(_field) or "").lower()
+                if any(s in _val for s in _PRIVATE_SIGNALS):
+                    return True
+            return False
+
+        # ── Private profile — fail immediately, no retries ────────────────────────
+        if _is_private_profile(profile):
+            _err_msg = profile.get("error") or profile.get("_bd_message") or "Profile is private or hidden"
+            logger.warning("[Pipeline] Private/hidden profile for %s — marking failed, no retry", url)
+            _plog(job_id, url, "FAILED", f"Private profile: {_err_msg}", "error")
+            _lead_id_val = _lead_id(url)
+            try:
+                await _upsert_lead({
+                    "id": _lead_id_val,
+                    "linkedin_url": url,
+                    "status": "failed",
+                    "job_id": job_id,
+                    "score_explanation": "Profile is private or hidden on LinkedIn — BrightData cannot access it.",
+                    "enriched_at": datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception:
+                pass
+            return None
+
         # ── Retry if BrightData returned empty/partial/error profile ─────────────
         # Up to 3 re-scrape attempts with exponential back-off (2s, 4s, 8s).
         if not _has_data(profile):
@@ -7154,6 +7182,10 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
                 if retried and _has_data(retried):
                     profile = retried
                     logger.info("[Pipeline] Retry %d succeeded for %s", _attempt + 1, url)
+                    break
+                # Check if retry itself returned a private profile
+                if retried and _is_private_profile(retried):
+                    logger.warning("[Pipeline] Retry confirmed private profile for %s — stopping retries", url)
                     break
             else:
                 _plog(job_id, url, "VALIDATION", "all 3 retries returned empty/invalid profile — skipping", "error")
