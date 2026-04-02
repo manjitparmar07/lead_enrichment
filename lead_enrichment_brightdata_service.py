@@ -836,15 +836,17 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
             },
         }
 
+    # Only send to LIO if crm_brief is available — enrichment_data fallback removed
+    if not _crm_brief:
+        logger.warning("[LIO] Skipping lead %s — crm_brief is null, not sending to LIO", lead_id)
+        return
+
     payload = {
-        # Top-level identity fields LIO uses to index/store the lead
         "lead_id":         lead_id,
         "linkedin_url":    lead.get("linkedin_url", ""),
         "enriched_at":     lead.get("enriched_at", ""),
         "cache_hit":       bool(lead.get("_cache_hit", False)),
         "crm_brief":       _crm_brief,
-        # Full enrichment schema (matches LIO system prompt)
-        "enrichment_data": enrichment_data,
         "sso_id":          sso_id,
         "organization_id": lead.get("organization_id", ""),
     }
