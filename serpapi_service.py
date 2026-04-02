@@ -50,13 +50,12 @@ async def search_linkedin_urls(query: str, org_id: str = "default", num: int = 1
     # To get more, paginate using `start` (0, 10, 20 …).
     pages_needed = (num + 9) // 10  # ceil(num / 10)
 
-    # Build query string — apply exact title and exclude keywords modifiers
-    q_string = f"site:linkedin.com/in {query}"
-    exclude = filters.get("excludeKeywords") or ""
-    if exclude:
-        # Append each comma-separated word as a Google minus operator
-        for word in [w.strip() for w in exclude.split(",") if w.strip()]:
-            q_string += f" -{word}"
+    # Site type: people profiles or company pages
+    site_type = filters.get("siteType", "people")
+    site_prefix = "site:linkedin.com/company" if site_type == "company" else "site:linkedin.com/in"
+    url_marker  = "linkedin.com/company/" if site_type == "company" else "linkedin.com/in/"
+
+    q_string = f"{site_prefix} {query}"
 
     linkedin_urls: list[str] = []
     seen: set[str] = set()
@@ -72,11 +71,6 @@ async def search_linkedin_urls(query: str, org_id: str = "default", num: int = 1
                 "num": 10,
                 "start": page * 10,
             }
-            # Apply SerpAPI filter params only when explicitly set
-            if filters.get("gl"):
-                params["gl"] = filters["gl"]
-            if filters.get("hl"):
-                params["hl"] = filters["hl"]
             if filters.get("tbs"):
                 params["tbs"] = filters["tbs"]
             async with session.get(SERPAPI_BASE, params=params) as resp:
@@ -85,7 +79,7 @@ async def search_linkedin_urls(query: str, org_id: str = "default", num: int = 1
 
             for r in data.get("organic_results", []):
                 link = r.get("link", "")
-                if "linkedin.com/in/" in link:
+                if url_marker in link:
                     clean = link.split("?")[0].rstrip("/")
                     if clean not in seen:
                         seen.add(clean)

@@ -19,11 +19,9 @@ class SearchRequest(BaseModel):
 
 
 class AdvancedFilters(BaseModel):
-    gl: Optional[str] = None              # Google country code (e.g. "us", "in")
-    hl: Optional[str] = "en"             # Interface language (e.g. "en", "hi")
-    tbs: Optional[str] = None            # Time-based search (e.g. "qdr:w", "qdr:m")
-    excludeKeywords: Optional[str] = None  # Comma-separated words to exclude
-    exactTitle: Optional[bool] = False   # Wrap role/title in quotes
+    siteType: Optional[str] = "people"   # 'people' = linkedin.com/in | 'company' = linkedin.com/company
+    tbs: Optional[str] = None            # Freshness: qdr:d / qdr:w / qdr:m / qdr:y
+    # Boolean query fields are built on frontend — backend only needs siteType + tbs
 
 
 class BulkSearchRequest(BaseModel):
