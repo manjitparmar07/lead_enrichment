@@ -303,10 +303,10 @@ _bd_client: Optional[httpx.AsyncClient] = None    # Bright Data
 _web_client: Optional[httpx.AsyncClient] = None   # Website scraping (follow redirects)
 
 # ── Concurrency controls for 1000-URL bulk jobs ───────────────────────────────
-# Max 5 simultaneous HuggingFace LLM calls (prevents HF rate limiting)
-_llm_semaphore: asyncio.Semaphore = asyncio.Semaphore(5)
-# Max 10 simultaneous full enrichment pipelines (company waterfall + website + LLM)
-_enrichment_semaphore: asyncio.Semaphore = asyncio.Semaphore(10)
+# Max 10 simultaneous HuggingFace LLM calls (HF paid tier safe limit)
+_llm_semaphore: asyncio.Semaphore = asyncio.Semaphore(10)
+# Max 20 simultaneous full enrichment pipelines (DB pool size limit)
+_enrichment_semaphore: asyncio.Semaphore = asyncio.Semaphore(20)
 
 _HTTP_LIMITS = httpx.Limits(max_connections=40, max_keepalive_connections=20)
 
@@ -6931,8 +6931,8 @@ async def enrich_bulk(
             sub_job_ids = [str(uuid.uuid4()) for _ in url_chunks]
             total_chunks = len(url_chunks)
 
-            # Max 25 concurrent trigger calls to BrightData (avoid 429 rate-limit)
-            _bd_semaphore = asyncio.Semaphore(25)
+            # Max 50 concurrent trigger calls to BrightData (BD standard plan safe limit)
+            _bd_semaphore = asyncio.Semaphore(50)
 
             async def _trigger_bd_chunk(idx: int, sjid: str, chunk: list) -> str:
                 async with _bd_semaphore:  # at most 10 in-flight at once
