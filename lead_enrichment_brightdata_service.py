@@ -544,10 +544,11 @@ async def send_to_lio_failed(
         logger.warning("[LIO-FAILED] Could not notify LIO for %s: %s", linkedin_url, e)
 
 
-async def send_to_lio(lead: dict, sso_id: str = "") -> None:
+async def send_to_lio(lead: dict, sso_id: str = "", force: bool = False) -> None:
     """
     Fire-and-forget: forward an enriched lead to the LIO service.
     Called as asyncio.create_task() — never blocks enrich_single().
+    force=True bypasses idempotency — use when user explicitly re-submits same URL.
     Logs a warning on failure but does not raise.
     """
     url = LIO_RECEIVE_URL
@@ -557,33 +558,34 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
 
     lead_id = lead.get("lead_id") or lead.get("id", "unknown")
 
-    # Idempotency — DB-first (always available), Redis as secondary cache
-    # DB check: lio_sent_at column — set after every successful LIO send
-    try:
-        async with get_pool().acquire() as _conn:
-            _row = await _conn.fetchrow(
-                "SELECT lio_sent_at FROM enriched_leads WHERE id=$1", lead_id
-            )
-            if _row and _row["lio_sent_at"]:
-                logger.info("[LIO] Lead %s already sent at %s — skipping (idempotent)", lead_id, _row["lio_sent_at"])
-                return
-    except Exception:
-        pass  # DB check failed — proceed
+    # Idempotency — skip if already sent, unless force=True (user re-submission)
+    if not force:
+        try:
+            async with get_pool().acquire() as _conn:
+                _row = await _conn.fetchrow(
+                    "SELECT lio_sent_at FROM enriched_leads WHERE id=$1", lead_id
+                )
+                if _row and _row["lio_sent_at"]:
+                    logger.info("[LIO] Lead %s already sent at %s — skipping (idempotent)", lead_id, _row["lio_sent_at"])
+                    return
+        except Exception:
+            pass  # DB check failed — proceed
 
     # Redis secondary cache (24h TTL) — fast path if Redis available
     _lio_sent_key = f"lio:sent:{lead_id}"
-    try:
-        import redis.asyncio as aioredis
-        _redis_url = os.getenv("REDIS_URL", "")
-        if _redis_url:
-            _r = aioredis.from_url(_redis_url, decode_responses=True)
-            already_sent = await _r.get(_lio_sent_key)
-            await _r.close()
-            if already_sent:
-                logger.info("[LIO] Lead %s already sent (Redis) — skipping", lead_id)
-                return
-    except Exception:
-        pass  # Redis unavailable — proceed without Redis check
+    if not force:
+        try:
+            import redis.asyncio as aioredis
+            _redis_url = os.getenv("REDIS_URL", "")
+            if _redis_url:
+                _r = aioredis.from_url(_redis_url, decode_responses=True)
+                already_sent = await _r.get(_lio_sent_key)
+                await _r.close()
+                if already_sent:
+                    logger.info("[LIO] Lead %s already sent (Redis) — skipping", lead_id)
+                    return
+        except Exception:
+            pass  # Redis unavailable — proceed without Redis check
 
     # work_email is the DB column name; email is legacy/nested key — prefer work_email
     raw_email = lead.get("work_email") or lead.get("email", "") or ""

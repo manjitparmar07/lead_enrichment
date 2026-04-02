@@ -761,7 +761,7 @@ async def enrich_bulk(request: Request):
                 _sso  = sso_id
                 async def _capped_lio_send(_l=_lead, _s=_sso):
                     async with _skip_lio_sem:
-                        await svc.send_to_lio(_l, sso_id=_s)
+                        await svc.send_to_lio(_l, sso_id=_s, force=True)
                 asyncio.create_task(_capped_lio_send())
                 skipped_urls.append(url)
             else:
