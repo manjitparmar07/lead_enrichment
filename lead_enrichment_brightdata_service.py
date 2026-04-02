@@ -499,6 +499,36 @@ async def lio_dlq_replay(max_items: int = 50) -> dict:
         return {"replayed": 0, "failed": 0, "error": str(e)}
 
 
+async def send_to_lio_failed(
+    linkedin_url: str,
+    org_id: str,
+    sso_id: str = "",
+    reason: str = "enrichment_failed",
+) -> None:
+    """
+    Notify LIO that a LinkedIn URL failed enrichment.
+    Sends status=failed so LIO can mark the lead accordingly.
+    """
+    url = LIO_RECEIVE_URL
+    if not url:
+        return
+    payload = {
+        "enrichment_data": {
+            "status":       "failed",
+            "linkedin_url": linkedin_url,
+            "error_reason": reason,
+        },
+        "sso_id":          sso_id,
+        "organization_id": org_id,
+    }
+    try:
+        client = _get_lio_client()
+        resp = await client.post(url, json=payload)
+        logger.info("[LIO-FAILED] Sent failure for %s → HTTP %s", linkedin_url, resp.status_code)
+    except Exception as e:
+        logger.warning("[LIO-FAILED] Could not notify LIO for %s: %s", linkedin_url, e)
+
+
 async def send_to_lio(lead: dict, sso_id: str = "") -> None:
     """
     Fire-and-forget: forward an enriched lead to the LIO service.
@@ -7181,7 +7211,7 @@ async def _process_fallback_batch(job_id: str, urls: list[str]) -> None:
     await _process_sequential_batch(job_id, url_chunks, sub_job_ids)
 
 
-async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org_id: str, sub_job_id: Optional[str] = None) -> Optional[dict]:
+async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org_id: str, sub_job_id: Optional[str] = None, sso_id: str = "") -> Optional[dict]:
     """
     Process a single BrightData profile through the full enrichment pipeline.
     Returns the enriched lead dict on success, None on failure.
@@ -7233,11 +7263,13 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
                     "linkedin_url": url,
                     "status": "failed",
                     "job_id": job_id,
+                    "organization_id": org_id,
                     "score_explanation": "Profile is private or hidden on LinkedIn — BrightData cannot access it.",
                     "enriched_at": datetime.now(timezone.utc).isoformat(),
                 })
             except Exception:
                 pass
+            asyncio.create_task(send_to_lio_failed(url, org_id, sso_id, reason="private_profile"))
             return None
 
         # ── Retry if BrightData returned empty/partial/error profile ─────────────
@@ -7262,6 +7294,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             else:
                 _plog(job_id, url, "VALIDATION", "all 3 retries returned empty/invalid profile — skipping", "error")
                 logger.error("[Pipeline] All 3 retries returned empty/invalid profile for %s — skipping", url)
+                asyncio.create_task(send_to_lio_failed(url, org_id, sso_id, reason="empty_after_retries"))
                 return None
 
         name = profile.get("name", "")
@@ -7622,7 +7655,7 @@ async def process_webhook_profiles(
     # Process all profiles fully in parallel — no lock needed.
     # The job counter UPDATE below uses LEAST() which is atomic at DB level
     # and handles concurrent increments safely without any application-level lock.
-    coros = [_process_one_webhook_profile(p, job_id, org_id, sub_job_id=_sub_job_id) for p in profiles]
+    coros = [_process_one_webhook_profile(p, job_id, org_id, sub_job_id=_sub_job_id, sso_id=sso_id) for p in profiles]
     results = await asyncio.gather(*coros, return_exceptions=True)
 
     ok_leads = [r for r in results if isinstance(r, dict)]
