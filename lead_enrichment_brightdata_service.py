@@ -302,6 +302,12 @@ _api_client: Optional[httpx.AsyncClient] = None   # Hunter / Apollo / Dropcontac
 _bd_client: Optional[httpx.AsyncClient] = None    # Bright Data
 _web_client: Optional[httpx.AsyncClient] = None   # Website scraping (follow redirects)
 
+# ── Concurrency controls for 1000-URL bulk jobs ───────────────────────────────
+# Max 5 simultaneous HuggingFace LLM calls (prevents HF rate limiting)
+_llm_semaphore: asyncio.Semaphore = asyncio.Semaphore(5)
+# Max 10 simultaneous full enrichment pipelines (company waterfall + website + LLM)
+_enrichment_semaphore: asyncio.Semaphore = asyncio.Semaphore(10)
+
 _HTTP_LIMITS = httpx.Limits(max_connections=40, max_keepalive_connections=20)
 
 # ── Bright Data timeout — override via BD_REQUEST_TIMEOUT env var ──────────────
@@ -1810,20 +1816,18 @@ async def _call_llm(
     max_tokens: int = 1800,
     temperature: float = 0.3,
     model_override: Optional[str] = None,
-    # Explicit key overrides — used when keys come from DB tool configs rather than env/keys_service
+    # Kept for signature compatibility — unused (Groq removed)
     groq_api_key: Optional[str] = None,
     wb_llm_host_override: Optional[str] = None,
     wb_llm_key_override: Optional[str] = None,
     wb_llm_model_override: Optional[str] = None,
-    # When True: skip WB LLM and try HuggingFace first, then Groq as fallback
     hf_first: bool = False,
 ) -> Optional[str]:
-    """Try WB LLM → Groq → HuggingFace (default) or HuggingFace → Groq (hf_first=True).
-    model_override: overrides the Groq model (env default or explicit groq_api_key).
-    groq_api_key / wb_llm_*_override: explicit keys from DB — take priority over env/keys_service.
-    hf_first: skip WB LLM and use HuggingFace as primary, Groq as fallback.
+    """HuggingFace (Qwen2.5-72B) only — Groq removed.
+    Semaphore-limited to max 5 concurrent calls to prevent HF rate limiting.
+    3 retries with 5s/10s backoff on transient failures.
     """
-    async def _post(base_url: str, api_key: str, model: str, msgs: list, timeout: int = 60) -> str:
+    async def _post(base_url: str, api_key: str, model: str, msgs: list, timeout: int = 180) -> str:
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
@@ -1834,59 +1838,28 @@ async def _call_llm(
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"].strip()
 
-    # Groq rejects payloads over ~12KB total. System prompt (~3.5K) + user message (8K) = 11.5K safe.
-    def _truncate_for_groq(msgs: list, char_limit: int = 8000) -> list:
-        result = []
-        for m in msgs:
-            if m["role"] == "user" and len(m["content"]) > char_limit:
-                result.append({**m, "content": m["content"][:char_limit] + "\n...[truncated for token limit]"})
-            else:
-                result.append(m)
-        return result
+    hf_token = _hf_token()
+    if not hf_token:
+        logger.warning("[LLM] No HuggingFace token — cannot generate LLM output")
+        return None
 
-    async def _try_groq() -> Optional[str]:
-        g_key = groq_api_key or _groq_key()
-        if not g_key:
-            return None
-        _is_wb_model = model_override and ("/" in model_override or model_override.startswith("wb-"))
-        groq_model = (None if _is_wb_model else model_override) or _groq_model()
-        groq_messages = _truncate_for_groq(messages)
+    hf_model = _hf_model()
+    payload_chars = sum(len(m["content"]) for m in messages)
+
+    async with _llm_semaphore:   # max 5 concurrent HF calls
         for attempt in range(3):
             try:
-                return await _post("https://api.groq.com/openai", g_key, groq_model, groq_messages)
+                logger.info("[LLM] HuggingFace (%s) attempt %d/3 payload=%d chars", hf_model, attempt + 1, payload_chars)
+                result = await _post("https://router.huggingface.co", hf_token, hf_model, messages)
+                logger.info("[LLM] HuggingFace OK — attempt %d", attempt + 1)
+                return result
             except Exception as e:
-                if "413" in str(e):
-                    logger.warning("[LLM] Groq 413 payload too large — not retrying, will fallback")
-                    break
-                if "429" in str(e) and attempt < 2:
-                    wait = 5 * (attempt + 1)
-                    logger.warning("[LLM] Groq 429 — retrying in %ds (attempt %d/3)", wait, attempt + 1)
-                    await asyncio.sleep(wait)
-                else:
-                    logger.warning("[LLM] Groq failed: %s", e)
-                    break
-        return None
+                logger.warning("[LLM] HuggingFace failed (attempt %d/3): %s", attempt + 1, e)
+                if attempt < 2:
+                    await asyncio.sleep(5 * (attempt + 1))  # 5s, 10s
 
-    async def _try_hf() -> Optional[str]:
-        hf_token = _hf_token()
-        if not hf_token:
-            return None
-        hf_model = _hf_model()
-        for _hf_attempt in range(3):
-            try:
-                logger.info("[LLM] Trying HuggingFace (%s) attempt %d/3 payload=%d chars", hf_model, _hf_attempt + 1, sum(len(m["content"]) for m in messages))
-                return await _post("https://router.huggingface.co", hf_token, hf_model, messages, timeout=180)
-            except Exception as e:
-                logger.warning("[LLM] HuggingFace failed (attempt %d/3): %s", _hf_attempt + 1, e)
-                if _hf_attempt < 2:
-                    await asyncio.sleep(5 * (_hf_attempt + 1))
-        return None
-
-    # Priority: HuggingFace (Qwen2.5-72B) → Groq — WB LLM skipped
-    result = await _try_hf()
-    if result:
-        return result
-    return await _try_groq()
+    logger.error("[LLM] All 3 HuggingFace attempts failed — returning None")
+    return None
 
 
 def _parse_json_from_llm(raw: str) -> dict:
@@ -7228,12 +7201,14 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
                 pass
 
         # True parallel: company waterfall + contact email lookup run together.
-        # Website scrape follows waterfall (needs real_website URL from it).
-        (company_extras, company_wf_log), contact = await asyncio.gather(
-            enrich_company_waterfall(company, domain, profile),
-            find_contact_info(first, last, domain, linkedin_url=url),
-            return_exceptions=True,
-        )
+        # Controlled by _enrichment_semaphore (max 10 concurrent external API calls).
+        # LLM calls further limited by _llm_semaphore (max 5) inside _call_llm.
+        async with _enrichment_semaphore:
+            (company_extras, company_wf_log), contact = await asyncio.gather(
+                enrich_company_waterfall(company, domain, profile),
+                find_contact_info(first, last, domain, linkedin_url=url),
+                return_exceptions=True,
+            )
         if isinstance(company_extras, Exception):
             company_extras, company_wf_log = {}, []
         if isinstance(contact, Exception):
