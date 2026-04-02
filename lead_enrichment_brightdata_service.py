@@ -571,6 +571,35 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
                     except Exception:
                         scores[_sf] = 0
 
+        # Inject lead_id into who_they_are — LLM output never has this
+        if isinstance(_crm_brief.get("who_they_are"), dict):
+            _crm_brief["who_they_are"].setdefault("lead_id", lead_id)
+
+        # Inject contact block — LLM never has actual email/phone; pull from DB
+        if "contact" not in _crm_brief:
+            _crm_brief["contact"] = {
+                "work_email":       email,
+                "phone":            phone,
+                "email_source":     lead.get("email_source", ""),
+                "email_confidence": lead.get("email_confidence", ""),
+                "email_verified":   bool(lead.get("email_verified")),
+                "bounce_risk":      lead.get("bounce_risk", ""),
+            }
+
+        # Inject company_intelligence — LLM schema doesn't include this; pull from DB/website_intel
+        if "company_intelligence" not in _crm_brief:
+            _wi = _parse_json_safe(lead.get("website_intelligence"), {})
+            _prod_offer = _parse_json_safe(lead.get("product_offerings"), [])
+            _tgt_custs  = _parse_json_safe(lead.get("target_customers"), [])
+            _crm_brief["company_intelligence"] = {
+                "description":       lead.get("company_description") or _wi.get("company_description") or "",
+                "value_proposition": lead.get("value_proposition") or _wi.get("value_proposition") or "",
+                "product_category":  lead.get("product_category") or _wi.get("product_category") or "",
+                "product_offerings": _prod_offer[:10],
+                "target_customers":  _tgt_custs,
+                "pricing_signals":   lead.get("pricing_signals") or _wi.get("pricing_signals") or "",
+            }
+
     # enrichment_data = LLM-structured output (shaped by lio_system_prompt).
     # Fallback maps linkedin_enrich into the same crm_brief JSON structure so LIO
     # always receives a consistent shape regardless of whether LLM ran.
