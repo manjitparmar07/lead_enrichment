@@ -669,6 +669,15 @@ async def send_to_lio(lead: dict, sso_id: str = "", force: bool = False) -> None
                 "bounce_risk":      lead.get("bounce_risk", ""),
             }
 
+        # Patch crm_import_fields.analyst_summary from DB — LLM returns generic/empty text
+        _cif = _crm_brief.get("crm_import_fields")
+        if isinstance(_cif, dict) and not _cif.get("analyst_summary"):
+            _db_summary = (
+                lead.get("score_explanation")
+                or f"{seniority} at {lead.get('company') or 'company'} — {lead.get('score_tier') or 'unscored'}"
+            )
+            _cif["analyst_summary"] = _db_summary
+
         # Inject company_intelligence — LLM schema doesn't include this; pull from DB/website_intel
         if "company_intelligence" not in _crm_brief:
             _wi = _parse_json_safe(lead.get("website_intelligence"), {})
