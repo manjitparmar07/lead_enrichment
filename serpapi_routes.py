@@ -18,10 +18,19 @@ class SearchRequest(BaseModel):
     org_id: Optional[str] = "default"
 
 
+class AdvancedFilters(BaseModel):
+    gl: Optional[str] = None              # Google country code (e.g. "us", "in")
+    hl: Optional[str] = "en"             # Interface language (e.g. "en", "hi")
+    tbs: Optional[str] = None            # Time-based search (e.g. "qdr:w", "qdr:m")
+    excludeKeywords: Optional[str] = None  # Comma-separated words to exclude
+    exactTitle: Optional[bool] = False   # Wrap role/title in quotes
+
+
 class BulkSearchRequest(BaseModel):
     queries: list[str]
     org_id: Optional[str] = "default"
-    num: Optional[int] = 10   # results per query, max 100
+    num: Optional[int] = 10              # results per query, max 100
+    filters: Optional[AdvancedFilters] = None
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -50,7 +59,8 @@ async def bulk_search(req: BulkSearchRequest):
     if len(req.queries) > 20:
         raise HTTPException(status_code=422, detail="Max 20 queries per request")
     try:
-        results = await svc.bulk_search(req.queries, req.org_id, req.num or 10)
+        filters = req.filters.model_dump() if req.filters else {}
+        results = await svc.bulk_search(req.queries, req.org_id, req.num or 10, filters)
         all_urls = list({u for r in results for u in r.get("linkedin_urls", [])})
         return {"success": True, "results": results, "total_urls": len(all_urls), "all_urls": all_urls}
     except ValueError as e:

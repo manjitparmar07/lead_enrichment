@@ -37,18 +37,26 @@ async def init_serpapi_db() -> None:
 
 # ── Core search ───────────────────────────────────────────────────────────────
 
-async def search_linkedin_urls(query: str, org_id: str = "default", num: int = 10) -> dict:
+async def search_linkedin_urls(query: str, org_id: str = "default", num: int = 10, filters: dict | None = None) -> dict:
     """Search Google via SerpAPI for LinkedIn profile URLs matching query."""
     key = _serpapi_key()
     if not key:
         raise ValueError("SERPAPI_KEY not configured")
 
+    filters = filters or {}
     num = max(1, min(num, 100))  # clamp 1–100
 
     # SerpAPI / Google returns 10 results per page max.
     # To get more, paginate using `start` (0, 10, 20 …).
     pages_needed = (num + 9) // 10  # ceil(num / 10)
+
+    # Build query string — apply exact title and exclude keywords modifiers
     q_string = f"site:linkedin.com/in {query}"
+    exclude = filters.get("excludeKeywords") or ""
+    if exclude:
+        # Append each comma-separated word as a Google minus operator
+        for word in [w.strip() for w in exclude.split(",") if w.strip()]:
+            q_string += f" -{word}"
 
     linkedin_urls: list[str] = []
     seen: set[str] = set()
@@ -64,6 +72,13 @@ async def search_linkedin_urls(query: str, org_id: str = "default", num: int = 1
                 "num": 10,
                 "start": page * 10,
             }
+            # Apply SerpAPI filter params only when explicitly set
+            if filters.get("gl"):
+                params["gl"] = filters["gl"]
+            if filters.get("hl"):
+                params["hl"] = filters["hl"]
+            if filters.get("tbs"):
+                params["tbs"] = filters["tbs"]
             async with session.get(SERPAPI_BASE, params=params) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
@@ -98,11 +113,11 @@ async def search_linkedin_urls(query: str, org_id: str = "default", num: int = 1
     return {"id": record_id, "query": query, "linkedin_urls": linkedin_urls, "result_count": len(linkedin_urls)}
 
 
-async def bulk_search(queries: list[str], org_id: str = "default", num: int = 10) -> list[dict]:
+async def bulk_search(queries: list[str], org_id: str = "default", num: int = 10, filters: dict | None = None) -> list[dict]:
     """Run multiple queries concurrently."""
     import asyncio
     results = await asyncio.gather(
-        *[search_linkedin_urls(q, org_id, num) for q in queries],
+        *[search_linkedin_urls(q, org_id, num, filters) for q in queries],
         return_exceptions=True,
     )
     output = []
