@@ -499,6 +499,21 @@ async def lio_dlq_replay(max_items: int = 50) -> dict:
         return {"replayed": 0, "failed": 0, "error": str(e)}
 
 
+_CRM_BRIEF_REQUIRED_KEYS = ("who_they_are", "crm_scores", "outreach_blueprint", "crm_import_fields")
+
+def _validate_crm_brief(d: dict) -> bool:
+    """
+    Returns True if crm_brief has all required top-level keys and is not empty.
+    False = treat as invalid → trigger regen.
+    """
+    if not d or not isinstance(d, dict):
+        return False
+    for key in _CRM_BRIEF_REQUIRED_KEYS:
+        if key not in d or not d[key]:
+            return False
+    return True
+
+
 async def send_to_lio_failed(
     linkedin_url: str,
     org_id: str,
@@ -957,14 +972,44 @@ async def send_to_lio(lead: dict, sso_id: str = "") -> None:
             },
         }
 
-    # Only send to LIO if crm_brief is available
-    if not _crm_brief:
-        logger.warning("[LIO] Skipping lead %s — crm_brief is null, scheduling background regeneration", lead_id)
-        # Trigger background regeneration so next send_to_lio call will have crm_brief
-        org_id_for_regen = lead.get("organization_id") or "default"
+    # ── Validate crm_brief — null, empty {}, or partial JSON ─────────────────
+    _org_id_for_regen = lead.get("organization_id") or "default"
+    _linkedin_url_for_fail = lead.get("linkedin_url", "")
+
+    if not _validate_crm_brief(_crm_brief):
+        # Issue 3 & 4: empty {} or partial/missing required keys
+        if _crm_brief is not None:
+            logger.warning("[LIO] Lead %s crm_brief is empty or partial — attempting regen", lead_id)
+        else:
+            logger.warning("[LIO] Lead %s crm_brief is null — attempting regen", lead_id)
+
         if lead.get("name"):
-            asyncio.create_task(regenerate_crm_brief_for_lead(lead_id, org_id=org_id_for_regen))
-        return
+            try:
+                # Await regen directly (we're already in a background task)
+                regen_lead = await regenerate_crm_brief_for_lead(lead_id, org_id=_org_id_for_regen)
+                if regen_lead:
+                    regen_brief_raw = regen_lead.get("crm_brief")
+                    regen_brief = None
+                    if regen_brief_raw:
+                        try:
+                            regen_brief = json.loads(regen_brief_raw) if isinstance(regen_brief_raw, str) else regen_brief_raw
+                        except Exception:
+                            pass
+                    if _validate_crm_brief(regen_brief):
+                        logger.info("[LIO] Regen successful for lead %s — proceeding to send", lead_id)
+                        _crm_brief = regen_brief
+                    else:
+                        raise RuntimeError("Regen produced invalid crm_brief")
+                else:
+                    raise RuntimeError("Regen returned no lead")
+            except Exception as regen_err:
+                logger.error("[LIO] Regen also failed for lead %s: %s — notifying LIO as failed", lead_id, regen_err)
+                await send_to_lio_failed(_linkedin_url_for_fail, _org_id_for_regen, sso_id, reason="llm_failed")
+                return
+        else:
+            logger.warning("[LIO] Lead %s has no name — cannot regen, notifying LIO as failed", lead_id)
+            await send_to_lio_failed(_linkedin_url_for_fail, _org_id_for_regen, sso_id, reason="llm_failed")
+            return
 
     payload = {
         "enrichment_data": _crm_brief,
@@ -6518,9 +6563,10 @@ async def enrich_single(
     lead["_cache_hit"] = False
     lead["linkedin_enrich"] = _format_linkedin_enrich(lead, include_contact=not skip_contact)
 
-    # If crm_brief generation failed (LLM rate-limited/timed out), regenerate in background
-    if lead.get("crm_brief") is None and lead.get("name"):
-        logger.warning("[Enrich] crm_brief missing for %s — scheduling background regeneration", url)
+    # If crm_brief generation failed or empty — regenerate in background
+    _saved_brief_single = _parse_json_safe(lead.get("crm_brief"), None)
+    if not _validate_crm_brief(_saved_brief_single) and lead.get("name"):
+        logger.warning("[Enrich] crm_brief missing/invalid for %s — scheduling background regeneration", url)
         asyncio.create_task(regenerate_crm_brief_for_lead(lead_id, org_id=org_id))
 
     # Forward to LIO — only if BrightData returned real data (lead has a name)
@@ -7558,9 +7604,10 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
         _plog(job_id, url, "COMPLETED", f"score_tier={score_tier!r} — lead saved and sent to LIO")
         logger.info("[Pipeline] %s → completed", url)
 
-        # If crm_brief generation failed (LLM rate-limited/timed out), regenerate in background
-        if lead.get("crm_brief") is None:
-            logger.warning("[Pipeline] crm_brief missing for %s — scheduling background regeneration", url)
+        # If crm_brief generation failed or empty — regenerate in background
+        _saved_brief = _parse_json_safe(lead.get("crm_brief"), None)
+        if not _validate_crm_brief(_saved_brief):
+            logger.warning("[Pipeline] crm_brief missing/invalid for %s — scheduling background regeneration", url)
             asyncio.create_task(regenerate_crm_brief_for_lead(lead_id, org_id=org_id))
 
         return lead
@@ -7897,4 +7944,9 @@ async def regenerate_crm_brief_for_lead(lead_id: str, org_id: str = "") -> Optio
         )
 
     logger.info("[RegenerateCrmBrief] Updated crm_brief for lead=%s (%d chars)", lead_id, len(crm_brief_db))
-    return await get_lead(lead_id)
+    updated_lead = await get_lead(lead_id)
+    # Auto-send to LIO after successful regen — but only if called standalone (not from send_to_lio itself)
+    if updated_lead and updated_lead.get("name"):
+        sso_id_for_lio = updated_lead.get("sso_id") or ""
+        asyncio.create_task(send_to_lio(updated_lead, sso_id=sso_id_for_lio))
+    return updated_lead
