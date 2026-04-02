@@ -1061,6 +1061,7 @@ async def send_to_lio(lead: dict, sso_id: str = "", force: bool = False) -> None
             await send_to_lio_failed(_linkedin_url_for_fail, _org_id_for_regen, sso_id, reason="llm_failed")
             return
 
+    _crm_brief["status"] = "success"
     payload = {
         "enrichment_data": _crm_brief,
         "sso_id":          sso_id,
