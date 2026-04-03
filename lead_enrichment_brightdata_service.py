@@ -306,7 +306,7 @@ def _normalise_person_text(lead: dict) -> None:
 
 # ── Shared persistent HTTP clients (reuse TCP/TLS connections across requests) ─
 # Each external service gets its own client so keep-alive pools don't interfere.
-LIO_RECEIVE_URL = os.getenv("LIO_RECEIVE_URL", "https://api-lio-worksbuddy.lbmdemo.com/api/enrich/receive")
+LIO_RECEIVE_URL = os.getenv("LIO_RECEIVE_URL", "https://api-lio.worksbuddy.ai/api/enrich/receive")
 _JWT_SECRET     = os.getenv("JWT_SECRET", "")
 _LIO_TOKEN      = os.getenv("LIO_TOKEN", "")   # dedicated bearer token for LIO auth
 _lio_client: Optional[httpx.AsyncClient] = None
