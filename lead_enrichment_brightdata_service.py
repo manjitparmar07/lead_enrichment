@@ -1062,6 +1062,7 @@ async def send_to_lio(lead: dict, sso_id: str = "", force: bool = False) -> None
             return
 
     _crm_brief["status"] = "success"
+    _crm_brief["input_url"] = lead.get("linkedin_url") or ""
     payload = {
         "enrichment_data": _crm_brief,
         "sso_id":          sso_id,
