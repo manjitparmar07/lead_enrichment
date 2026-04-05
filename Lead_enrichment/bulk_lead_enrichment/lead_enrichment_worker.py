@@ -16,7 +16,7 @@ These are kept for backwards compatibility — main.py already imports them.
 from __future__ import annotations
 
 import logging
-from queue_manager import start_queue_system, stop_queue_system
+from Lead_enrichment.bulk_lead_enrichment.queue_manager import start_queue_system, stop_queue_system
 
 logger = logging.getLogger(__name__)
 

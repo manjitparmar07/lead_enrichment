@@ -21,8 +21,8 @@ from typing import List, Union
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-import ai_enrichment_service as svc
-import enrichment_config_service as cfg_svc
+from Lead_enrichment.outreach_lead_enrichment import ai_enrichment_service as svc
+from config import enrichment_config_service as cfg_svc
 
 router = APIRouter(prefix="/v1/ai", tags=["AI Enrichment"])
 

@@ -22,8 +22,8 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from db import get_pool
-import lead_enrichment_brightdata_service as svc
-import enrichment_config_service as cfg_svc
+from Lead_enrichment.bulk_lead_enrichment import lead_enrichment_brightdata_service as svc
+from config import enrichment_config_service as cfg_svc
 
 logger = logging.getLogger(__name__)
 

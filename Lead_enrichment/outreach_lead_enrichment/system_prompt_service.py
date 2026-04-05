@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from db import get_pool, named_args
-import workspace_service as ws
+from workspace import workspace_service as ws
 
 logger = logging.getLogger(__name__)
 

@@ -78,7 +78,7 @@ BD_BASE = "https://api.brightdata.com/datasets/v3"
 def _k(name: str, default: str = "") -> str:
     """Fetch key from keys_service (admin store) with os.getenv fallback."""
     try:
-        import keys_service as _ks
+        from auth import keys_service as _ks
         return _ks.get(name) or os.getenv(name, default)
     except Exception:
         return os.getenv(name, default)
@@ -1162,7 +1162,7 @@ async def _push_lead_task(queue: str, task: dict) -> bool:
 async def _publish_lead_done(org_id: str, job_id: str, lead: dict) -> None:
     """Publish lead:done event to Ably — real-time frontend update."""
     try:
-        import ably_service
+        from realtime import ably_service
         channel = f"tenant:{org_id}:job:{job_id}"
         await ably_service.publish(channel, "lead:done", {
             "job_id":         job_id,
@@ -1185,7 +1185,7 @@ async def _publish_lead_done(org_id: str, job_id: str, lead: dict) -> None:
 async def _publish_job_done(org_id: str, job_id: str, processed: int, failed: int) -> None:
     """Publish job:done event when all leads in a bulk job are processed."""
     try:
-        import ably_service
+        from realtime import ably_service
         channel = f"tenant:{org_id}:job:{job_id}"
         await ably_service.publish(channel, "job:done", {
             "job_id":    job_id,
@@ -1737,7 +1737,19 @@ async def list_leads(
     job_id: Optional[str] = None,
     min_score: Optional[int] = None,
     tier: Optional[str] = None,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+    q: Optional[str] = None,
 ) -> dict:
+    _SORTABLE = {
+        "score": "total_score",
+        "name": "name",
+        "company": "company",
+        "enriched_at": "enriched_at",
+        "created_at": "created_at",
+    }
+    sort_col = _SORTABLE.get(sort_by or "", "total_score")
+    sort_order = "ASC" if (sort_dir or "").upper() == "ASC" else "DESC"
     clauses: list[str] = []
     params: list = []
     if org_id:
@@ -1748,12 +1760,16 @@ async def list_leads(
         params.append(min_score); clauses.append(f"total_score>=${len(params)}")
     if tier:
         params.append(tier); clauses.append(f"score_tier=${len(params)}")
+    if q:
+        params.append(f"%{q.lower()}%")
+        n = len(params)
+        clauses.append(f"(LOWER(name) LIKE ${n} OR LOWER(company) LIKE ${n})")
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     params_page = params + [limit, offset]
     async with get_pool().acquire() as conn:
         total = await conn.fetchval(f"SELECT COUNT(*) FROM enriched_leads {where}", *params)
         rows = await conn.fetch(
-            f"SELECT * FROM enriched_leads {where} ORDER BY total_score DESC, enriched_at DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}",
+            f"SELECT * FROM enriched_leads {where} ORDER BY {sort_col} {sort_order} NULLS LAST, enriched_at DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}",
             *params_page,
         )
     return {"total": total, "leads": [dict(r) for r in rows]}
@@ -2019,18 +2035,17 @@ async def _call_llm(
     max_tokens: int = 1800,
     temperature: float = 0.3,
     model_override: Optional[str] = None,
-    # Kept for signature compatibility — unused (Groq removed)
     groq_api_key: Optional[str] = None,
     wb_llm_host_override: Optional[str] = None,
     wb_llm_key_override: Optional[str] = None,
     wb_llm_model_override: Optional[str] = None,
     hf_first: bool = False,
 ) -> Optional[str]:
-    """HuggingFace (Qwen2.5-72B) only — Groq removed.
-    Semaphore-limited to max 5 concurrent calls to prevent HF rate limiting.
-    3 retries with 5s/10s backoff on transient failures.
+    """HuggingFace only — Qwen2.5-7B-Instruct (fast, low latency).
+    3 retries with 3s/6s backoff on transient failures.
+    Semaphore-limited to max 10 concurrent calls.
     """
-    async def _post(base_url: str, api_key: str, model: str, msgs: list, timeout: int = 180) -> str:
+    async def _post(base_url: str, api_key: str, model: str, msgs: list, timeout: int = 90) -> str:
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
@@ -2043,13 +2058,13 @@ async def _call_llm(
 
     hf_token = _hf_token()
     if not hf_token:
-        logger.warning("[LLM] No HuggingFace token — cannot generate LLM output")
+        logger.warning("[LLM] No HuggingFace token configured")
         return None
 
-    hf_model = _hf_model()
+    hf_model = _hf_model()  # Qwen/Qwen2.5-7B-Instruct from HF_MODEL env
     payload_chars = sum(len(m["content"]) for m in messages)
 
-    async with _llm_semaphore:   # max 5 concurrent HF calls
+    async with _llm_semaphore:
         for attempt in range(3):
             try:
                 logger.info("[LLM] HuggingFace (%s) attempt %d/3 payload=%d chars", hf_model, attempt + 1, payload_chars)
@@ -2059,7 +2074,7 @@ async def _call_llm(
             except Exception as e:
                 logger.warning("[LLM] HuggingFace failed (attempt %d/3): %s", attempt + 1, e)
                 if attempt < 2:
-                    await asyncio.sleep(5 * (attempt + 1))  # 5s, 10s
+                    await asyncio.sleep(3 * (attempt + 1))  # 3s, 6s
 
     logger.error("[LLM] All 3 HuggingFace attempts failed — returning None")
     return None
@@ -3032,15 +3047,19 @@ async def _try_hunter(first: str, last: str, domain: str) -> Optional[dict]:
     return None
 
 
-async def _try_apollo(first: str, last: str, domain: str) -> Optional[dict]:
-    if not _apollo_api_key() or not domain:
+async def _try_apollo(first: str, last: str, domain: str, linkedin_url: str = "") -> Optional[dict]:
+    if not _apollo_api_key() or (not domain and not linkedin_url):
         return None
     try:
+        payload: dict = {"first_name": first, "last_name": last, "reveal_personal_emails": True}
+        if domain:
+            payload["domain"] = domain
+        if linkedin_url:
+            payload["linkedin_url"] = linkedin_url
         c = _get_api_client()
         r = await c.post("https://api.apollo.io/v1/people/match",
             headers={"Content-Type": "application/json", "X-Api-Key": _apollo_api_key()},
-            json={"first_name": first, "last_name": last,
-                  "domain": domain, "reveal_personal_emails": True},
+            json=payload,
         )
         body = r.json()
         p   = body.get("person") or {}
@@ -3071,6 +3090,11 @@ async def _try_apollo(first: str, last: str, domain: str) -> Optional[dict]:
             }
         if email and "placeholder" in email.lower():
             logger.warning("[Apollo] Rejected placeholder email: %s", email)
+        # Check for credit exhaustion (422 with insufficient credits message)
+        error_msg = body.get("error") or ""
+        if r.status_code == 422 and "insufficient credits" in error_msg.lower():
+            logger.warning("[Apollo] Credit exhausted: %s", error_msg)
+            return {"_credit_exhausted": True, "source": "apollo_credit_exhausted"}
     except Exception as e:
         logger.warning("[Apollo] %s", e)
     return None
@@ -3990,7 +4014,7 @@ async def enrich_company_waterfall(company_name: str, domain: str, profile: dict
                 if v and not result.get(k):
                     result[k] = v
             log.append({
-                "step": 4, "source": "LLM Qwen2.5-72B",
+                "step": 4, "source": f"LLM {_hf_model().split('/')[-1]}",
                 "fields_found": list(llm_result.keys()),
                 "note": f"lead_score={meta.get('lead_score',0)} temp={meta.get('lead_temperature','')}",
             })
@@ -5766,6 +5790,67 @@ def _resolve_tier(tier_raw: str) -> str:
     return "cold"
 
 
+def _patch_crm_brief_images(crm_brief: Optional[dict], avatar_url: str, company_logo: str) -> Optional[dict]:
+    """Inject profile_image + company_logo into crm_brief.who_they_are before saving to DB.
+    LLM never has real image URLs — must be patched from BD profile data.
+    """
+    if not crm_brief or not isinstance(crm_brief, dict):
+        return crm_brief
+    who = crm_brief.get("who_they_are")
+    if isinstance(who, dict):
+        if not who.get("profile_image") and avatar_url:
+            who["profile_image"] = avatar_url
+        if not who.get("company_logo") and company_logo:
+            who["company_logo"] = company_logo
+    return crm_brief
+
+
+_SCORE_LABEL_MAP = {
+    "very high": 90, "high": 75, "medium high": 65,
+    "medium": 50,    "low medium": 35,
+    "low": 20,       "very low": 10,
+}
+
+def _patch_crm_brief_scores(crm_brief: Optional[dict],
+                             icp_fit_score: int = 0,
+                             intent_score: int = 0,
+                             timing_score: int = 0) -> Optional[dict]:
+    """Normalize crm_scores to integers before saving to DB.
+    LLM sometimes returns 'High', 'Very High' etc. instead of 0-100 integers.
+    Falls back to DB-calculated scores when LLM returned 0.
+    """
+    if not crm_brief or not isinstance(crm_brief, dict):
+        return crm_brief
+
+    scores = crm_brief.get("crm_scores")
+    if not isinstance(scores, dict):
+        return crm_brief
+
+    def _to_int(v) -> int:
+        if isinstance(v, int):
+            return v
+        s = str(v).lower().replace("%", "").strip()
+        if s in _SCORE_LABEL_MAP:
+            return _SCORE_LABEL_MAP[s]
+        try:
+            return int(float(s))
+        except Exception:
+            return 0
+
+    for field in ("icp_fit", "engagement_score", "timing_score"):
+        scores[field] = _to_int(scores.get(field))
+
+    # Fallback to DB scoring when LLM returned 0
+    if not scores.get("icp_fit"):
+        scores["icp_fit"] = icp_fit_score
+    if not scores.get("engagement_score"):
+        scores["engagement_score"] = intent_score
+    if not scores.get("timing_score"):
+        scores["timing_score"] = timing_score
+
+    return crm_brief
+
+
 def _is_company_url(url: str) -> bool:
     return "linkedin.com/company/" in url.lower()
 
@@ -6217,7 +6302,7 @@ async def enrich_single(
             return {}, "", 0
         try:
             import company_service as _cs
-            import workspace_service as _ws_svc
+            from workspace import workspace_service as _ws_svc
             _ws_cfg = await _ws_svc.get_workspace_config(org_id)
             _known = {
                 "name":              company or company_extras.get("company_name") or "",
@@ -6383,7 +6468,7 @@ async def enrich_single(
     # ── P3: AI Analysis Layer (tags, behavioural signals, pitch intelligence) ─
     try:
         from ai_analysis import run_ai_analysis, _rule_based_analysis
-        import workspace_service as _ws
+        from workspace import workspace_service as _ws
         _ws_config = await _ws.get_workspace_config(org_id)
         _ai = await run_ai_analysis(profile, _ws_config)
     except Exception as _ai_err:
@@ -7431,70 +7516,30 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             except Exception:
                 pass
 
-        # True parallel: company waterfall + contact email lookup run together.
-        # Controlled by _enrichment_semaphore (max 10 concurrent external API calls).
-        # LLM calls further limited by _llm_semaphore (max 5) inside _call_llm.
-        async with _enrichment_semaphore:
-            (company_extras, company_wf_log), contact = await asyncio.gather(
-                enrich_company_waterfall(company, domain, profile),
-                find_contact_info(first, last, domain, linkedin_url=url),
-                return_exceptions=True,
-            )
-        if isinstance(company_extras, Exception):
-            company_extras, company_wf_log = {}, []
-        if isinstance(contact, Exception):
-            contact = {}
+        # Company waterfall + contact lookup both removed from bulk path.
+        # Company enrichment → POST /api/leads/view/company
+        # Email enrichment  → POST /api/leads/view/email
+        company_extras = {}
+        company_wf_log = []
+        contact = {}
 
-        verified_domain = company_extras.pop("_verified_domain", domain) or domain
-        real_website = company_extras.get("company_website") or (f"https://{verified_domain}" if verified_domain else "")
-        profile["_company_extras"] = company_extras
+        verified_domain = domain
+        # real_website not used in bulk — website scrape is done via /view/company only
+        profile["_company_extras"] = {}
 
-        # Skip website scrape if BD already gave us full company data — saves 3–8s
-        _bd_has_company_data = bool(
-            company_extras.get("company_description") and
-            company_extras.get("company_website")
-        )
-
-        # ── Stage 2: ENRICHING — run website scrape + LLM in parallel ─────────
+        # ── Stage 2: ENRICHING — LLM only (website scrape removed from bulk path) ──
+        # Website scrape (11 concurrent fetches + LLM ~30-60s) is NOT called here.
+        # Use POST /view/company to fetch company/website intelligence on demand.
         async with get_pool().acquire() as _conn:
             await _conn.execute(
                 "UPDATE enriched_leads SET status='enriching', updated_at=NOW() WHERE id=$1",
                 lead_id,
             )
-        _plog(job_id, url, "ENRICHING", f"email={contact.get('email') if isinstance(contact, dict) else '?'!r}  skip_web_scrape={_bd_has_company_data}")
+        _plog(job_id, url, "ENRICHING", f"email={contact.get('email') if isinstance(contact, dict) else '?'!r}")
         logger.info("[Pipeline] %s → enriching", url)
 
-        # Website scrape and LLM run concurrently — whichever finishes first doesn't block the other
-        if _bd_has_company_data:
-            _pipeline_log.info("[SPEED] Skipping website scrape — BD already has full company data")
-            enrichment = await build_comprehensive_enrichment(url, profile, contact, website_intel={}, org_id=org_id)
-            website_intel = {}
-        else:
-            (website_intel, enrichment) = await asyncio.gather(
-                scrape_website_intelligence(real_website),
-                build_comprehensive_enrichment(url, profile, contact, website_intel={}, org_id=org_id),
-                return_exceptions=True,
-            )
-            if isinstance(website_intel, Exception):
-                website_intel = {}
-            if isinstance(enrichment, Exception):
-                raise enrichment
-            # Merge website intel into enrichment post-hoc if it added value
-            if website_intel and isinstance(website_intel, dict):
-                wi_fields = ("company_description", "value_proposition", "product_category",
-                             "product_offerings", "target_customers", "pricing_signals", "business_model")
-                wi_sub = enrichment.get("website_intelligence") or {}
-                for f in wi_fields:
-                    if website_intel.get(f) and not wi_sub.get(f):
-                        wi_sub[f] = website_intel[f]
-                enrichment["website_intelligence"] = wi_sub
-
-        if website_intel and isinstance(website_intel, dict) and website_intel.get("pages_scraped"):
-            company_wf_log.append({
-                "step": 5, "source": "Website Scrape",
-                "fields_found": website_intel.get("pages_scraped", []),
-                "note": f"pages={len(website_intel.get('pages_scraped', []))}, category={website_intel.get('product_category', '?')}",
-            })
+        website_intel = {}  # populated via /view/company — not in bulk path
+        enrichment = await build_comprehensive_enrichment(url, profile, contact, website_intel={}, org_id=org_id)
 
         scoring = enrichment.get("lead_scoring", enrichment.get("scoring", {}))
         tier_raw = scoring.get("icp_match_tier") or scoring.get("score_tier", "")
@@ -7531,9 +7576,10 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             "linkedin_url": url,
             "name": pp.get("full_name") or ident.get("full_name") or name,
             "first_name": first, "last_name": last,
-            "work_email": pp.get("work_email") or ident.get("work_email") or contact.get("email"),
-            "personal_email": pp.get("personal_email") or ident.get("personal_email"),
-            "direct_phone": pp.get("direct_phone") or ident.get("direct_phone") or contact.get("phone"),
+            # Email fields intentionally empty — populated via POST /api/leads/view/email
+            "work_email": None,
+            "personal_email": None,
+            "direct_phone": pp.get("direct_phone") or ident.get("direct_phone"),
             "twitter": pp.get("twitter") or ident.get("twitter") or contact.get("twitter"),
             "city": pp.get("city") or ident.get("city"),
             "country": pp.get("country") or ident.get("country"),
@@ -7607,7 +7653,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             "last_contacted": outreach.get("last_contacted"),
             "email_status": outreach.get("email_status"),
             "lead_source": crm.get("lead_source", "LinkedIn URL"),
-            "enrichment_source": crm.get("enrichment_source"),
+            "enrichment_source": "Bright Data",
             "data_completeness": _safe_int(crm.get("data_completeness")),
             "crm_stage": crm.get("crm_stage"),
             "tags": _safe_json(crm.get("tags")),
@@ -7642,12 +7688,27 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             "about": (profile.get("about") or "")[:1000],
             "followers": _safe_int(profile.get("followers")),
             "connections": _safe_int(profile.get("connections")),
-            "email_source": contact.get("source") if isinstance(contact, dict) else None,
-            "email_confidence": contact.get("confidence") if isinstance(contact, dict) else None,
-            # Full Apollo API response (person + org) — reused for company LLM enrichment
-            "apollo_raw": json.dumps(contact.get("_apollo_raw"), default=str) if isinstance(contact, dict) and contact.get("_apollo_raw") else None,
+            # Email source fields empty — set when /view/email is called
+            "email_source": None,
+            "email_confidence": None,
+            "apollo_raw": None,
             # ── Stage 3: COMPLETED — LLM done, full data saved ───────────────
-            "crm_brief": json.dumps(enrichment.get("crm_brief"), default=str) if enrichment.get("crm_brief") is not None else None,
+            # Patch crm_brief before saving:
+            #   1. profile_image + company_logo — LLM never has real image URLs
+            #   2. crm_scores — LLM returns "High"/"Very High", normalize to integers
+            "crm_brief": json.dumps(
+                _patch_crm_brief_scores(
+                    _patch_crm_brief_images(
+                        enrichment.get("crm_brief"),
+                        avatar_url=_extract_avatar(profile) or contact.get("avatar_url") or "",
+                        company_logo=cp.get("company_logo") or company_extras.get("company_logo") or "",
+                    ),
+                    icp_fit_score=_safe_int(ls.get("icp_fit_score")),
+                    intent_score=_safe_int(ls.get("intent_score")),
+                    timing_score=_safe_int(ls.get("timing_score")),
+                ),
+                default=str,
+            ) if enrichment.get("crm_brief") is not None else None,
             "status": "completed",
             "job_id": job_id,
             "organization_id": org_id,

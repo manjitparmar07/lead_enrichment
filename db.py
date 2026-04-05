@@ -34,10 +34,16 @@ _pool: asyncpg.Pool | None = None
 
 async def init_pool() -> None:
     global _pool
+    db_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or os.getenv("PG_URL")
+    if not db_url:
+        raise RuntimeError(
+            "DATABASE_URL environment variable is not set. "
+            "Set it in Railway → your service → Variables."
+        )
     _pool = await asyncpg.create_pool(
-        os.environ["DATABASE_URL"],
-        min_size=20,
-        max_size=200,
+        db_url,
+        min_size=2,
+        max_size=20,
         command_timeout=300,  # 5 min — needed for bulk COPY to remote DB
     )
 

@@ -21,7 +21,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-import system_prompt_service as sps
+from Lead_enrichment.outreach_lead_enrichment import system_prompt_service as sps
 
 logger = logging.getLogger(__name__)
 

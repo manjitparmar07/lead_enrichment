@@ -17,8 +17,8 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-from auth_routes import get_current_user
-import company_service as cs
+from auth.auth_routes import get_current_user
+from Lead_enrichment.company_lead_enrichment import company_service as cs
 from db import get_pool
 
 logger = logging.getLogger(__name__)

@@ -18,39 +18,47 @@ if _env_path.exists():
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from auth_routes import router as auth_router
-from lead_enrichment_brightdata_routes import (
+from auth.auth_routes import router as auth_router
+from auth.keys_routes import router as keys_router
+from realtime.ably_routes import router as ably_router
+from workspace.workspace_routes import router as workspace_router
+from config.enrichment_config_routes import router as enrichment_config_router
+from analytics.analytics_routes import router as analytics_router
+from lead_import.import_routes import router as import_router
+from storage.storage_routes import router as storage_router
+from security import SecurityMiddleware
+from search.serpapi_routes import router as serpapi_router
+from search.serpapi_service import init_serpapi_db
+from custom_features.custom_features_routes import router as custom_features_router
+from custom_features.custom_features_service import init_custom_features_db
+
+# ── Lead Enrichment modules ───────────────────────────────────────────────────
+from Lead_enrichment.bulk_lead_enrichment.lead_enrichment_brightdata_routes import (
     router as lead_enrichment_router,
     _linkedin_enrich_router,
     _email_enrich_router,
     _outreach_enrich_router,
     _company_enrich_router,
 )
-from keys_routes import router as keys_router
-from ably_routes import router as ably_router
-from workspace_routes import router as workspace_router
-from enrichment_config_routes import router as enrichment_config_router
-from company_routes import router as company_router
-from ai_enrichment_routes import router as ai_enrichment_router
-from analytics_routes import router as analytics_router
-from import_routes import router as import_router
-from storage_routes import router as storage_router
-from system_prompt_routes import router as system_prompt_router
-from system_prompt_generator_routes import router as spg_router
-from email_enrichment_routes import router as email_enrichment_router
-from security import SecurityMiddleware
-import keys_service
-import lead_enrichment_worker as worker
-import import_worker as _import_worker
-import queue_manager as _queue_manager
+from Lead_enrichment.bulk_lead_enrichment.lead_enrichment_brightdata_service import init_leads_db
+from Lead_enrichment.bulk_lead_enrichment import lead_enrichment_worker as worker
+from Lead_enrichment.bulk_lead_enrichment import queue_manager as _queue_manager
+
+from Lead_enrichment.email_lead_enrichment.email_enrichment_routes import router as email_enrichment_router
+
+from Lead_enrichment.outreach_lead_enrichment.system_prompt_routes import router as system_prompt_router
+from Lead_enrichment.outreach_lead_enrichment.system_prompt_generator_routes import router as spg_router
+from Lead_enrichment.outreach_lead_enrichment.system_prompt_service import init_system_prompts_db
+from Lead_enrichment.outreach_lead_enrichment.ai_enrichment_routes import router as ai_enrichment_router
+
+from Lead_enrichment.company_lead_enrichment.company_routes import router as company_router
+from Lead_enrichment.company_lead_enrichment.company_service import init_company_db
+
+from auth import keys_service
+from lead_import import import_worker as _import_worker
 import db as _db
-from lead_enrichment_brightdata_service import init_leads_db
-from workspace_service import init_workspace_db
-from enrichment_config_service import init_config_db
-from company_service import init_company_db
-from system_prompt_service import init_system_prompts_db
-from serpapi_routes import router as serpapi_router
-from serpapi_service import init_serpapi_db
+from workspace.workspace_service import init_workspace_db
+from config.enrichment_config_service import init_config_db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -106,6 +114,7 @@ app.include_router(import_router)
 app.include_router(storage_router)
 app.include_router(email_enrichment_router,   prefix="/api")
 app.include_router(serpapi_router,            prefix="/api")
+app.include_router(custom_features_router,    prefix="/api")
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 # Production requests go through nginx which owns CORS headers.
@@ -140,6 +149,7 @@ async def startup():
     await init_company_db()
     await init_system_prompts_db()
     await init_serpapi_db()
+    await init_custom_features_db()
     await worker.start_workers()
     await _import_worker.start_import_workers()
     await _queue_manager.start_ai_workers()

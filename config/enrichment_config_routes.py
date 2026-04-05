@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-import enrichment_config_service as cfg
+from config import enrichment_config_service as cfg
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/config", tags=["Enrichment Config"])

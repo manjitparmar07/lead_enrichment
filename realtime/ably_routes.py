@@ -22,7 +22,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-import ably_service
+from realtime import ably_service
 
 logger  = logging.getLogger(__name__)
 router  = APIRouter(prefix="/ably", tags=["Ably"])

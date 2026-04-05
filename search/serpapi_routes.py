@@ -5,7 +5,7 @@ import logging
 from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-import serpapi_service as svc
+from search import serpapi_service as svc
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/linkedin-finder", tags=["LinkedIn Finder"])

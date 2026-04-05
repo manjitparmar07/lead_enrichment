@@ -20,7 +20,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-import keys_service
+from auth import keys_service
 
 logger = logging.getLogger(__name__)
 

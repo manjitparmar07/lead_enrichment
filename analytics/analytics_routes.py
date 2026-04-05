@@ -21,7 +21,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Query, Request
 
-import analytics_service as svc
+from analytics import analytics_service as svc
 
 logger = logging.getLogger(__name__)
 

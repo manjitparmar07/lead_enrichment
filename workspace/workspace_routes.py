@@ -16,7 +16,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-import workspace_service as ws
+from workspace import workspace_service as ws
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/workspace", tags=["Workspace Config"])

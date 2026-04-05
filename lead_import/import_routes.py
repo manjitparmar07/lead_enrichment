@@ -16,7 +16,7 @@ import logging
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from import_service import (
+from lead_import.import_service import (
     IMPORTABLE_FIELDS,
     get_folder_status,
     get_import_history,

@@ -97,8 +97,8 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, HttpUrl, field_validator
 
-import lead_enrichment_brightdata_service as svc
-import enrichment_config_service as cfg_svc
+from Lead_enrichment.bulk_lead_enrichment import lead_enrichment_brightdata_service as svc
+from config import enrichment_config_service as cfg_svc
 
 logger = logging.getLogger(__name__)
 
@@ -1313,11 +1313,15 @@ async def list_leads(
     job_id: Optional[str] = Query(None),
     min_score: Optional[int] = Query(None, ge=0, le=100),
     tier: Optional[str] = Query(None, pattern="^(hot|warm|cool|cold)$"),
+    sort_by: Optional[str] = Query(None),
+    sort_dir: Optional[str] = Query(None),
+    q: Optional[str] = Query(None),
 ):
     """List all enriched leads."""
     result = await svc.list_leads(
         limit=limit, offset=offset,
         job_id=job_id, min_score=min_score, tier=tier,
+        sort_by=sort_by, sort_dir=sort_dir, q=q,
     )
     result["leads"] = [_format_lead(l) for l in result["leads"]]
     return result
@@ -2050,28 +2054,22 @@ _email_enrich_router = APIRouter(
 )
 
 _EMAIL_DESC = """
-Returns the email enrichment result fetched via the Apollo → Hunter waterfall.
-If no email is stored, a live Apollo → Hunter lookup runs automatically.
+Returns email enrichment via Apollo only, using BD raw data for lookup parameters.
 
 **How to call:**
 ```
 POST /api/leads/view/email
 Content-Type: application/json
 
-{ "leadenrich_id": "abc123def456", "system_prompt": "..." }
+{ "leadenrich_id": "abc123def456" }
 ```
-`system_prompt` is optional — omit it to get stored data only.
-When provided, an AI-generated personalised email template is returned in `ai_generated.email_template`.
 
-**Fields returned:**
-- **work_email** — Best verified work email
-- **source** — Provider that found the email (apollo / hunter / pattern / activity)
-- **confidence** — Confidence score 0–100
-- **verified** — Whether the email passed verification
-- **bounce_risk** — low / medium / high
-- **all_emails** — All emails discovered across providers
-- **activity_emails** — Emails extracted from LinkedIn posts/activity
-- **ai_generated** — Present only when `system_prompt` is supplied
+**Flow:**
+1. Fetch lead + BD raw data from DB using leadenrich_id
+2. Extract first_name, last_name, domain from BD raw data
+3. Call Apollo person match API
+4. Save apollo_raw to DB
+5. Return email result
 """
 
 
@@ -2081,105 +2079,189 @@ When provided, an AI-generated personalised email template is returned in `ai_ge
     description=_EMAIL_DESC,
 )
 async def email_enrichment(body: ViewEmailRequest):
+    from db import get_pool as _get_pool
+
     lead = await _resolve_lead(body.leadenrich_id)
-    full = _get_full_data(lead)
-    person_profile = full.get("person_profile") or {}
 
-    # If no email stored yet AND lookup not already attempted — run Apollo → Hunter live lookup
-    _already_attempted = lead.get("email_source") in ("not_found", "lookup_attempted")
-    if not lead.get("work_email") and not lead.get("email") and not _already_attempted:
-        first, last = svc._parse_name(lead.get("name") or "")
-        domain = ""
-        website = lead.get("company_website") or ""
-        if website:
-            try:
-                from urllib.parse import urlparse as _urlparse
-                netloc = _urlparse(website if website.startswith("http") else f"https://{website}").netloc
-                domain = netloc.replace("www.", "").split(":")[0].lower()
-            except Exception:
-                pass
-
-        if first and domain:
-            from db import get_pool as _get_pool
-            try:
-                contact = await svc.find_contact_info(
-                    first=first, last=last, domain=domain,
-                    linkedin_url=lead.get("linkedin_url") or "",
-                )
-                if contact.get("email"):
-                    # Persist found email back to DB
-                    async with _get_pool().acquire() as _conn:
-                        await _conn.execute(
-                            """UPDATE enriched_leads SET work_email=$1, email_source=$2,
-                               email_confidence=$3, bounce_risk=$4, enrichment_source=$5
-                               WHERE id=$6""",
-                            contact["email"],
-                            contact.get("source"),
-                            str(contact.get("confidence", "")) or None,
-                            contact.get("bounce_risk"),
-                            contact.get("source"),
-                            lead["id"],
-                        )
-                    lead["work_email"]        = contact["email"]
-                    lead["email_source"]      = contact.get("source")
-                    lead["email_confidence"]  = contact.get("confidence")
-                    lead["email_verified"]    = contact.get("verified", False)
-                    lead["bounce_risk"]       = contact.get("bounce_risk")
-                    lead["enrichment_source"] = contact.get("source")
-                    lead["phone"]             = lead.get("phone") or contact.get("phone")
-                else:
-                    # No email found — mark so we don't retry Apollo/Hunter on every request
-                    async with _get_pool().acquire() as _conn:
-                        await _conn.execute(
-                            "UPDATE enriched_leads SET email_source='not_found' WHERE id=$1",
-                            lead["id"],
-                        )
-                    lead["email_source"] = "not_found"
-                await _lead_cache_set(lead["id"], lead)  # refresh cache with latest state
-            except Exception as _e:
-                logger.warning("[EmailView] Live lookup failed for %s: %s", body.leadenrich_id, _e)
-
-    # AI-generated email template if system_prompt provided
-    ai_email = None
-    if body.system_prompt and lead.get("name"):
+    # ── Parse BD raw data ────────────────────────────────────────────────────
+    raw_bd = lead.get("raw_brightdata") or {}
+    if isinstance(raw_bd, str):
         try:
-            lead_summary = (
-                f"Lead: {lead.get('name')} | Title: {lead.get('title','')} | "
-                f"Company: {lead.get('company','')} | Email: {lead.get('work_email') or lead.get('email','N/A')} | "
-                f"Location: {lead.get('location','')} | Industry: {lead.get('industry','')}"
+            raw_bd = json.loads(raw_bd)
+        except Exception:
+            raw_bd = {}
+
+    # Extract name from BD raw data first, fallback to lead row
+    first = (raw_bd.get("first_name") or "").strip()
+    last  = (raw_bd.get("last_name") or "").strip()
+    if not first:
+        first, last = svc._parse_name(raw_bd.get("name") or lead.get("name") or "")
+
+    # Clean last_name for Apollo:
+    #   1. Strip trailing initials like "N." or "A." (e.g. "Djernæs N." → "Djernæs")
+    #   2. Normalize special chars (æ→ae, ø→o, ü→ue etc.) for better match rate
+    import re as _re, unicodedata as _ud
+    last = _re.sub(r'\s+[A-Z]\.$', '', last).strip()
+    first = _re.sub(r'\s+[A-Z]\.$', '', first).strip()
+    def _normalize_name(s: str) -> str:
+        _char_map = {'æ':'ae','ø':'o','å':'aa','ö':'oe','ü':'ue','ä':'ae',
+                     'é':'e','è':'e','ê':'e','ë':'e','ñ':'n','ç':'c',
+                     'í':'i','ì':'i','î':'i','ï':'i','ó':'o','ò':'o','ô':'o',
+                     'ú':'u','ù':'u','û':'u','ý':'y','ß':'ss'}
+        return ''.join(_char_map.get(c.lower(), c) for c in s)
+    first_apollo = _normalize_name(first)
+    last_apollo  = _normalize_name(last)
+
+    # Extract domain — try company_website first, then raw_brightdata fields
+    domain = ""
+    _co_website = lead.get("company_website") or ""
+    if _co_website:
+        try:
+            from urllib.parse import urlparse as _urlparse
+            netloc = _urlparse(_co_website if _co_website.startswith("http") else f"https://{_co_website}").netloc
+            domain = netloc.replace("www.", "").split(":")[0].lower()
+        except Exception:
+            pass
+
+    linkedin_url = lead.get("linkedin_url") or raw_bd.get("url") or ""
+
+    # ── Already has email — return immediately ───────────────────────────────
+    if lead.get("work_email"):
+        apollo_raw_stored = lead.get("apollo_raw")
+        apollo_raw = {}
+        if apollo_raw_stored:
+            try:
+                apollo_raw = json.loads(apollo_raw_stored) if isinstance(apollo_raw_stored, str) else apollo_raw_stored
+            except Exception:
+                apollo_raw = {}
+        return {
+            "lead_id":           lead.get("id"),
+            "linkedin_url":      linkedin_url,
+            "name":              lead.get("name"),
+            "company":           lead.get("company"),
+            "work_email":        lead.get("work_email"),
+            "email":             lead.get("work_email"),
+            "source":            lead.get("email_source"),
+            "message":           f"Email already found: {lead.get('work_email')}" + (f" | Phone: {lead.get('direct_phone')}" if lead.get("direct_phone") else ""),
+            "confidence":        lead.get("email_confidence"),
+            "verified":          bool(lead.get("email_verified")),
+            "bounce_risk":       lead.get("bounce_risk"),
+            "enrichment_source": lead.get("enrichment_source"),
+            "phone":             lead.get("direct_phone") or lead.get("phone"),
+            "all_emails":        [lead.get("work_email")],
+            "activity_emails":   [],
+            "activity_phones":   [],
+            "ai_generated":      None,
+        }
+
+    # ── Apollo lookup — domain OR linkedin_url required ──────────────────────
+    if not first_apollo or (not domain and not linkedin_url):
+        logger.warning("[EmailView] Cannot call Apollo — missing first=%r domain=%r linkedin=%r for lead %s",
+                       first, domain, linkedin_url, lead.get("id"))
+        return {
+            "lead_id":    lead.get("id"),
+            "linkedin_url": linkedin_url,
+            "name":       lead.get("name"),
+            "company":    lead.get("company"),
+            "work_email": None, "email": None,
+            "source": "missing_params",
+            "message": "Cannot search email — missing required data (first name and company domain or LinkedIn URL not available for this lead).",
+            "confidence": None,
+            "verified": False, "bounce_risk": None,
+            "enrichment_source": None, "phone": None,
+            "all_emails": [], "activity_emails": [], "activity_phones": [],
+            "ai_generated": None,
+        }
+
+    try:
+        apollo_result = await svc._try_apollo(first_apollo, last_apollo, domain, linkedin_url=linkedin_url)
+    except Exception as _e:
+        logger.warning("[EmailView] Apollo call failed for %s: %s", lead.get("id"), _e)
+        apollo_result = None
+
+    # Credit exhausted — return immediately with clear message, do NOT mark as not_found
+    if apollo_result and apollo_result.get("_credit_exhausted"):
+        return {
+            "lead_id":           lead.get("id"),
+            "linkedin_url":      linkedin_url,
+            "name":              lead.get("name"),
+            "company":           lead.get("company"),
+            "work_email":        None,
+            "email":             None,
+            "source":            "not_found",
+            "message":           "Apollo credit balance exhausted — email could not be fetched. Please recharge your Apollo plan to continue email enrichment.",
+            "confidence":        None,
+            "verified":          False,
+            "bounce_risk":       None,
+            "enrichment_source": None,
+            "phone":             None,
+            "all_emails":        [],
+            "activity_emails":   [],
+            "activity_phones":   [],
+            "ai_generated":      None,
+        }
+
+    work_email  = None
+    phone       = None
+    source      = "apollo"
+    confidence  = None
+    apollo_raw  = {}
+
+    if apollo_result and apollo_result.get("email"):
+        work_email = apollo_result["email"]
+        phone      = apollo_result.get("phone")
+        confidence = apollo_result.get("confidence")
+        apollo_raw = apollo_result.get("_apollo_raw") or {}
+
+        # Save email + apollo_raw to DB
+        async with _get_pool().acquire() as _conn:
+            await _conn.execute(
+                """UPDATE enriched_leads
+                   SET work_email=$1, email_source=$2, email_confidence=$3,
+                       enrichment_source=$4, direct_phone=COALESCE(direct_phone, $5),
+                       apollo_raw=$6, updated_at=NOW()
+                   WHERE id=$7""",
+                work_email,
+                source,
+                str(confidence) if confidence else None,
+                "apollo",
+                phone,
+                json.dumps(apollo_raw, default=str) if apollo_raw else None,
+                lead["id"],
             )
-            ai_email = await _quick_llm(
-                body.system_prompt,
-                f"Write a personalised outreach email for this lead.\n\n{lead_summary}\n\n"
-                "Return JSON: {{\"subject\": \"...\", \"body\": \"...\"}}",
-                max_tokens=1500,
+        logger.info("[EmailView] Apollo found email=%s for lead %s", work_email, lead.get("id"))
+    else:
+        # No email found — mark to avoid retrying on every request
+        async with _get_pool().acquire() as _conn:
+            await _conn.execute(
+                "UPDATE enriched_leads SET email_source='not_found', updated_at=NOW() WHERE id=$1",
+                lead["id"],
             )
-        except Exception as _e:
-            logger.warning("[EmailView] AI generation failed: %s", _e)
+        logger.info("[EmailView] Apollo found no email for lead %s", lead.get("id"))
+
+    if work_email:
+        _message = f"Email found: {work_email}" + (f" | Phone: {phone}" if phone else "")
+    else:
+        _message = f"No email found for {lead.get('name', 'this lead')} at {lead.get('company', 'their company')} via Apollo."
 
     return {
-        "lead_id":    lead.get("id"),
-        "linkedin_url": lead.get("linkedin_url"),
-        "name":       lead.get("name"),
-        "company":    lead.get("company"),
-
-        "work_email":        lead.get("work_email") or None,
-        "email":             lead.get("email") or lead.get("work_email") or None,
-        "source":            lead.get("email_source"),
-        "confidence":        lead.get("email_confidence"),
-        "verified":          bool(lead.get("email_verified")),
-        "bounce_risk":       lead.get("bounce_risk"),
-        "enrichment_source": lead.get("enrichment_source"),
-
-        "phone":             lead.get("phone"),
-
-        "all_emails": person_profile.get("emails") or (
-            [lead.get("work_email")] if lead.get("work_email") else []
-        ),
-        "activity_emails": full.get("activity_emails", []),
-        "activity_phones": full.get("activity_phones", []),
-
-        "ai_generated": {"email_template": ai_email} if ai_email else None,
+        "lead_id":           lead.get("id"),
+        "linkedin_url":      linkedin_url,
+        "name":              lead.get("name"),
+        "company":           lead.get("company"),
+        "work_email":        work_email,
+        "email":             work_email,
+        "source":            source if work_email else "not_found",
+        "message":           _message,
+        "confidence":        confidence,
+        "verified":          False,
+        "bounce_risk":       None,
+        "enrichment_source": "apollo" if work_email else None,
+        "phone":             phone,
+        "all_emails":        [work_email] if work_email else [],
+        "activity_emails":   [],
+        "activity_phones":   [],
+        "ai_generated":      None,
     }
 
 
@@ -2529,7 +2611,7 @@ async def _do_company_enrichment(
     company_linkedin: str, lead: Optional[dict], org_id: str
 ) -> dict:
     """Full enrichment pipeline: BrightData scrape → Apollo → LLM → DB save. Returns result dict."""
-    import company_service as cs
+    from Lead_enrichment.company_lead_enrichment import company_service as cs
     from datetime import datetime, timezone
 
     # Step 1: BrightData scrape
@@ -2600,7 +2682,7 @@ async def _do_company_enrichment(
     description=_COMPANY_DESC,
 )
 async def company_enrichment(body: ViewCompanyRequest):
-    import company_service as cs
+    from Lead_enrichment.company_lead_enrichment import company_service as cs
 
     if not body.leadenrich_id and not body.company_linkedin_url:
         raise HTTPException(
