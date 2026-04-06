@@ -2639,8 +2639,7 @@ async def _do_company_enrichment(
     # Step 3: LLM enrichment
     crm_brief: Optional[dict] = None
     try:
-        from lead_enrichment_brightdata_service import _enrich_company_with_llm
-        crm_brief = await _enrich_company_with_llm(
+        crm_brief = await svc._enrich_company_with_llm(
             bd_data, apollo_raw,
             bd_data.get("name") or (lead.get("company") if lead else "") or ""
         )
