@@ -1,0 +1,3572 @@
+"""
+lead_enrichment_brightdata_routes.py
+--------------------------------------
+FastAPI router for Worksbuddy Lead Enrichment (Bright Data powered).
+
+Endpoints:
+  POST   /api/leads/enrich            — single LinkedIn URL (sync, ~60s)
+  POST   /api/leads/enrich/bulk       — bulk URLs (async, returns job_id)
+  GET    /api/leads/jobs              — list all jobs
+  GET    /api/leads/jobs/{job_id}     — job status + progress
+  POST   /api/leads/jobs/{job_id}/stop  — cancel a running job + BrightData snapshot
+  POST   /api/leads/jobs/{job_id}/rerun — rerun a failed/cancelled job via BrightData
+  POST   /api/leads/webhook/brightdata — Bright Data batch results webhook
+  POST   /api/leads/webhook/notify    — Bright Data snapshot-ready notification
+  GET    /api/leads                   — list enriched leads (filterable)
+  GET    /api/leads/{lead_id}         — single lead detail
+  POST   /api/leads/{lead_id}/outreach — regenerate outreach copy
+  DELETE /api/leads/{lead_id}         — delete lead
+  GET    /api/leads/export/csv        — export leads as CSV
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import csv
+import io
+import json
+import logging
+import os
+from typing import Any, Dict, Optional
+
+import jwt
+
+# ── Lead row Redis cache — TTL read from workspace_configs (default 1800s) ───
+_LEAD_CACHE_TTL = 1800  # module-level default; overridden per-org via get_scoring_config()
+
+
+async def _lead_cache_ttl(org_id: str) -> int:
+    try:
+        sc = await cfg_svc.get_scoring_config(org_id)
+        return int(sc.get("lead_cache_ttl", 1800))
+    except Exception:
+        return _LEAD_CACHE_TTL
+_lead_redis: Any = None
+_lead_redis_fail_until: float = 0.0  # epoch seconds — don't retry before this time
+
+
+async def _get_lead_redis() -> Any:
+    global _lead_redis, _lead_redis_fail_until
+    if _lead_redis is not None:
+        return _lead_redis
+    import time
+    if time.monotonic() < _lead_redis_fail_until:
+        return None  # in backoff window — skip reconnect attempt
+    try:
+        import redis.asyncio as aioredis
+        client = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True, socket_connect_timeout=2)
+        await client.ping()
+        _lead_redis = client
+    except Exception:
+        _lead_redis = None
+        _lead_redis_fail_until = time.monotonic() + 30  # don't retry for 30s
+    return _lead_redis
+
+
+async def _lead_cache_get(lead_id: str) -> Optional[dict]:
+    r = await _get_lead_redis()
+    if not r:
+        return None
+    try:
+        raw = await r.get(f"lead:row:{lead_id}")
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+async def _lead_cache_set(lead_id: str, lead: dict) -> None:
+    r = await _get_lead_redis()
+    if not r:
+        return
+    try:
+        await r.setex(f"lead:row:{lead_id}", _LEAD_CACHE_TTL, json.dumps(lead, default=str))
+    except Exception:
+        pass
+
+
+async def _lead_cache_delete(lead_id: str) -> None:
+    r = await _get_lead_redis()
+    if not r:
+        return
+    try:
+        await r.delete(f"lead:row:{lead_id}")
+    except Exception:
+        pass
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, HttpUrl, field_validator
+
+from Lead_enrichment.bulk_lead_enrichment import lead_enrichment_brightdata_service as svc
+from config import enrichment_config_service as cfg_svc
+
+logger = logging.getLogger(__name__)
+
+# ── JWT config (same secret used by auth_routes to issue tokens) ──────────────
+_JWT_SECRET    = os.getenv("JWT_SECRET", "")
+_JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+
+router = APIRouter(prefix="/leads", tags=["Lead Enrichment"])
+
+# Webhook secret — set LEAD_WEBHOOK_SECRET in .env to protect incoming webhooks
+WEBHOOK_SECRET = os.getenv("LEAD_WEBHOOK_SECRET", "")
+
+# ── Webhook backpressure ───────────────────────────────────────────────────────
+MAX_WEBHOOK_INFLIGHT: int = 100   # max concurrent background webhook tasks
+_webhook_inflight: int = 0        # current count of in-flight background tasks
+
+# ── skip_existing LIO send rate cap ────────────────────────────────────────────
+# When bulk submit finds already-enriched leads, it fire-and-forgets send_to_lio
+# for each. Without a cap, 5000 pre-enriched leads = 5000 concurrent HTTP calls.
+_SKIP_LIO_CONCURRENCY = int(os.getenv("SKIP_LIO_CONCURRENCY", "50"))
+_skip_lio_sem: asyncio.Semaphore = asyncio.Semaphore(_SKIP_LIO_CONCURRENCY)
+
+
+def _get_org_id(request: Request) -> str:
+    """
+    Extract organization_id from the JWT in the Authorization header.
+    Decodes without signature verification (trust: upstream SSO already validated it).
+    Falls back to 'default' if no token or decode fails.
+    """
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return "default"
+    token = auth[7:].strip()
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return "default"
+        payload_b64 = parts[1]
+        # Re-add padding
+        payload_b64 += "=" * (4 - len(payload_b64) % 4)
+        payload = json.loads(base64.b64decode(payload_b64))
+        return str(payload.get("organization_id", "default"))
+    except Exception:
+        return "default"
+
+
+# ── LIO shared helpers ───────────────────────────────────────────────────────
+
+import re as _lio_re
+
+def _lio_fill(template: str, ctx: dict) -> str:
+    """Replace {var} placeholders using regex — safe against literal JSON braces."""
+    def _sub(m):
+        key = m.group(1)
+        val = ctx.get(key)
+        return str(val) if val is not None else m.group(0)
+    return _lio_re.sub(r'\{([a-zA-Z_][a-zA-Z0-9_]*)\}', _sub, template)
+
+def _lio_strip_md(text: str) -> str:
+    """Strip markdown code fences that some LLMs wrap JSON in."""
+    text = text.strip()
+    text = _lio_re.sub(r'^```(?:json)?\s*', '', text, flags=_lio_re.MULTILINE)
+    text = _lio_re.sub(r'\s*```$', '', text, flags=_lio_re.MULTILINE)
+    return text.strip()
+
+# Stage index → DB result key
+_LIO_RESULT_KEYS = {
+    0: "company_intel", 1: "tags", 2: "signals",
+    3: "buying", 4: "pitch", 5: "outreach", 6: "score"
+}
+
+
+async def _build_lio_ctx(lead: dict, ws_ctx: dict, prev: dict) -> dict:
+    """Build the full template-variable context dict from a lead row + workspace + prev stage results."""
+    import json as _json
+
+    full_data: dict = {}
+    try: full_data = _json.loads(lead.get("full_data") or "{}")
+    except Exception: pass
+    raw_profile: dict = {}
+    try: raw_profile = _json.loads(lead.get("raw_profile") or "{}")
+    except Exception: pass
+
+    activity: list = raw_profile.get("activity", []) or []
+    own_posts: list = raw_profile.get("posts", []) or []
+
+    def _act_str(a) -> str:
+        return (a.get("title") or a.get("attribution") or a.get("action") or a.get("text") or "")[:180]
+
+    name_parts = (lead.get("name") or "").split()
+
+    # Infer title from about bio if missing
+    about_text = (raw_profile.get("about") or raw_profile.get("summary")
+                  or raw_profile.get("headline") or lead.get("about") or "")
+    raw_title = (raw_profile.get("title") or raw_profile.get("headline")
+                 or full_data.get("title") or lead.get("title") or "")
+    if not raw_title and about_text:
+        m = _lio_re.search(
+            r"(?:I(?:'m| am)(?: the)?\s+|^)(CEO|CTO|CFO|COO|CMO|Founder|Co-Founder|"
+            r"Director|VP|Head of \w+|President|Partner|Managing Director|MD)",
+            about_text, _lio_re.IGNORECASE
+        )
+        if m:
+            raw_title = m.group(1)
+
+    # Infer industry from post topics if missing
+    industry = (raw_profile.get("industry") or full_data.get("industry") or lead.get("industry") or "")
+    if not industry:
+        all_post_text = " ".join(_act_str(p) for p in own_posts[:5]).lower()
+        if any(w in all_post_text for w in ("blockchain", "crypto", "web3", "defi", "nft")):
+            industry = "Blockchain / Web3 Technology"
+        elif any(w in all_post_text for w in ("saas", "software", "platform", "app")):
+            industry = "Software / SaaS"
+        elif any(w in all_post_text for w in ("fintech", "finance", "banking", "payment")):
+            industry = "Fintech"
+        elif any(w in all_post_text for w in ("ai", "artificial intelligence", "machine learning", "llm")):
+            industry = "Artificial Intelligence"
+
+    # Build rich company description
+    desc_parts = []
+    for k in ("company_description", "company_about", "company_summary", "company_specialty", "company_overview"):
+        v = full_data.get(k) or raw_profile.get(k)
+        if v: desc_parts.append(str(v)[:400])
+    if about_text:
+        desc_parts.append(f"Founder/Leader bio: {about_text[:400]}")
+    if own_posts:
+        post_lines = "\n".join(f"  • {p.get('title','')[:120]}" for p in own_posts[:4] if p.get("title"))
+        if post_lines:
+            desc_parts.append(f"Published posts:\n{post_lines}")
+    awards = raw_profile.get("honors_and_awards", []) or []
+    if awards:
+        award_lines = "; ".join(f"{a.get('title','')} — {a.get('publication','')}" for a in awards[:3])
+        desc_parts.append(f"Awards: {award_lines}")
+    edu = raw_profile.get("educations_details") or ""
+    if edu:
+        desc_parts.append(f"Education: {str(edu)[:200]}")
+    followers = raw_profile.get("followers") or 0
+    connections = raw_profile.get("connections") or 0
+    if followers or connections:
+        desc_parts.append(f"LinkedIn: {followers} followers, {connections}+ connections")
+
+    company_description = "\n\n".join(desc_parts) or "No description available"
+
+    def _act_line(a) -> str:
+        interaction = a.get("interaction", "")
+        title = _act_str(a)
+        return f"- [{interaction}] {title}" if interaction else f"- {title}"
+
+    recent_posts_str = "\n".join(_act_line(a) for a in (activity + own_posts)[:10]) or "No recent activity"
+    recent_activity_str = "\n".join(_act_line(a) for a in activity[:12]) or "No activity data"
+
+    def _s(raw) -> str:
+        if isinstance(raw, (dict, list)): return _json.dumps(raw)
+        return str(raw or "")
+
+    def _parse(raw):
+        if isinstance(raw, (dict, list)): return raw
+        try: return _json.loads(raw)
+        except Exception: return raw
+
+    ci_obj     = _parse(prev.get("company_intel", "")) if prev.get("company_intel") else {}
+    buying_obj = _parse(prev.get("buying", ""))        if prev.get("buying")        else {}
+    pitch_obj  = _parse(prev.get("pitch", ""))         if prev.get("pitch")         else {}
+
+    # Build compact raw JSON for LLM (actual BrightData fields, truncated)
+    def _act_brief(a) -> dict:
+        return {"action": a.get("interaction", ""), "title": _act_str(a)[:200]}
+
+    raw_brightdata_json = _json.dumps({
+        "name": f"{raw_profile.get('first_name','')} {raw_profile.get('last_name','')}".strip(),
+        "about": about_text[:800] if about_text else None,
+        "title": raw_title or None,
+        "company": raw_profile.get("current_company_name") or raw_profile.get("current_company"),
+        "location": raw_profile.get("city") or raw_profile.get("location"),
+        "country_code": raw_profile.get("country_code"),
+        "followers": raw_profile.get("followers"),
+        "connections": raw_profile.get("connections"),
+        "education": raw_profile.get("educations_details"),
+        "posts": [
+            {
+                "title": p.get("title", ""),
+                "date": (p.get("created_at", "") or "")[:10],
+                "attribution": (p.get("attribution", "") or "")[:200],
+            }
+            for p in own_posts[:5]
+        ],
+        "activity": [_act_brief(a) for a in activity[:15]],
+        "honors_and_awards": [
+            {"title": a.get("title", ""), "publication": a.get("publication", "")}
+            for a in (raw_profile.get("honors_and_awards", []) or [])[:3]
+        ],
+    }, ensure_ascii=False, indent=2)
+
+    return {
+        "raw_brightdata_json": raw_brightdata_json,
+        "first_name":     raw_profile.get("first_name")  or (name_parts[0] if name_parts else ""),
+        "last_name":      raw_profile.get("last_name")   or (" ".join(name_parts[1:]) if len(name_parts) > 1 else ""),
+        "inferred_title": raw_title,
+        "company":        raw_profile.get("current_company_name") or raw_profile.get("current_company") or lead.get("company") or "",
+        "about":          about_text,
+        "industry":       industry,
+        "city":           (raw_profile.get("city") or raw_profile.get("location") or "").split(",")[0].strip(),
+        "country":        raw_profile.get("country") or lead.get("location") or "",
+        "company_description": company_description,
+        "recent_posts":    recent_posts_str,
+        "recent_activity": recent_activity_str,
+        "total_score":       str(lead.get("total_score") or 0),
+        "icp_fit_score":     str(lead.get("icp_score") or 0),
+        "score_tier":        lead.get("score_tier") or "",
+        "warm_signal_count": str(len(own_posts)),
+        "email_status":      "found" if lead.get("email") else "not found",
+        "product_name":      ws_ctx.get("product_name", ""),
+        "value_proposition": ws_ctx.get("value_proposition", ""),
+        "target_titles":     ws_ctx.get("target_titles", ""),
+        "tone":              ws_ctx.get("tone", "professional"),
+        "banned_phrases":    ws_ctx.get("banned_phrases", ""),
+        "case_study":        ws_ctx.get("case_study", ""),
+        "cta_style":         ws_ctx.get("cta_style", "question"),
+        "company_intel":       _s(prev.get("company_intel", "")),
+        "auto_tags":           _s(prev.get("tags", "[]")),
+        "behavioural_signals": _s(prev.get("signals", "")),
+        "buying_signals":      _s(prev.get("buying", "")),
+        "pitch_intelligence":  _s(prev.get("pitch", "")),
+        "company_stage":        ci_obj.get("company_stage", "")       if isinstance(ci_obj, dict)     else "",
+        "intent_level":         buying_obj.get("intent_level", "")    if isinstance(buying_obj, dict) else "",
+        "timing_score":         str(buying_obj.get("timing_score", 0)) if isinstance(buying_obj, dict) else "0",
+        "trigger_events":       _json.dumps(buying_obj.get("trigger_events", [])) if isinstance(buying_obj, dict) else "[]",
+        "personalization_hook": pitch_obj.get("personalization_hook", "") if isinstance(pitch_obj, dict) else "",
+        "core_pain":            pitch_obj.get("core_pain", "")         if isinstance(pitch_obj, dict) else "",
+    }
+
+
+async def _lio_stage_stream(lead_id: str, stage_idx: int, system_prompt: str, user_prompt: str,
+                             wb_llm_key_db, wb_llm_host_db, wb_llm_model_db):
+    """Async generator: calls LLM with pre-filled prompts and streams SSE result."""
+    import httpx as _httpx
+    import json as _json
+
+    async def _call_llm(system: str, user: str) -> str:
+        errors = []
+        wb_host = wb_llm_host_db or svc._wb_llm_host()
+        wb_key  = wb_llm_key_db  or svc._wb_llm_key()
+        wb_mdl  = wb_llm_model_db or svc._wb_llm_model()
+        if wb_host and wb_key:
+            try:
+                async with _httpx.AsyncClient(timeout=90) as c:
+                    r = await c.post(f"{wb_host.rstrip('/')}/v1/chat/completions",
+                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {wb_key}"},
+                        json={"model": wb_mdl, "messages": [{"role":"system","content":system},{"role":"user","content":user}],
+                              "temperature": 0.3, "max_tokens": 2000})
+                    if r.is_success: return r.json()["choices"][0]["message"]["content"].strip()
+                    errors.append(f"WB LLM: HTTP {r.status_code}")
+            except Exception as e: errors.append(f"WB LLM: {e}")
+        hf_token = svc._hf_token()
+        if hf_token:
+            try:
+                async with _httpx.AsyncClient(timeout=90) as c:
+                    r = await c.post("https://router.huggingface.co/v1/chat/completions",
+                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {hf_token}"},
+                        json={"model": svc._hf_model(),
+                              "messages": [{"role":"system","content":system},{"role":"user","content":user}],
+                              "temperature": 0.3, "max_tokens": 2000})
+                    if r.is_success: return r.json()["choices"][0]["message"]["content"].strip()
+                    try: body_txt = r.json().get("error", {}).get("message") or r.text
+                    except Exception: body_txt = r.text
+                    errors.append(f"HuggingFace: HTTP {r.status_code}: {body_txt}")
+            except Exception as e: errors.append(f"HuggingFace: {e}")
+        raise RuntimeError(" | ".join(errors) if errors else "No LLM provider configured.")
+
+    stage_name = _LIO_RESULT_KEYS.get(stage_idx, f"stage_{stage_idx}")
+    yield f"data: {_json.dumps({'status': 'running', 'stage': stage_idx, 'stage_name': stage_name})}\n\n"
+    try:
+        result = await _call_llm(system_prompt, user_prompt)
+        result = _lio_strip_md(result)
+        # Validate it's proper JSON
+        try: _json.loads(result)
+        except Exception:
+            # Wrap plain-string responses (e.g. tag arrays) — keep as-is if not parseable
+            pass
+        rk = _LIO_RESULT_KEYS.get(stage_idx)
+        if rk:
+            try:
+                await svc.save_lead_lio_results(lead_id, {rk: result})
+            except Exception as _e:
+                logger.warning("[LIO save stage %d] %s", stage_idx, _e)
+        yield f"data: {_json.dumps({'status': 'done', 'stage': stage_idx, 'stage_name': stage_name, 'result': result, 'done': True})}\n\n"
+    except Exception as e:
+        logger.error("[LIO Stage %d] %s", stage_idx, e)
+        yield f"data: {_json.dumps({'error': str(e), 'done': True})}\n\n"
+
+
+async def _lio_setup(lead_id: str, stage_idx: int, prev: dict, request: Request):
+    """Load lead, prompt config, workspace context, and LLM keys for a stage (legacy)."""
+    org_id = _get_org_id(request)
+    lead = await svc.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    prompts = await cfg_svc.get_lio_prompts(org_id)
+    if stage_idx < 0 or stage_idx >= len(prompts):
+        raise HTTPException(status_code=400, detail=f"Stage {stage_idx} not configured")
+    prompt_cfg = prompts[stage_idx]
+    ws_ctx = await cfg_svc.get_workspace_context(org_id)
+    wb_row        = await cfg_svc.get_tool_row(org_id, "wb_llm")
+    wb_llm_key_db = (wb_row or {}).get("api_key") or None
+    wb_extra: dict = {}
+    try: wb_extra = json.loads((wb_row or {}).get("extra_config") or "{}") if wb_row else {}
+    except Exception: pass
+    wb_llm_host_db  = wb_extra.get("host") or None
+    wb_llm_model_db = wb_extra.get("model") or None
+    ctx = await _build_lio_ctx(lead, ws_ctx, prev)
+    return lead_id, stage_idx, prompt_cfg, ctx, wb_llm_key_db, wb_llm_host_db, wb_llm_model_db
+
+
+async def _lio_llm_keys(request: Request):
+    """Fetch LLM provider keys for the org — used by named LIO routes."""
+    org_id = _get_org_id(request)
+    wb_row        = await cfg_svc.get_tool_row(org_id, "wb_llm")
+    wb_llm_key_db = (wb_row or {}).get("api_key") or None
+    wb_extra: dict = {}
+    try: wb_extra = json.loads((wb_row or {}).get("extra_config") or "{}") if wb_row else {}
+    except Exception: pass
+    return wb_llm_key_db, wb_extra.get("host"), wb_extra.get("model")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Request / Response models
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _validate_linkedin_url(v: str) -> str:
+    """Accept both person (linkedin.com/in/) and company (linkedin.com/company/) URLs."""
+    v = v.strip()
+    if not v:
+        raise ValueError("linkedin_url is required")
+    v_lower = v.lower()
+    if "linkedin.com" not in v_lower:
+        raise ValueError("Must be a LinkedIn URL (linkedin.com/in/... or linkedin.com/company/...)")
+    if "/in/" not in v_lower and "/company/" not in v_lower:
+        raise ValueError("URL must be a person profile (linkedin.com/in/...) or company page (linkedin.com/company/...)")
+    return v
+
+
+class SingleEnrichRequest(BaseModel):
+    linkedin_url: str
+    generate_outreach: bool = True
+    engagement_data: Optional[dict] = None
+    force_refresh: bool = False   # bypass duplicate cache and re-enrich
+    forward_to_lio: bool = False  # suppress LIO forwarding (frontend sets true)
+
+    @field_validator("linkedin_url")
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        return _validate_linkedin_url(v)
+
+
+class BulkEnrichRequest(BaseModel):
+    linkedin_urls: list[str]
+    webhook_url: Optional[str] = None   # Where Bright Data posts results
+    notify_url: Optional[str] = None    # Snapshot-ready notification URL
+    webhook_auth: Optional[str] = None  # Auth header value for your webhook
+    token: Optional[str] = None         # Tenant/org token — echoed back in response + webhook
+    skip_existing: bool = True          # skip URLs already enriched (< LEAD_CACHE_TTL_DAYS old)
+    forward_to_lio: bool = False        # suppress LIO forwarding when True; False (default) = auto-send to LIO
+    system_prompt: Optional[str] = None  # optional: custom system prompt used during outreach/AI generation per lead
+
+    @field_validator("linkedin_urls")
+    @classmethod
+    def validate_urls(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError("linkedin_urls must not be empty")
+        if len(v) > 5000:
+            raise ValueError("Maximum 5000 URLs per batch")
+        cleaned = []
+        for url in v:
+            url = url.strip()
+            url_lower = url.lower()
+            if url and "linkedin.com" in url_lower and ("/in/" in url_lower or "/company/" in url_lower):
+                cleaned.append(url)
+        if not cleaned:
+            raise ValueError("No valid LinkedIn URLs found (must be /in/ person or /company/ page URLs)")
+        # Deduplicate while preserving order
+        seen = set()
+        deduped = []
+        for url in cleaned:
+            if url not in seen:
+                seen.add(url)
+                deduped.append(url)
+        return deduped
+
+
+class RegenerateOutreachRequest(BaseModel):
+    pass  # No body needed — uses existing lead data
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Routes
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/enrich/stream", include_in_schema=False)
+async def enrich_stream(body: SingleEnrichRequest, request: Request):
+    """
+    Stream a single LinkedIn profile enrichment as Server-Sent Events.
+
+    Yields one JSON event per stage (loading → done) as the enrichment progresses:
+      stage: profile | company | contact | website | scoring | complete
+
+    Each event:  data: {"stage": "...", "status": "loading"|"done"|"error", "data": {...}}
+    """
+    org_id = _get_org_id(request)
+
+    async def gen():
+        try:
+            async for event in svc.enrich_single_stream(
+                linkedin_url=body.linkedin_url,
+                org_id=org_id,
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as e:
+            logger.error("[EnrichStream] %s", e, exc_info=True)
+            yield f"data: {json.dumps({'stage': 'complete', 'status': 'error', 'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/enrich", include_in_schema=False)
+async def enrich_single(body: SingleEnrichRequest, request: Request, background_tasks: BackgroundTasks):
+    """
+    Enrich a single LinkedIn profile URL.
+
+    Calls Bright Data sync API (~30–60s), finds email via waterfall,
+    scores the lead (3-layer model), and generates AI outreach if score ≥ threshold.
+
+    Pass a single URL:
+    ```json
+    {"linkedin_url": "https://www.linkedin.com/in/someone"}
+    ```
+    """
+    org_id = _get_org_id(request)
+
+    # ── Duplicate detection ────────────────────────────────────────────────────
+    if not body.force_refresh:
+        existing = await svc.check_existing_lead(body.linkedin_url, org_id)
+        if existing:
+            if existing.get("_stale"):
+                # Stale cache: warn but still return cached — client can force_refresh
+                return {
+                    "success": True,
+                    "cache_hit": True,
+                    "stale": True,
+                    "stale_warning": (
+                        f"Lead enriched {existing.get('enriched_at', 'previously')} — "
+                        "data may be outdated. Pass force_refresh=true to re-enrich."
+                    ),
+                    "lead": _format_lead(existing),
+                }
+            return {
+                "success": True,
+                "cache_hit": True,
+                "stale": False,
+                "lead": _format_lead(existing),
+            }
+
+    # Load tool availability from enrichment config
+    tools_available = await cfg_svc.get_available_tools(org_id)
+    try:
+        lead = await svc.enrich_single(
+            linkedin_url=body.linkedin_url,
+            engagement_data=body.engagement_data,
+            generate_outreach_flag=body.generate_outreach,
+            org_id=org_id,
+            tools=tools_available,
+            forward_to_lio=body.forward_to_lio,
+        )
+        # Deduct credits for tools that were actually used
+        if lead and not lead.get("error"):
+            lead_id = lead.get("id")
+            await cfg_svc.deduct_credit(org_id, "brightdata", lead_id=lead_id, reason="profile enrichment")
+            email_source = str(lead.get("email_source") or "")
+            if "apollo" in email_source:
+                await cfg_svc.deduct_credit(org_id, "apollo", lead_id=lead_id, reason="email discovery")
+            background_tasks.add_task(
+                svc.audit_log, org_id, "enrich_single",
+                lead_id=lead_id, linkedin_url=body.linkedin_url,
+                meta={"force_refresh": body.force_refresh},
+            )
+        return {
+            "success": True,
+            "cache_hit": False,
+            "lead": _format_lead(lead),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("[EnrichSingle] %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Enrichment failed: {e}")
+
+
+def _decode_token(token: str) -> dict:
+    """
+    Verify and decode JWT using JWT_SECRET.
+    Returns decoded payload dict, or {} if invalid/expired.
+    """
+    if not _JWT_SECRET:
+        logger.error("[Auth] JWT_SECRET not configured — cannot verify token")
+        return {}
+    try:
+        return jwt.decode(token.strip(), _JWT_SECRET, algorithms=[_JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        logger.warning("[Auth] Token expired")
+        return {}
+    except jwt.InvalidTokenError as e:
+        logger.warning("[Auth] Invalid token: %s", e)
+        return {}
+
+
+def _validate_token(token: Optional[str]) -> tuple[str, str]:
+    """
+    Verify JWT with JWT_SECRET and return (org_id, sso_id).
+    Raises HTTP 401 if token is missing or signature invalid/expired.
+    platform check is skipped for OAuth tokens (isOAuthToken=true or no platform field).
+    """
+    if not token:
+        raise HTTPException(status_code=401, detail="Token required.")
+    payload = _decode_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+    # Only enforce platform check for non-OAuth tokens that explicitly set platform
+    platform = payload.get("platform")
+    is_oauth = payload.get("isOAuthToken", False)
+    if platform and not is_oauth and platform != "worksbuddy":
+        raise HTTPException(status_code=401, detail="Invalid token: platform mismatch.")
+    org_id = str(payload.get("organization_id", "default"))
+    # Support id, sso_id, sub, user_id as fallbacks
+    sso_id = str(payload.get("sso_id") or payload.get("sub") or payload.get("user_id") or payload.get("id") or "")
+    return org_id, sso_id
+
+
+class SingleEnrichPublicRequest(BaseModel):
+    linkedin_url: str
+    token: str
+
+    @field_validator("linkedin_url")
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        return _validate_linkedin_url(v)
+
+
+@router.post(
+    "/enrich/single",
+    tags=["LinkedIn Enrichment"],
+    summary="Single LinkedIn Enrich",
+    description="""
+Enrich **one** LinkedIn profile URL synchronously.
+
+Pass your JWT token (from Get Token) in the request body — same token used for the Bulk API.
+The response includes the full enriched lead **plus** the structured `linkedin_enrich` view.
+
+**Cache behaviour:** If the URL was already enriched, the cached result is returned instantly
+(`_cache_hit: true`). Fresh enrichments call Bright Data (~30–60s).
+
+```json
+{
+  "linkedin_url": "https://www.linkedin.com/in/johndoe",
+  "token": "<YOUR_TOKEN>"
+}
+```
+""",
+)
+async def enrich_single_public(body: SingleEnrichPublicRequest):
+    org_id, sso_id = _validate_token(body.token)
+    tools_available = await cfg_svc.get_available_tools(org_id)
+    try:
+        lead = await svc.enrich_single(
+            linkedin_url=body.linkedin_url,
+            org_id=org_id,
+            sso_id=sso_id,
+            tools=tools_available,
+        )
+        if lead and not lead.get("error"):
+            lead_id = lead.get("id")
+            if not lead.get("_cache_hit"):
+                await cfg_svc.deduct_credit(org_id, "brightdata", lead_id=lead_id, reason="profile enrichment")
+                email_source = str(lead.get("email_source") or "")
+                if "apollo" in email_source:
+                    await cfg_svc.deduct_credit(org_id, "apollo", lead_id=lead_id, reason="email discovery")
+        return {
+            "success":        True,
+            "_cache_hit":     lead.get("_cache_hit", False),
+            "lead":           _format_lead(lead),
+            "linkedin_enrich": lead.get("linkedin_enrich"),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("[EnrichSinglePublic] %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Enrichment failed: {e}")
+
+
+@router.post("/enrich/bulk")
+async def enrich_bulk(request: Request):
+    """
+    Enrich multiple LinkedIn profile URLs asynchronously.
+
+    No Authorization header required. Pass JWT in the `token` body field —
+    organization_id is decoded from it and echoed back in the response.
+
+    ```json
+    {
+      "linkedin_urls": ["https://www.linkedin.com/in/alice"],
+      "token": "<YOUR_JWT_TOKEN>",
+      "webhook_url": "https://your-app.com/api/leads/webhook/brightdata"
+    }
+    ```
+    """
+    try:
+        raw = await request.json()
+        # Handle double-encoded JSON (body sent as a string instead of object)
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        body = BulkEnrichRequest(**raw)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid request body: {e}")
+
+    org_id, sso_id = _validate_token(body.token)
+
+    urls_to_submit = body.linkedin_urls
+    skipped_urls: list[str] = []
+
+    # ── skip_existing: filter out URLs already enriched for this org ──────────
+    # Single batch query instead of N individual queries
+    if body.skip_existing:
+        filtered: list[str] = []
+        existing_map = await svc.check_existing_leads_batch(urls_to_submit, org_id)
+        for url in urls_to_submit:
+            lead_id = svc._lead_id(svc._normalize_linkedin_url(url))
+            existing = existing_map.get(lead_id)
+            lead_status = (existing or {}).get("status", "")
+            if existing and not existing.get("_stale") and lead_status in ("completed", "enriched"):
+                # Lead already fully enriched — send to LIO under concurrency cap
+                existing["linkedin_enrich"] = svc._format_linkedin_enrich(existing)
+                _lead = dict(existing)
+                _sso  = sso_id
+                async def _capped_lio_send(_l=_lead, _s=_sso):
+                    async with _skip_lio_sem:
+                        await svc.send_to_lio(_l, sso_id=_s, force=True)
+                asyncio.create_task(_capped_lio_send())
+                skipped_urls.append(url)
+            else:
+                # Not completed (pending/scraping/enriching/failed/stale/missing) — re-enrich
+                filtered.append(url)
+        urls_to_submit = filtered
+
+    if not urls_to_submit:
+        return {
+            "success": True,
+            "job": None,
+            "skipped_urls": skipped_urls,
+            "submitted_count": 0,
+            "message": "All submitted URLs are already enriched. Pass skip_existing=false or use /re-enrich to force refresh.",
+        }
+
+    try:
+        job = await svc.enrich_bulk(
+            urls=urls_to_submit,
+            webhook_url=body.webhook_url,
+            notify_url=body.notify_url,
+            webhook_auth=body.webhook_auth,
+            org_id=org_id,
+            sso_id=sso_id,
+            forward_to_lio=body.forward_to_lio,
+            system_prompt=body.system_prompt,
+        )
+        await svc.audit_log(
+            org_id, "bulk_submit", job_id=job["id"],
+            meta={"submitted": len(urls_to_submit), "skipped": len(skipped_urls)},
+        )
+        resp = {
+            "success": True,
+            "job": job,
+            "submitted_count": len(urls_to_submit),
+            "skipped_count": len(skipped_urls),
+            "skipped_urls": skipped_urls if len(skipped_urls) <= 20 else skipped_urls[:20],
+            "message": (
+                f"Batch job started for {len(urls_to_submit)} URLs"
+                + (f" ({len(skipped_urls)} skipped — already enriched)" if skipped_urls else "")
+                + f". Track progress at GET /api/leads/jobs/{job['id']}"
+            ),
+        }
+        if body.token is not None:
+            resp["token"] = body.token
+        return resp
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("[EnrichBulk] %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Batch trigger failed: {e}")
+
+
+# ── Job management ─────────────────────────────────────────────────────────
+
+@router.get("/jobs")
+async def list_jobs(
+    status: str = Query(""),
+    q: str = Query(""),
+    limit: int = Query(20, ge=1, le=200),
+):
+    """List enrichment jobs."""
+    jobs = await svc.list_jobs(limit=limit)
+    if status:
+        jobs = [j for j in jobs if j.get("status") == status]
+    if q:
+        q_lower = q.lower()
+        jobs = [j for j in jobs if q_lower in j.get("id", "").lower()]
+
+    # Fetch all sub_jobs for these jobs in a single query instead of N parallel queries
+    if jobs:
+        job_ids = [j["id"] for j in jobs]
+        from db import get_pool
+        async with get_pool().acquire() as conn:
+            placeholders = ",".join(f"${i+1}" for i in range(len(job_ids)))
+            sub_rows = await conn.fetch(
+                f"SELECT * FROM enrichment_sub_jobs WHERE job_id IN ({placeholders}) ORDER BY chunk_index",
+                *job_ids,
+            )
+        sub_map: dict[str, list] = {j["id"]: [] for j in jobs}
+        for row in sub_rows:
+            sub_map[row["job_id"]].append(dict(row))
+        for job in jobs:
+            job["sub_jobs"] = sub_map.get(job["id"], [])
+    return {"jobs": jobs, "total": len(jobs)}
+
+
+@router.get("/jobs/{job_id}/sub-jobs", include_in_schema=False)
+async def get_sub_jobs(job_id: str):
+    """List sub-jobs (chunks) for a specific enrichment job."""
+    job = await svc.get_job(job_id)
+    org_id = job.get("organization_id", "default") if job else "default"
+    sub_jobs = await svc.list_sub_jobs(job_id, org_id=org_id)
+    return {"sub_jobs": sub_jobs, "total": len(sub_jobs)}
+
+
+@router.get("/jobs/{job_id}")
+async def get_job(job_id: str):
+    """Get status and progress of a specific enrichment job."""
+    from db import get_pool
+    async with get_pool().acquire() as conn:
+        job_row = await conn.fetchrow("SELECT * FROM enrichment_jobs WHERE id=$1", job_id)
+        if not job_row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        job = dict(job_row)
+        org_id = job.get("organization_id", "default")
+
+        leads_count = await conn.fetchval("SELECT COUNT(*) FROM enriched_leads WHERE job_id=$1", job_id)
+        sub_rows = await conn.fetch(
+            "SELECT * FROM enrichment_sub_jobs WHERE job_id=$1 AND organization_id=$2 ORDER BY chunk_index",
+            job_id, org_id,
+        )
+
+    return {**job, "leads_count": leads_count, "sub_jobs": [dict(r) for r in sub_rows]}
+
+
+# ── LIO Dead-Letter Queue ─────────────────────────────────────────────────────
+
+@router.get("/lio/dlq/count")
+async def lio_dlq_count():
+    """Return number of failed LIO deliveries waiting in the dead-letter queue."""
+    try:
+        import redis.asyncio as aioredis
+        redis_url = os.getenv("REDIS_URL", "")
+        if not redis_url:
+            return {"count": 0, "error": "REDIS_URL not configured"}
+        r = aioredis.from_url(redis_url, decode_responses=True)
+        count = await r.llen("lio:dlq")
+        await r.close()
+        return {"count": count}
+    except Exception as e:
+        return {"count": 0, "error": str(e)}
+
+
+@router.post("/lio/dlq/replay")
+async def lio_dlq_replay(max_items: int = 50):
+    """Replay up to max_items failed LIO deliveries from the dead-letter queue."""
+    result = await svc.lio_dlq_replay(max_items=max_items)
+    return result
+
+
+
+@router.post(
+    "/jobs/{job_id}/stop",
+    summary="Stop / cancel a running job",
+    description=(
+        "Cancels a running or pending enrichment job.\n\n"
+        "**What this does:**\n"
+        "- Marks the job and all pending sub-jobs as `cancelled` in the database.\n"
+        "- Calls the BrightData snapshot cancel API to stop any in-progress scrape.\n"
+        "- Any webhook results that arrive after cancellation are automatically discarded.\n\n"
+        "**Cancellable statuses:** `running`, `pending`, `fallback`\n\n"
+        "**BrightData cancel endpoint called:**\n"
+        "`POST https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}/cancel`"
+    ),
+    responses={
+        200: {
+            "description": "Job cancelled successfully",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "job_id": "3f1b2c4d-...",
+                        "status": "cancelled",
+                        "snapshots_cancelled": 4,
+                    }
+                }
+            },
+        },
+        400: {"description": "Job is not in a cancellable state"},
+        404: {"description": "Job not found"},
+    },
+)
+async def stop_job(job_id: str):
+    from db import get_pool
+    import asyncio as _asyncio
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, snapshot_id FROM enrichment_jobs WHERE id=$1", job_id
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if row["status"] not in ("running", "pending", "fallback"):
+            raise HTTPException(status_code=400, detail=f"Job is already {row['status']}")
+        await conn.execute(
+            "UPDATE enrichment_jobs SET status='cancelled', error='Stopped by user' WHERE id=$1",
+            job_id,
+        )
+        await conn.execute(
+            "UPDATE enrichment_sub_jobs SET status='cancelled' WHERE job_id=$1 AND status IN ('pending','running')",
+            job_id,
+        )
+        # Collect all sub-job snapshot_ids (chunked BD path)
+        sub_snap_rows = await conn.fetch(
+            "SELECT snapshot_id FROM enrichment_sub_jobs WHERE job_id=$1 AND snapshot_id IS NOT NULL",
+            job_id,
+        )
+
+    # Build unique set: sub-job snapshots + parent job snapshot (backward compat)
+    snapshot_ids = {r["snapshot_id"] for r in sub_snap_rows if r["snapshot_id"]}
+    if row["snapshot_id"]:
+        snapshot_ids.add(row["snapshot_id"])
+
+    if snapshot_ids:
+        await _asyncio.gather(*[svc.cancel_brightdata_snapshot(sid) for sid in snapshot_ids])
+
+    return {
+        "job_id": job_id,
+        "status": "cancelled",
+        "snapshots_cancelled": len(snapshot_ids),
+    }
+
+
+@router.post(
+    "/jobs/{job_id}/rerun",
+    summary="Rerun a failed or cancelled job",
+    description=(
+        "Reruns the BrightData snapshot for an existing enrichment job.\n\n"
+        "**What this does:**\n"
+        "- Calls the BrightData snapshot rerun API using the job's existing `snapshot_id`.\n"
+        "- Updates the job's `snapshot_id` to the new one returned by BrightData.\n"
+        "- Resets the job status to `running` and clears any previous error.\n"
+        "- Resets all sub-jobs to `pending` so progress tracking starts fresh.\n\n"
+        "**Rerunnable statuses:** `failed`, `cancelled`, `completed`\n\n"
+        "**BrightData rerun endpoint called:**\n"
+        "`POST https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}/rerun`"
+    ),
+    responses={
+        200: {
+            "description": "Job rerun triggered successfully",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "job_id": "3f1b2c4d-...",
+                        "status": "running",
+                        "old_snapshot_id": "s_abc123",
+                        "new_snapshot_id": "s_xyz789",
+                    }
+                }
+            },
+        },
+        400: {"description": "Job has no snapshot_id to rerun, or is already running"},
+        404: {"description": "Job not found"},
+    },
+)
+async def rerun_job(job_id: str):
+    from db import get_pool
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, snapshot_id FROM enrichment_jobs WHERE id=$1", job_id
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if row["status"] in ("running", "pending"):
+            raise HTTPException(status_code=400, detail=f"Job is already {row['status']}")
+        old_snapshot_id = row["snapshot_id"]
+        if not old_snapshot_id:
+            raise HTTPException(status_code=400, detail="Job has no snapshot_id — cannot rerun (was not a BrightData batch job)")
+
+    try:
+        new_snapshot_id = await svc.rerun_brightdata_snapshot(old_snapshot_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"BrightData rerun failed: {e}")
+
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            "UPDATE enrichment_jobs SET status='running', snapshot_id=$1, error=NULL, updated_at=NOW() WHERE id=$2",
+            new_snapshot_id, job_id,
+        )
+        await conn.execute(
+            "UPDATE enrichment_sub_jobs SET status='pending', processed=0, failed=0, updated_at=NOW() WHERE job_id=$1",
+            job_id,
+        )
+
+    return {
+        "job_id": job_id,
+        "status": "running",
+        "old_snapshot_id": old_snapshot_id,
+        "new_snapshot_id": new_snapshot_id,
+    }
+
+
+@router.delete("/jobs/{job_id}", include_in_schema=False)
+async def delete_job(job_id: str):
+    """Delete a job and all its sub-jobs from the database."""
+    from db import get_pool
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow("SELECT id FROM enrichment_jobs WHERE id=$1", job_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        await conn.execute("DELETE FROM enrichment_sub_jobs WHERE job_id=$1", job_id)
+        await conn.execute("DELETE FROM enrichment_jobs WHERE id=$1", job_id)
+    return {"job_id": job_id, "deleted": True}
+
+
+# ── Webhooks ───────────────────────────────────────────────────────────────
+
+@router.post("/webhook/brightdata", include_in_schema=False)
+async def webhook_brightdata(request: Request, background_tasks: BackgroundTasks):
+    """
+    Receives enriched profile data from Bright Data (batch delivery).
+    Bright Data POSTs an array of profile objects to this endpoint.
+
+    Configure via Bright Data dashboard or API trigger:
+      endpoint=https://your-app.com/api/leads/webhook/brightdata
+    """
+    # Optional auth check
+    if WEBHOOK_SECRET:
+        auth = request.headers.get("Authorization", "")
+        if auth != f"Bearer {WEBHOOK_SECRET}":
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        profiles = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    if not isinstance(profiles, list):
+        profiles = [profiles]
+
+    # Extract routing params from query string
+    job_id      = request.query_params.get("job_id")
+    sub_job_id  = request.query_params.get("sub_job_id")
+    snapshot_id = request.query_params.get("snapshot_id")
+
+    # ── Backpressure guard ────────────────────────────────────────────────────
+    global _webhook_inflight
+    if _webhook_inflight >= MAX_WEBHOOK_INFLIGHT:
+        logger.warning("[Webhook] inflight limit reached (%d) — returning 429", _webhook_inflight)
+        return JSONResponse(status_code=429, content={"ok": False, "error": "too many in-flight webhooks"})
+
+    # ── Idempotency check: guard DB calls within BrightData's 10s window ─────
+    async def _pre_response() -> dict:
+        if snapshot_id:
+            if await svc.is_snapshot_processed(snapshot_id):
+                logger.info("[Webhook] snapshot %s already processed — skipping", snapshot_id)
+                return {"ok": True, "duplicate": True, "message": "Snapshot already processed"}
+            org_id = _get_org_id(request)
+            await svc.mark_snapshot_processed(snapshot_id, job_id, org_id)
+        return {}
+
+    try:
+        early = await asyncio.wait_for(_pre_response(), timeout=9.0)
+    except asyncio.TimeoutError:
+        logger.warning("[Webhook] pre-response timed out for snapshot %s — accepting anyway", snapshot_id)
+        return JSONResponse(status_code=202, content={"ok": True, "timeout": True, "received": len(profiles)})
+
+    if early.get("duplicate"):
+        return early
+
+    # Process in background so webhook returns quickly (Bright Data timeout is 10s).
+    # _bg_task owns the inflight counter so it reflects true in-flight work.
+    async def _bg_task():
+        global _webhook_inflight
+        _webhook_inflight += 1
+        try:
+            await svc.process_webhook_profiles(profiles, job_id, sub_job_id)
+        finally:
+            _webhook_inflight -= 1
+
+    background_tasks.add_task(_bg_task)
+
+    return {"ok": True, "received": len(profiles)}
+
+
+@router.post("/webhook/notify", include_in_schema=False)
+async def webhook_notify(request: Request, background_tasks: BackgroundTasks):
+    """
+    Bright Data snapshot-ready notification.
+    Body: {"snapshot_id": "s_xxx", "status": "ready"}
+    Triggers async download and processing of the snapshot.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    status = data.get("status") or data.get("state", "")
+    snapshot_id = data.get("snapshot_id") or data.get("id")
+    job_id = request.query_params.get("job_id")
+    sub_job_id = request.query_params.get("sub_job_id")
+
+    if status == "ready" and snapshot_id:
+        # ── Backpressure guard ────────────────────────────────────────────────
+        global _webhook_inflight
+        if _webhook_inflight >= MAX_WEBHOOK_INFLIGHT:
+            logger.warning("[WebhookNotify] inflight limit reached (%d) — returning 429", _webhook_inflight)
+            return JSONResponse(status_code=429, content={"ok": False, "error": "too many in-flight webhooks"})
+
+        # ── Idempotency check within BrightData's 10s window ─────────────────
+        async def _pre_response_notify() -> dict:
+            if await svc.is_snapshot_processed(snapshot_id):
+                logger.info("[WebhookNotify] snapshot %s already processed — skipping", snapshot_id)
+                return {"ok": True, "duplicate": True, "message": "Snapshot already processed"}
+            org_id = _get_org_id(request)
+            await svc.mark_snapshot_processed(snapshot_id, job_id, org_id)
+            return {}
+
+        try:
+            early = await asyncio.wait_for(_pre_response_notify(), timeout=9.0)
+        except asyncio.TimeoutError:
+            logger.warning("[WebhookNotify] pre-response timed out for snapshot %s — accepting anyway", snapshot_id)
+            return JSONResponse(status_code=202, content={"ok": True, "timeout": True})
+
+        if early.get("duplicate"):
+            return early
+
+        async def _download_and_process():
+            global _webhook_inflight
+            _webhook_inflight += 1
+            try:
+                profiles = await svc.poll_snapshot(snapshot_id, interval=5, timeout=120)
+                await svc.process_webhook_profiles(profiles, job_id=job_id, sub_job_id=sub_job_id)
+                if job_id:
+                    await svc._update_job(job_id, status="completed")
+            except Exception as e:
+                logger.error("[Notify] Download failed for %s: %s", snapshot_id, e)
+                if job_id:
+                    await svc._update_job(job_id, status="failed", error=str(e))
+            finally:
+                _webhook_inflight -= 1
+
+        background_tasks.add_task(_download_and_process)
+
+    return {"ok": True}
+
+
+# ── Lead results ───────────────────────────────────────────────────────────
+
+@router.get("/queue/stats", include_in_schema=False)
+async def queue_stats():
+    """
+    Real-time queue system snapshot.
+
+    Returns active tenant count, per-tenant queue depth, current chunk size,
+    worker status, and Redis memory usage.
+
+    Useful for monitoring scale: how many tenants are active, how deep
+    each tenant's queue is, and whether the system is under memory pressure.
+    """
+    from queue_manager import get_queue_stats
+    return await get_queue_stats()
+
+
+# ── AI Processing Queue ───────────────────────────────────────────────────────
+
+class _AIProcessRequest(BaseModel):
+    token: str
+    job_id: str
+    lead_ids: list[str]
+    system_prompt: str
+    forward_to_lio: bool = False
+
+    @field_validator("lead_ids")
+    @classmethod
+    def _validate_lead_ids(cls, v):
+        if not v:
+            raise ValueError("lead_ids cannot be empty")
+        if len(v) > 5000:
+            raise ValueError("max 5000 lead_ids per request")
+        return list(dict.fromkeys(v))  # deduplicate, preserve order
+
+
+@router.post("/jobs/ai-process", include_in_schema=False)
+async def enqueue_ai_processing(request: Request):
+    """
+    Enqueue raw_profile leads for AI processing via Qwen 70B / HuggingFace / WB LLM.
+
+    Body:
+      token         — JWT for org_id / sso_id
+      job_id        — existing job to track progress against
+      lead_ids      — list of lead IDs (must have status='scraping' or 'ai_queued')
+      system_prompt — system prompt to use for every lead
+      forward_to_lio — whether to forward completed leads to LIO
+
+    Status transitions: scraping → ai_queued → ai_processing → completed
+
+    Returns: { enqueued: N, chunks: N, workers: N }
+    """
+    import redis.asyncio as aioredis
+    from queue_manager import push_ai_job, get_ai_queue_stats, AI_WORKERS
+
+    body_raw = await request.body()
+    try:
+        body = _AIProcessRequest.model_validate(json.loads(body_raw))
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    # Decode JWT — same pattern as enrich_bulk
+    JWT_SECRET = os.getenv("JWT_SECRET", "")
+    try:
+        decoded = jwt.decode(
+            body.token,
+            JWT_SECRET,
+            algorithms=["HS256"],
+            options={"verify_exp": False},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+
+    org_id = decoded.get("org_id") or decoded.get("organizationId", "")
+    sso_id = decoded.get("sso_id") or decoded.get("userId", "")
+    if not org_id:
+        raise HTTPException(status_code=401, detail="org_id missing from token")
+
+    try:
+        r = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
+        chunks_enqueued = await push_ai_job(
+            job_id=body.job_id,
+            org_id=org_id,
+            lead_ids=body.lead_ids,
+            system_prompt=body.system_prompt,
+            r=r,
+            sso_id=sso_id,
+            forward_to_lio=body.forward_to_lio,
+        )
+        await r.aclose()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Redis error: {e}")
+
+    return {
+        "ok":      True,
+        "enqueued": len(body.lead_ids),
+        "chunks":  chunks_enqueued,
+        "workers": AI_WORKERS,
+        "job_id":  body.job_id,
+        "org_id":  org_id,
+    }
+
+
+@router.get("/queue/ai-stats", include_in_schema=False)
+async def ai_queue_stats():
+    """Real-time AI processing queue snapshot."""
+    from queue_manager import get_ai_queue_stats
+    return await get_ai_queue_stats()
+
+
+@router.post("/queue/ai-dlq/retry", include_in_schema=False)
+async def ai_dlq_retry(index: int = 0):
+    """Retry one item from the AI dead-letter queue by index (default: first item)."""
+    from queue_manager import retry_ai_dlq
+    ok = await retry_ai_dlq(index)
+    return {"ok": ok}
+
+
+@router.get("", include_in_schema=False)
+async def list_leads(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    job_id: Optional[str] = Query(None),
+    min_score: Optional[int] = Query(None, ge=0, le=100),
+    tier: Optional[str] = Query(None, pattern="^(hot|warm|cool|cold)$"),
+    sort_by: Optional[str] = Query(None),
+    sort_dir: Optional[str] = Query(None),
+    q: Optional[str] = Query(None),
+):
+    """List all enriched leads."""
+    result = await svc.list_leads(
+        limit=limit, offset=offset,
+        job_id=job_id, min_score=min_score, tier=tier,
+        sort_by=sort_by, sort_dir=sort_dir, q=q,
+    )
+    result["leads"] = [_format_lead(l) for l in result["leads"]]
+    return result
+
+
+@router.get("/export/csv", include_in_schema=False)
+async def export_leads_csv(
+    request: Request,
+    job_id: Optional[str] = Query(None),
+    min_score: Optional[int] = Query(None, ge=0, le=100),
+    tier: Optional[str] = Query(None),
+):
+    """Export enriched leads as CSV download (enhanced — includes contact, company, outreach fields)."""
+    org_id = _get_org_id(request)
+    result = await svc.list_leads(
+        limit=5000, offset=0, org_id=org_id,
+        job_id=job_id, min_score=min_score, tier=tier,
+    )
+    leads = result["leads"]
+
+    _CSV_FIELDS = [
+        "name", "first_name", "last_name", "title", "seniority_level", "department",
+        "company", "industry", "employee_count", "hq_location", "company_website",
+        "funding_stage", "total_funding",
+        "work_email", "email_source", "email_confidence", "email_verified",
+        "direct_phone", "twitter",
+        "city", "country", "timezone",
+        "linkedin_url",
+        "total_score", "score_tier", "icp_fit_score", "intent_score",
+        "timing_score", "engagement_score", "score_explanation",
+        "email_subject", "outreach_angle",
+        "followers", "connections",
+        "job_id", "enriched_at",
+    ]
+
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=_CSV_FIELDS, extrasaction="ignore")
+    writer.writeheader()
+    for lead in leads:
+        row = {f: lead.get(f, "") for f in _CSV_FIELDS}
+        writer.writerow(row)
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=leads_enriched.csv"},
+    )
+
+
+@router.get("/export/json", include_in_schema=False)
+async def export_leads_json(
+    request: Request,
+    job_id: Optional[str] = Query(None),
+    min_score: Optional[int] = Query(None, ge=0, le=100),
+    tier: Optional[str] = Query(None),
+):
+    """Export enriched leads as JSON download."""
+    org_id = _get_org_id(request)
+    result = await svc.list_leads(
+        limit=5000, offset=0, org_id=org_id,
+        job_id=job_id, min_score=min_score, tier=tier,
+    )
+    leads = [_format_lead(l, full=True) for l in result["leads"]]
+    output = json.dumps({"total": result["total"], "leads": leads}, default=str, indent=2)
+    return StreamingResponse(
+        iter([output]),
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=leads_enriched.json"},
+    )
+
+
+# ── Bulk Re-enrichment ──────────────────────────────────────────────────────
+
+class ReEnrichJobRequest(BaseModel):
+    token: Optional[str] = None
+
+
+@router.post("/jobs/{job_id}/re-enrich", include_in_schema=False)
+async def re_enrich_job(job_id: str, body: ReEnrichJobRequest, request: Request):
+    """
+    Re-submit all LinkedIn URLs from a completed job as a new bulk job.
+
+    Useful for refreshing stale data or retrying a high-failure-rate job.
+    Returns the new job_id.
+    """
+    org_id = _get_org_id(request)
+    if body.token:
+        org_id, _ = _validate_token(body.token)
+
+    job = await svc.get_job(job_id, org_id=org_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Fetch all lead URLs from the original job
+    result = await svc.list_leads(limit=5000, offset=0, org_id=org_id, job_id=job_id)
+    urls = [l["linkedin_url"] for l in result["leads"] if l.get("linkedin_url")]
+    if not urls:
+        raise HTTPException(status_code=400, detail="No leads found in this job to re-enrich")
+
+    try:
+        new_job = await svc.enrich_bulk(urls=urls, org_id=org_id)
+        await svc.audit_log(
+            org_id, "re_enrich",
+            job_id=new_job["id"],
+            meta={"original_job_id": job_id, "urls_count": len(urls)},
+        )
+        return {
+            "success": True,
+            "new_job_id": new_job["id"],
+            "submitted_urls": len(urls),
+            "original_job_id": job_id,
+            "message": f"Re-enrichment started for {len(urls)} URLs. Track at GET /api/leads/jobs/{new_job['id']}",
+        }
+    except Exception as e:
+        logger.error("[ReEnrichJob] %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Re-enrichment failed: {e}")
+
+
+# ── Scheduled / Manual Refresh ─────────────────────────────────────────────
+
+class RefreshLeadsRequest(BaseModel):
+    older_than_days: int = 90
+    tier: Optional[str] = None
+    min_score: int = 0
+    limit: int = 200
+    token: Optional[str] = None
+
+
+@router.post("/refresh", include_in_schema=False)
+async def schedule_refresh(body: RefreshLeadsRequest, request: Request):
+    """
+    Find stale leads matching the criteria and re-submit them as a new bulk job.
+
+    ```json
+    { "older_than_days": 90, "tier": "hot", "min_score": 70, "limit": 200 }
+    ```
+    """
+    org_id = _get_org_id(request)
+    if body.token:
+        org_id, _ = _validate_token(body.token)
+
+    stale = await svc.get_stale_leads(
+        org_id=org_id,
+        older_than_days=body.older_than_days,
+        tier=body.tier,
+        min_score=body.min_score,
+        limit=body.limit,
+    )
+    if not stale:
+        return {"success": True, "job": None, "queued_urls": 0, "message": "No stale leads found matching criteria"}
+
+    urls = [l["linkedin_url"] for l in stale if l.get("linkedin_url")]
+    try:
+        new_job = await svc.enrich_bulk(urls=urls, org_id=org_id)
+        await svc.audit_log(
+            org_id, "refresh_scheduled",
+            job_id=new_job["id"],
+            meta={
+                "older_than_days": body.older_than_days,
+                "tier": body.tier,
+                "min_score": body.min_score,
+                "queued_urls": len(urls),
+            },
+        )
+        return {
+            "success": True,
+            "job_id": new_job["id"],
+            "queued_urls": len(urls),
+            "message": f"Refresh job started for {len(urls)} stale leads. Track at GET /api/leads/jobs/{new_job['id']}",
+        }
+    except Exception as e:
+        logger.error("[RefreshLeads] %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Refresh failed: {e}")
+
+
+# ── Audit Log ───────────────────────────────────────────────────────────────
+
+@router.get("/audit", include_in_schema=False)
+async def get_audit_log(
+    request: Request,
+    action: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """
+    Audit log for lead enrichment actions in this org.
+
+    Filter by action: enrich_single | bulk_submit | delete | re_enrich | refresh_scheduled
+    """
+    org_id = _get_org_id(request)
+    return await svc.list_audit_log(org_id, action=action, limit=limit, offset=offset)
+
+
+@router.get("/{lead_id}", include_in_schema=False)
+async def get_lead(lead_id: str):
+    """Get full detail for a single enriched lead."""
+    lead = await svc.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return _format_lead(lead, full=True)
+
+
+@router.post("/{lead_id}/outreach", include_in_schema=False)
+async def regenerate_outreach(lead_id: str):
+    """
+    Re-generate AI outreach copy (cold email + LinkedIn note + sequence)
+    for an already-enriched lead.
+    """
+    # Semaphore caps concurrent LLM calls — prevents quota exhaustion under load.
+    # Requests above _OUTREACH_CONCURRENCY queue in the event loop (no 429 returned).
+    async with _outreach_sem:
+        try:
+            result = await svc.regenerate_outreach_for_lead(lead_id)
+        except RuntimeError as exc:
+            logger.warning("[RegenerateOutreach] LLM unavailable for lead=%s: %s", lead_id, exc)
+            raise HTTPException(status_code=503, detail="LLM is rate-limited or unavailable. Please wait a moment and try again.")
+        except Exception as exc:
+            logger.error("[RegenerateOutreach] Unexpected error for lead=%s: %s", lead_id, exc)
+            raise HTTPException(status_code=500, detail=f"Regeneration failed: {exc}")
+    if not result:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return {"success": True, "lead": _format_lead(result, full=True)}
+
+
+@router.post("/{lead_id}/company", include_in_schema=False)
+async def regenerate_company(lead_id: str):
+    """
+    Re-run AI analysis (culture_signals, account_pitch, company_tags)
+    for the company associated with this lead.
+    """
+    result = await svc.regenerate_company_for_lead(lead_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return {"success": True, "lead": _format_lead(result, full=True)}
+
+
+@router.post("/{lead_id}/crm-brief", include_in_schema=False)
+async def regenerate_crm_brief(lead_id: str, request: Request):
+    """
+    Re-run the CRM brief LLM call for an already-enriched lead.
+    Uses raw_profile from DB + lio_system_prompt + lio_model from workspace_configs.
+    """
+    org_id = _get_org_id(request)
+
+    # Verify lead exists before accepting job
+    lead = await svc.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    if not lead.get("raw_profile") and not lead.get("raw_brightdata"):
+        raise HTTPException(status_code=422, detail="No raw profile saved for this lead — re-enrich first")
+
+    try:
+        result = await svc.regenerate_crm_brief_for_lead(lead_id, org_id=org_id)
+    except Exception as exc:
+        logger.error("[RegenerateCrmBrief] Failed for lead=%s: %s", lead_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {"success": True, "lead_id": lead_id, "crm_brief": result.get("crm_brief") if result else None}
+
+
+@router.delete("/{lead_id}", include_in_schema=False)
+async def delete_lead(lead_id: str, request: Request, background_tasks: BackgroundTasks):
+    """Delete an enriched lead record."""
+    org_id = _get_org_id(request)
+    lead = await svc.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    deleted = await svc.delete_lead(lead_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    await _lead_cache_delete(lead_id)
+    background_tasks.add_task(
+        svc.audit_log, org_id, "delete",
+        lead_id=lead_id, linkedin_url=lead.get("linkedin_url"),
+    )
+    return {"success": True, "message": "Lead deleted"}
+
+
+# ── Lead Notes ──────────────────────────────────────────────────────────────
+
+class AddNoteRequest(BaseModel):
+    note: str
+
+
+@router.post("/{lead_id}/notes", include_in_schema=False)
+async def add_note(lead_id: str, body: AddNoteRequest, request: Request):
+    """Add a manual note to a lead."""
+    org_id = _get_org_id(request)
+    if not body.note.strip():
+        raise HTTPException(status_code=400, detail="Note cannot be empty")
+    lead = await svc.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    note = await svc.add_lead_note(lead_id, org_id, body.note)
+    return {"success": True, "note": note}
+
+
+@router.get("/{lead_id}/notes", include_in_schema=False)
+async def list_notes(lead_id: str, request: Request):
+    """List all notes for a lead."""
+    org_id = _get_org_id(request)
+    notes = await svc.list_lead_notes(lead_id, org_id)
+    return {"notes": notes, "count": len(notes)}
+
+
+@router.delete("/{lead_id}/notes/{note_id}", include_in_schema=False)
+async def delete_note(lead_id: str, note_id: str, request: Request):
+    """Delete a note from a lead."""
+    org_id = _get_org_id(request)
+    deleted = await svc.delete_lead_note(note_id, org_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Note not found")
+    return {"success": True, "message": "Note deleted"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Enrichment View APIs — 4 focused views of an enriched lead
+#
+# How to look up a lead (pass ONE of these as a query param):
+#   ?url=https://www.linkedin.com/in/username   ← primary — use the same URL you submitted
+#   ?lead_id=abc123def456                       ← alternative — internal ID from job results
+#
+# 3rd parties: always use ?url= — you already have the LinkedIn URL you submitted.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_outreach_from_prompt(prompt: str) -> dict | None:
+    """
+    If the system_prompt already contains completed outreach copy, extract
+    fields and return a dict. Returns None if no completed copy is detected.
+
+    Handles both formats produced by system_prompt_generator_service:
+      Format A — "Email Subject Line: ..." / "LinkedIn Connection Note: ..."
+      Format B — "Email subject line: ..." / "LinkedIn connection note: ..."
+    """
+    import re as _re
+
+    has_subject  = bool(_re.search(r"Email [Ss]ubject [Ll]ine\s*:", prompt))
+    has_linkedin = bool(_re.search(r"LinkedIn [Cc]onnection [Nn]ote\s*:", prompt))
+    if not (has_subject and has_linkedin):
+        return None
+
+    def _grab(pattern, text, flags=_re.IGNORECASE | _re.DOTALL):
+        m = _re.search(pattern, text, flags)
+        return m.group(1).strip() if m else ""
+
+    subject        = _grab(r"Email [Ss]ubject [Ll]ine\s*:\s*(.+?)(?:\n|$)", prompt)
+    linkedin_note  = _grab(r"LinkedIn [Cc]onnection [Nn]ote\s*:\s*(.+?)(?:\n\n|\Z)", prompt)
+    best_channel   = _grab(r"Best [Cc]hannel\s*:\s*(.+?)(?:\n|$)", prompt)
+    best_time      = _grab(r"Best [Ss]end [Tt]ime\s*:\s*(.+?)(?:\n|$)", prompt)
+    outreach_angle = _grab(r"Primary [Aa]ngle\s*:\s*(.+?)(?:\n|\Z)", prompt)
+
+    # Email body — between "Email:\n\n" or after subject line, up to "LinkedIn connection note"
+    body_match = (
+        _re.search(r"Email\s*:\s*\n+(.+?)(?=LinkedIn [Cc]onnection [Nn]ote)", prompt, _re.DOTALL)
+        or _re.search(r"Email [Ss]ubject [Ll]ine\s*:.+?\n\n(.+?)(?=LinkedIn [Cc]onnection [Nn]ote|Best [Cc]hannel)", prompt, _re.DOTALL)
+    )
+    email_body = body_match.group(1).strip() if body_match else ""
+
+    return {
+        "cold_email":      {"subject": subject, "body": email_body},
+        "linkedin_note":   linkedin_note,
+        "best_channel":    best_channel,
+        "best_time":       best_time,
+        "outreach_angle":  outreach_angle,
+    }
+
+
+async def _quick_llm(system: str, user: str, max_tokens: int = 2000) -> str:
+    """Lightweight LLM call for view-endpoint AI generation. WB LLM → HuggingFace fallback."""
+    import httpx as _httpx
+    errors = []
+    wb_host = svc._wb_llm_host()
+    wb_key  = svc._wb_llm_key()
+    if wb_host and wb_key:
+        try:
+            async with _httpx.AsyncClient(timeout=60) as c:
+                r = await c.post(
+                    f"{wb_host.rstrip('/')}/v1/chat/completions",
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {wb_key}"},
+                    json={"model": svc._wb_llm_model(),
+                          "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                          "temperature": 0.35, "max_tokens": max_tokens},
+                )
+                if r.is_success:
+                    return r.json()["choices"][0]["message"]["content"].strip()
+                errors.append(f"WB LLM: HTTP {r.status_code}")
+        except Exception as e:
+            errors.append(f"WB LLM: {e}")
+    hf_token = svc._hf_token()
+    if hf_token:
+        try:
+            async with _httpx.AsyncClient(timeout=60) as c:
+                r = await c.post(
+                    "https://router.huggingface.co/v1/chat/completions",
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {hf_token}"},
+                    json={"model": svc._hf_model(),
+                          "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                          "temperature": 0.35, "max_tokens": max_tokens},
+                )
+                if r.is_success:
+                    return r.json()["choices"][0]["message"]["content"].strip()
+                try:
+                    body_txt = r.json().get("error", {}).get("message") or r.text
+                except Exception:
+                    body_txt = r.text
+                errors.append(f"HuggingFace: HTTP {r.status_code}: {body_txt}")
+        except Exception as e:
+            errors.append(f"HuggingFace: {e}")
+    raise RuntimeError(" | ".join(errors) if errors else "No LLM provider configured.")
+
+
+class ViewEmailRequest(BaseModel):
+    leadenrich_id: str
+    system_prompt: Optional[str] = None
+
+
+class ViewOutreachRequest(BaseModel):
+    leadenrich_id: Optional[str] = None
+    lead_data:     Optional[dict] = None   # Full ai_information object — used when leadenrich_id is absent/not found
+    system_prompt: Optional[str] = None
+
+
+class ViewCompanyRequest(BaseModel):
+    leadenrich_id: Optional[str] = None          # Lead ID from bulk enrichment results
+    company_linkedin_url: Optional[str] = None   # Direct company LinkedIn URL
+    system_prompt: Optional[str] = None
+    include_raw: bool = False                    # True bhejo to brightdata raw data bhi response mein aayega
+
+    @field_validator("company_linkedin_url")
+    @classmethod
+    def validate_company_url(cls, v):
+        if v is None:
+            return v
+        v = v.strip()
+        if "/company/" not in v:
+            raise ValueError("company_linkedin_url must be a LinkedIn company URL (must contain /company/)")
+        return v
+
+
+def _parse_json_field(lead: dict, key: str, default):
+    """Safely parse a JSON string field from a lead row."""
+    raw = lead.get(key)
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except Exception:
+        return default
+
+
+def _get_full_data(lead: dict) -> dict:
+    return _parse_json_field(lead, "full_data", {})
+
+
+def _build_outreach_lead_ctx(lead: dict) -> str:
+    """
+    Build a structured, signal-rich lead context string for the outreach LLM call.
+    Works generically for any lead — DB row or inline lead_data.
+    Only includes fields that have actual values, so the LLM sees real signals
+    not empty placeholders.
+    """
+    sections: list[str] = []
+
+    # ── Identity ──────────────────────────────────────────────────────────────
+    identity_parts = []
+    if lead.get("name"):         identity_parts.append(f"Name: {lead['name']}")
+    if lead.get("title"):        identity_parts.append(f"Title: {lead['title']}")
+    if lead.get("company"):      identity_parts.append(f"Company: {lead['company']}")
+    if lead.get("seniority_level"): identity_parts.append(f"Seniority: {lead['seniority_level']}")
+    if lead.get("location"):     identity_parts.append(f"Location: {lead['location']}")
+    elif lead.get("city") or lead.get("country"):
+        identity_parts.append(f"Location: {', '.join(filter(None, [lead.get('city',''), lead.get('country','')]))}")
+    if lead.get("followers"):    identity_parts.append(f"Followers: {lead['followers']}")
+    if lead.get("connections"):  identity_parts.append(f"Connections: {lead['connections']}")
+    if identity_parts:
+        sections.append("## Lead Identity\n" + " | ".join(identity_parts))
+
+    # ── About ─────────────────────────────────────────────────────────────────
+    about = str(lead.get("about") or "").strip()
+    if about:
+        sections.append(f"## About\n{about[:400]}")
+
+    # ── Career History ────────────────────────────────────────────────────────
+    career = lead.get("career_history") or []
+    if career:
+        career_lines = [
+            f"- {c.get('title','')} at {c.get('company','')}"
+            for c in career[:4] if c.get("title") or c.get("company")
+        ]
+        if career_lines:
+            sections.append("## Career History\n" + "\n".join(career_lines))
+
+    # ── Scores & Signals ──────────────────────────────────────────────────────
+    signal_parts = []
+    if lead.get("score_tier"):   signal_parts.append(f"Score tier: {lead['score_tier']}")
+    if lead.get("lead_score"):   signal_parts.append(f"Score: {lead['lead_score']}")
+    if lead.get("warm_signal") and str(lead["warm_signal"]).lower() not in ("none", "no warm signal detected", "false", ""):
+        signal_parts.append(f"Warm signal: {lead['warm_signal']}")
+    if lead.get("industry"):     signal_parts.append(f"Industry: {lead['industry']}")
+    tags = lead.get("tags") or []
+    if tags:                     signal_parts.append(f"Tags: {', '.join(tags)}")
+    if signal_parts:
+        sections.append("## Signals\n" + " | ".join(signal_parts))
+
+    # ── Behavioural Context ───────────────────────────────────────────────────
+    behaviour_parts = []
+    if lead.get("engages_with"):       behaviour_parts.append(f"Engages with: {lead['engages_with']}")
+    if lead.get("decision_pattern"):   behaviour_parts.append(f"Decision pattern: {lead['decision_pattern']}")
+    if lead.get("communication_style"): behaviour_parts.append(f"Communication style: {lead['communication_style']}")
+    # Also try pulling from behavioural_signals dict if present
+    bs = lead.get("behavioural_signals") or {}
+    if isinstance(bs, str):
+        try: bs = json.loads(bs)
+        except Exception: bs = {}
+    if isinstance(bs, dict):
+        if not lead.get("engages_with") and bs.get("engages_with"):
+            behaviour_parts.append(f"Engages with: {bs['engages_with']}")
+        if not lead.get("decision_pattern") and bs.get("decision_pattern"):
+            behaviour_parts.append(f"Decision pattern: {bs['decision_pattern']}")
+        if bs.get("pain_point_hint"):
+            behaviour_parts.append(f"Pain hint: {bs['pain_point_hint']}")
+    if behaviour_parts:
+        sections.append("## Behavioural Context\n" + " | ".join(behaviour_parts))
+
+    # ── Pitch Intelligence ────────────────────────────────────────────────────
+    pitch = lead.get("pitch_intelligence") or {}
+    if isinstance(pitch, str):
+        # Could be a pre-formatted string (from _lead_from_ai_information) or raw JSON
+        try: pitch = json.loads(pitch)
+        except Exception:
+            if pitch.strip():
+                sections.append(f"## Pitch Intelligence\n{pitch[:500]}")
+            pitch = {}
+    if isinstance(pitch, dict) and pitch:
+        pitch_parts = []
+        if pitch.get("best_angle"):        pitch_parts.append(f"Best angle: {pitch['best_angle']}")
+        if pitch.get("top_pain_point"):    pitch_parts.append(f"Top pain: {pitch['top_pain_point']}")
+        if pitch.get("best_value_prop"):   pitch_parts.append(f"Value prop: {pitch['best_value_prop']}")
+        if pitch.get("suggested_cta"):     pitch_parts.append(f"Suggested CTA: {pitch['suggested_cta']}")
+        if pitch.get("do_not_pitch"):
+            dnp = pitch["do_not_pitch"]
+            pitch_parts.append(f"Do NOT pitch: {', '.join(dnp) if isinstance(dnp, list) else dnp}")
+        if pitch_parts:
+            sections.append("## Pitch Intelligence\n" + " | ".join(pitch_parts))
+
+    # ── Real LinkedIn Posts ───────────────────────────────────────────────────
+    # Pull from whichever field has data — DB leads use linkedin_posts, inline leads use activity_feed
+    raw_posts = None
+    for field in ("linkedin_posts", "activity_feed"):
+        val = lead.get(field)
+        if val and str(val).strip() not in ("null", "[]", "{}"):
+            try:
+                parsed = json.loads(val) if isinstance(val, str) else val
+                if isinstance(parsed, list) and parsed:
+                    raw_posts = parsed
+                    break
+            except Exception:
+                pass
+
+    if raw_posts:
+        post_lines = []
+        for p in raw_posts[:4]:  # top 4 posts max
+            if not isinstance(p, dict):
+                continue
+            text = (p.get("text") or p.get("title") or p.get("content") or "").strip()
+            date = p.get("date") or p.get("published_at") or ""
+            likes = p.get("likes") or p.get("num_likes") or ""
+            if text:
+                snippet = text[:200] + ("..." if len(text) > 200 else "")
+                meta = " | ".join(filter(None, [date[:10] if date else "", f"{likes} likes" if likes else ""]))
+                post_lines.append(f'- "{snippet}"' + (f" ({meta})" if meta else ""))
+        if post_lines:
+            sections.append("## Recent LinkedIn Posts (real signals — use these)\n" + "\n".join(post_lines))
+
+    return "\n\n".join(sections)
+
+
+def _lead_from_ai_information(data: dict) -> dict:
+    """
+    Map a full ai_information payload (as returned by the enrichment API)
+    to the flat lead dict format used internally by outreach logic.
+    """
+    identity   = data.get("identity") or {}
+    profile    = identity.get("profile") or {}
+    scores     = data.get("scores") or {}
+    breakdown  = scores.get("breakdown") or {}
+    activity   = data.get("activity") or {}
+    pitch      = data.get("pitch_intelligence") or {}
+    behaviour  = data.get("behavioural_signals") or {}
+    contact    = data.get("contact") or {}
+    tags       = data.get("tags") or []
+
+    # Build location string
+    city    = profile.get("city") or identity.get("location") or ""
+    country = profile.get("country") or identity.get("country") or ""
+    location = ", ".join(filter(None, [city, country]))
+
+    # Summarise recent LinkedIn activity for LLM context
+    feed = activity.get("feed") or []
+    activity_summary = "; ".join(
+        item.get("title", "")[:120] for item in feed[:5] if item.get("title")
+    )
+
+    # Map posts from activity object — preserves real post text for LLM
+    posts_raw = activity.get("posts") or activity.get("linkedin_posts") or []
+    linkedin_posts_json = json.dumps(posts_raw) if posts_raw else None
+
+    # Pitch intelligence as a readable string
+    pitch_str = (
+        f"Best angle: {pitch.get('best_angle','')} | "
+        f"Top pain point: {pitch.get('top_pain_point','')} | "
+        f"Best value prop: {pitch.get('best_value_prop','')} | "
+        f"Suggested CTA: {pitch.get('suggested_cta','')} | "
+        f"Do not pitch: {', '.join(pitch.get('do_not_pitch') or [])}"
+    )
+
+    return {
+        "id":                data.get("lead_id") or identity.get("lead_id"),
+        "name":              identity.get("name") or profile.get("full_name"),
+        "title":             identity.get("title") or profile.get("current_title"),
+        "company":           identity.get("company"),
+        "industry":          profile.get("department") or (tags[0] if tags else ""),
+        "location":          location,
+        "linkedin_url":      identity.get("linkedin_url") or data.get("linkedin_url"),
+        "score_tier":        scores.get("score_tier") or breakdown.get("score_tier"),
+        "lead_score":        scores.get("total_score") or scores.get("combined_score"),
+        "warm_signal":       activity.get("warm_signal") or behaviour.get("warm_signal"),
+        "pitch_intelligence": pitch_str,
+        "about":             identity.get("about") or profile.get("about"),
+        "followers":         identity.get("followers"),
+        "connections":       identity.get("connections"),
+        "career_history":    profile.get("career_history") or [],
+        "top_skills":        profile.get("top_skills") or [],
+        "tags":              tags,
+        "behavioural_signals": behaviour,
+        "recent_activity":   activity_summary,
+        "linkedin_posts":    linkedin_posts_json,
+        "activity_feed":     json.dumps(feed[:10]) if feed else None,
+        "email":             contact.get("work_email") or contact.get("email"),
+        "seniority_level":   profile.get("seniority_level"),
+        "decision_pattern":  behaviour.get("decision_pattern"),
+        "communication_style": behaviour.get("communication_style"),
+        "engages_with":      behaviour.get("engages_with"),
+        # no stored outreach — will be generated from system_prompt
+        "cold_email":        None,
+        "email_subject":     None,
+        "linkedin_note":     None,
+        "best_channel":      None,
+        "outreach_angle":    None,
+        "best_send_time":    None,
+        "outreach_sequence": None,
+    }
+
+
+async def _resolve_lead(leadenrich_id: str) -> dict:
+    """
+    Resolve a lead by its leadenrich_id (returned from bulk job results / Ably events).
+    Checks Redis cache (30 min TTL) before hitting the DB.
+    Raises 400 if id is missing, 404 if not found in DB.
+    """
+    if not leadenrich_id:
+        raise HTTPException(
+            status_code=400,
+            detail="leadenrich_id is required. Get it from bulk job results or real-time Ably events.",
+        )
+    cached = await _lead_cache_get(leadenrich_id)
+    if cached:
+        return cached
+    lead = await svc.get_lead(leadenrich_id)
+    if not lead:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Lead not found: {leadenrich_id}. Make sure bulk enrichment has completed for this lead.",
+        )
+    await _lead_cache_set(leadenrich_id, lead)
+    return lead
+
+
+# ── 1. LinkedIn Enrichment ────────────────────────────────────────────────────
+
+_linkedin_enrich_router = APIRouter(
+    prefix="/leads",
+    tags=["LinkedIn Enrichment"],
+)
+
+_LINKEDIN_DESC = """
+Returns the full LinkedIn-sourced enrichment for a person, structured into 8 sections.
+
+**How to call:**
+Pass the same LinkedIn URL you submitted to the bulk API:
+```
+GET /api/leads/view/linkedin?url=https://www.linkedin.com/in/johndoe
+```
+Or use the internal `lead_id` returned in job results:
+```
+GET /api/leads/view/linkedin?lead_id=abc123def456
+```
+
+**Sections returned:**
+- **identity** — Name, title, company, location, about, followers, connections, skills
+- **contact** — Work email, phone, source, confidence, verified, bounce_risk
+- **scores** — Total score, ICP / intent / timing, tier, completeness, reasons
+- **icp_match** — ICP fit score, product category, match detail
+- **behavioural_signals** — Buying signals, engagement patterns, intent level
+- **pitch_intelligence** — Primary pitch, pain points, value propositions
+- **activity** — Recent posts, warm signal, hiring signals, activity feed
+- **tags** — Auto-generated persona and topic tags
+"""
+
+
+@_linkedin_enrich_router.get(
+    "/view/linkedin",
+    summary="LinkedIn Enrichment",
+    description=_LINKEDIN_DESC,
+)
+async def linkedin_enrichment(
+    leadenrich_id: str = Query(..., description="Lead ID returned from bulk enrichment job results"),
+):
+    lead = await _resolve_lead(leadenrich_id)
+    return svc._format_linkedin_enrich(lead)
+
+
+# ── 2. Email Enrichment — moved to email_lead_enrichment/email_enrichment_routes.py ──
+from Lead_enrichment.email_lead_enrichment.email_enrichment_routes import router as _email_enrich_router
+
+
+# ── Default outreach system prompt (universal — used when tenant passes no system_prompt) ──────
+_DEFAULT_OUTREACH_SYSTEM = (
+    "You are a senior B2B SDR writing cold outreach on behalf of the sender's company.\n\n"
+
+    "WHAT TO WRITE:\n"
+    "1. Email subject — curiosity-driven, under 8 words, no spam triggers, no company names.\n"
+    "2. Cold email body — exactly 3 paragraphs, under 150 words total:\n"
+    "   Para 1 — SPECIFIC HOOK: Reference something real and specific about the lead — "
+    "their company's focus, a recent LinkedIn post they wrote, their career move, or their stated pain point. "
+    "This must NOT be something that applies to every CEO or every company. "
+    "If LinkedIn posts are provided, use a concrete detail from one of them.\n"
+    "   Para 2 — VALUE BRIDGE: State the one problem you solve that is most relevant to this specific lead. "
+    "Give one concrete business outcome — not 'save time' or 'boost efficiency', "
+    "but a real result tied to their context (e.g. 'close the pipeline gap without adding headcount').\n"
+    "   Para 3 — DISCOVERY CTA: Ask one smart question tied to their specific situation. "
+    "It must feel like it comes from someone who already understands their world — not 'what are your biggest challenges?'.\n"
+    "3. LinkedIn note — under 300 chars, references something real about the lead, conversational, zero pitch.\n"
+    "4. Best channel: Email / LinkedIn / Phone — based on the lead's seniority and activity.\n"
+    "5. Best send time — in the lead's local timezone, specific day + time.\n"
+    "6. Primary outreach angle: Pain-based / Trigger / Insight.\n\n"
+
+    "STRICT RULES:\n"
+    "- Never use: 'I hope this finds you well', 'reaching out because', 'I noticed', 'synergy', "
+    "'game-changer', 'innovative solution', 'I came across your profile', 'one outcome is', "
+    "'automate manual work', or any phrase that sounds AI-generated.\n"
+    "- Never fabricate statistics or percentages — only state outcomes you can logically infer.\n"
+    "- If no LinkedIn posts are available, anchor Para 1 in the lead's role, company, or career history.\n"
+    "- Keep the tone direct, human, and professional — like a message from a smart colleague, not a salesperson.\n\n"
+
+    "Return ONLY a valid JSON object — no markdown, no explanation:\n"
+    "{\"cold_email\": {\"subject\": \"...\", \"body\": \"...\"}, "
+    "\"linkedin_note\": \"...\", \"best_channel\": \"...\", \"best_time\": \"...\", \"outreach_angle\": \"...\"}"
+)
+
+
+# ── 3. Outreach Enrichment ────────────────────────────────────────────────────
+
+_outreach_enrich_router = APIRouter(
+    prefix="/leads",
+    tags=["Outreach Enrichment"],
+)
+
+_OUTREACH_DESC = """
+Returns AI-generated outreach assets for a lead.
+
+**How to call:**
+```
+POST /api/leads/view/outreach
+Content-Type: application/json
+
+{ "leadenrich_id": "abc123def456", "system_prompt": "..." }
+```
+`system_prompt` is optional — omit it to get stored outreach data only.
+When provided, fresh outreach copy is generated live and returned in `ai_generated.outreach`.
+
+**Fields returned:**
+- **cold_email** — Personalised cold email (subject + body)
+- **linkedin_note** — Short LinkedIn connection message
+- **sequence** — Multi-step follow-up sequence
+- **best_time** — Recommended send time based on activity
+- **warm_signal** — Latest warm engagement signal
+- **best_channel** — Recommended outreach channel
+- **outreach_angle** — Primary pitch angle
+- **ai_generated** — Present only when `system_prompt` is supplied
+"""
+
+
+@_outreach_enrich_router.post(
+    "/view/outreach",
+    summary="Outreach Enrichment",
+    description=_OUTREACH_DESC,
+)
+async def outreach_enrichment(body: ViewOutreachRequest):
+    if not body.leadenrich_id and not body.lead_data:
+        raise HTTPException(400, "Provide either leadenrich_id or lead_data.")
+
+    # Resolve lead — prefer DB lookup, fall back to inline lead_data
+    lead = None
+    if body.leadenrich_id:
+        try:
+            lead = await _resolve_lead(body.leadenrich_id)
+        except HTTPException:
+            pass  # not found — will try lead_data below
+
+    if lead is None:
+        if not body.lead_data:
+            raise HTTPException(404, f"Lead not found: {body.leadenrich_id}. Provide lead_data as a fallback.")
+        lead = _lead_from_ai_information(body.lead_data)
+
+    system_prompt = body.system_prompt or _DEFAULT_OUTREACH_SYSTEM
+
+    # Always call LLM to generate fresh outreach
+    ai_outreach = None
+    try:
+        lead_ctx = _build_outreach_lead_ctx(lead)
+        raw = await _quick_llm(
+            system_prompt,
+            f"Generate personalised B2B outreach for this lead.\n\n{lead_ctx}\n\n"
+            "Return ONLY a valid JSON object — no explanation, no markdown — with this exact schema: "
+            "{\"cold_email\": {\"subject\": \"...\", \"body\": \"...\"}, "
+            "\"linkedin_note\": \"...\", \"best_channel\": \"...\", \"best_time\": \"...\", \"outreach_angle\": \"...\"}",
+            max_tokens=2000,
+        )
+        try:
+            # Strip markdown fences if present
+            cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            # If LLM added text before/after the JSON block, extract the first {...} object
+            import re as _re
+            _match = _re.search(r'\{[\s\S]*\}', cleaned)
+            if _match:
+                cleaned = _match.group(0)
+            ai_outreach = json.loads(cleaned)
+        except Exception as _je:
+            logger.warning("[OutreachView] JSON parse failed: %s | raw=%s", _je, raw[:300])
+            ai_outreach = None
+    except Exception as _e:
+        logger.warning("[OutreachView] AI generation failed: %s", _e)
+
+    # Save generated outreach back to DB if lead has an ID
+    if ai_outreach and lead.get("id"):
+        ai_email = ai_outreach.get("cold_email") or {}
+        try:
+            async with _get_pool().acquire() as _conn:
+                await _conn.execute(
+                    "UPDATE enriched_leads SET email_subject=$1, cold_email=$2, linkedin_note=$3 WHERE id=$4",
+                    ai_email.get("subject", ""),
+                    ai_email.get("body", ""),
+                    ai_outreach.get("linkedin_note", ""),
+                    lead["id"],
+                )
+        except Exception as _e:
+            logger.warning("[OutreachView] DB update failed for lead=%s: %s", lead.get("id"), _e)
+
+    # Build response from generated outreach
+    if ai_outreach:
+        ai_email = ai_outreach.get("cold_email") or {}
+        ai_body = ai_email.get("body", "")
+        cold_email_block = {
+            "subject":    ai_email.get("subject", ""),
+            "greeting":   "",
+            "opening":    "",
+            "body":       ai_body,
+            "cta":        "",
+            "sign_off":   "",
+            "full_email": ai_body,
+        }
+        linkedin_note_val = ai_outreach.get("linkedin_note", "")
+    else:
+        # LLM failed — fall back to stored DB values
+        full = _get_full_data(lead)
+        outreach_data = full.get("outreach") or {}
+        _stored_body = lead.get("cold_email") or outreach_data.get("cold_email") or ""
+        cold_email_block = {
+            "subject":    lead.get("email_subject") or outreach_data.get("email_subject") or "",
+            "greeting":   "",
+            "opening":    "",
+            "body":       _stored_body,
+            "cta":        "",
+            "sign_off":   "",
+            "full_email": _stored_body,
+        }
+        linkedin_note_val = lead.get("linkedin_note") or outreach_data.get("linkedin_note") or ""
+
+    full = _get_full_data(lead)
+    outreach_data = full.get("outreach") or {}
+
+    return {
+        "lead_id":      lead.get("id"),
+        "linkedin_url": lead.get("linkedin_url"),
+        "name":         lead.get("name"),
+        "title":        lead.get("title"),
+        "company":      lead.get("company"),
+        "score_tier":   lead.get("score_tier"),
+
+        "cold_email":     cold_email_block,
+        "linkedin_note":  linkedin_note_val,
+        "follow_up":      {"day3": "", "day7": ""},
+
+        "sequence":       _parse_json_field(lead, "outreach_sequence", {}),
+        "best_time":      (ai_outreach.get("best_time") if ai_outreach else None) or outreach_data.get("best_time") or lead.get("best_send_time"),
+        "best_channel":   (ai_outreach.get("best_channel") if ai_outreach else None) or lead.get("best_channel"),
+        "outreach_angle": (ai_outreach.get("outreach_angle") if ai_outreach else None) or lead.get("outreach_angle"),
+        "warm_signal":    lead.get("warm_signal"),
+
+        "ai_generated":   {"outreach": ai_outreach} if ai_outreach else None,
+    }
+
+
+# ── 4. Company Enrichment ─────────────────────────────────────────────────────
+
+_company_enrich_router = APIRouter(
+    prefix="/leads",
+    tags=["Company Enrichment"],
+)
+
+_COMPANY_DESC = """
+You are an expert B2B CRM data analyst. Your job is to enrich raw company data
+from LinkedIn into a fully structured, CRM-ready profile.
+
+You must return ONLY a valid JSON object — no markdown, no explanation, no preamble.
+Follow the exact schema provided. Infer and derive fields intelligently from the data.
+""".strip()
+
+# ── USER PROMPT ────────────────────────────────────────────────────────────────
+def build_prompt(raw_json: str) -> str:
+    return f"""
+Enrich the following LinkedIn company data into a complete CRM profile.
+
+RAW DATA:
+{raw_json}
+
+Return a JSON object with EXACTLY this schema:
+
+{{
+  "company_identity": {{
+    "legal_name": "",
+    "brand_name": "",
+    "tagline": "",
+    "description_short": "",          // 1-sentence, professional tone
+    "description_long": "",           // 3-5 sentences, for CRM about section
+    "founded_year": 0,
+    "company_stage": "",              // Startup / Growth / Mature / Enterprise
+    "organization_type": "",
+    "industry_primary": "",
+    "industry_secondary": [],
+    "hq_city": "",
+    "hq_state": "",
+    "hq_country": "",
+    "hq_full_address": "",
+    "office_locations": [],
+    "global_reach": true,
+    "website": "",
+    "linkedin_url": "",
+    "crunchbase_url": ""
+  }},
+
+  "tags": [],                          // 8-12 broad CRM tags e.g. "SaaS", "B2B", "IT Services"
+
+  "tech_tags": [],                     // 10-15 specific tech tags e.g. "Blockchain", "React Native"
+
+  "services": [
+    {{
+      "name": "",
+      "category": "",                  // e.g. "Development", "Marketing", "Consulting"
+      "description": "",
+      "target_audience": ""
+    }}
+  ],
+
+  "key_people": [
+    {{
+      "name": "",
+      "title": "",
+      "seniority": "",                 // C-Suite / VP / Manager / Individual Contributor
+      "department": "",
+      "linkedin_url": "",
+      "is_decision_maker": false,
+      "contact_confidence": ""        // High / Medium / Low
+    }}
+  ],
+
+  "contact_info": {{
+    "primary_email": "",
+    "emails": [],
+    "phone_primary": "",
+    "phones": [],
+    "whatsapp": "",
+    "preferred_contact_channel": ""
+  }},
+
+  "financials": {{
+    "funding_status": "",             // Bootstrapped / Seed / Series A / etc.
+    "total_funding_usd": 0,
+    "last_round_type": "",
+    "last_round_date": "",
+    "last_round_amount_usd": 0,
+    "revenue_range": "",              // e.g. "$1M-$5M" — infer from size/stage
+    "employee_count_linkedin": 0,
+    "employee_count_range": ""
+  }},
+
+  "social_presence": {{
+    "linkedin_followers": 0,
+    "linkedin_engagement_avg": "",    // Low / Medium / High — from post likes
+    "posting_frequency": "",          // Active / Moderate / Inactive
+    "content_themes": [],             // e.g. "Team Culture", "Tech Insights", "Product"
+    "last_post_date": ""
+  }},
+
+  "activities": [
+    {{
+      "date": "",
+      "type": "",                     // Post / Event / Announcement / Award
+      "summary": "",
+      "engagement_score": 0,          // likes + comments
+      "sentiment": ""                 // Positive / Neutral / Promotional
+    }}
+  ],
+
+  "interests": [],                    // 8-10 topics the company cares about
+                                      // e.g. "AI/ML", "Startup Ecosystem", "Women in Tech"
+
+  "icp_fit": {{
+    "ideal_customer_profile": "",     // Who they typically sell to
+    "target_company_size": "",
+    "target_industries": [],
+    "target_geographies": [],
+    "deal_type": ""                   // Project-based / Retainer / SaaS / Mixed
+  }},
+
+  "competitive_intelligence": {{
+    "direct_competitors": [],
+    "market_position": "",            // Niche / Mid-Market / Enterprise
+    "differentiators": [],
+    "weaknesses_inferred": []         // inferred from data gaps or signals
+  }},
+
+  "crm_metadata": {{
+    "lead_score": 0,                  // 0–100, based on activity, size, funding
+    "lead_temperature": "",           // Hot / Warm / Cold
+    "outreach_priority": "",          // High / Medium / Low
+    "best_outreach_time": "",         // inferred from post timing
+    "recommended_first_message": "",  // 1–2 sentence icebreaker for outreach
+    "crm_tags": [],
+    "data_source": "LinkedIn",
+    "data_scraped_at": "",
+    "enrichment_confidence": ""       // High / Medium / Low
+  }}
+}}"""
+
+
+# Per-company locks for deduplication: same company ke concurrent requests
+# pehli request kaam karti hai, baaki wait karke cache se return leti hain
+_company_locks: dict = {}       # company_id → asyncio.Lock
+_company_locks_ref: dict = {}   # company_id → waiter count
+
+# Outreach LLM concurrency cap — prevents 1000 simultaneous LLM calls from
+# exhausting HF quotas. Requests above this limit queue in the event loop.
+_OUTREACH_CONCURRENCY = int(os.getenv("OUTREACH_CONCURRENCY", "30"))
+_outreach_sem: asyncio.Semaphore = asyncio.Semaphore(_OUTREACH_CONCURRENCY)
+
+
+async def _do_company_enrichment(
+    company_linkedin: str, lead: Optional[dict], org_id: str
+) -> dict:
+    """Full enrichment pipeline: BrightData scrape → LLM → DB save. Returns result dict."""
+    from Lead_enrichment.company_lead_enrichment import company_service as cs
+    from datetime import datetime, timezone
+
+    # Step 1: BrightData scrape
+    bd_data = await cs._fetch_bd_company_profile(company_linkedin)
+    if not bd_data:
+        raise ValueError("BrightData returned no data for this company LinkedIn URL")
+
+    # Step 2: Apollo raw from DB (read previously saved data — no live Apollo API call)
+    apollo_raw: dict = {}
+    if lead and lead.get("id"):
+        try:
+            from db import get_pool
+            async with get_pool().acquire() as _conn:
+                _row = await _conn.fetchrow(
+                    "SELECT apollo_raw FROM enriched_leads WHERE id=$1 AND apollo_raw IS NOT NULL LIMIT 1",
+                    lead["id"],
+                )
+            if _row and _row["apollo_raw"]:
+                _parsed = json.loads(_row["apollo_raw"]) if isinstance(_row["apollo_raw"], str) else _row["apollo_raw"]
+                if isinstance(_parsed, dict):
+                    apollo_raw = _parsed
+        except Exception:
+            pass
+
+    # Step 3: LLM enrichment
+    crm_brief: Optional[dict] = None
+    try:
+        crm_brief = await svc._enrich_company_with_llm(
+            bd_data, apollo_raw,
+            bd_data.get("name") or (lead.get("company") if lead else "") or ""
+        )
+    except Exception as _e:
+        logger.warning("[ViewCompany] LLM failed: %s", _e)
+
+    # Step 4: Save to DB
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        record = {
+            "id":                   cs._company_id(company_linkedin),
+            "company_linkedin_url": company_linkedin,
+            "org_id":               org_id,
+            "raw_data":             json.dumps(bd_data, default=str),
+            "apollo_raw":           json.dumps(apollo_raw, default=str) if apollo_raw else None,
+            "crm_brief":            json.dumps(crm_brief, default=str) if crm_brief else None,
+            "last_enriched_at":     now,
+            "updated_at":           now,
+        }
+        cs._map_bd_company_profile(bd_data, record)
+        await cs._upsert_company(record)
+    except Exception as _e:
+        logger.warning("[ViewCompany] DB save failed: %s", _e)
+
+    return {
+        "lead_id":          lead.get("id") if lead else None,
+        "linkedin_url":     lead.get("linkedin_url") if lead else None,
+        "company_linkedin": company_linkedin,
+        "brightdata":       bd_data,
+        "apollo_raw":       apollo_raw,
+        "crm_brief":        crm_brief,
+        "cached":           False,
+    }
+
+
+@_company_enrich_router.post(
+    "/view/company",
+    summary="Company Enrichment",
+    description=_COMPANY_DESC,
+)
+async def company_enrichment(body: ViewCompanyRequest):
+    from Lead_enrichment.company_lead_enrichment import company_service as cs
+
+    if not body.leadenrich_id and not body.company_linkedin_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either leadenrich_id or company_linkedin_url.",
+        )
+
+    # ── Resolve company LinkedIn URL ─────────────────────────────────────────
+    lead: Optional[dict] = None
+    if body.leadenrich_id:
+        # Always fetch fresh from DB — Redis cache may lack raw_brightdata / apollo_raw
+        lead = await svc.get_lead(body.leadenrich_id)
+        if not lead:
+            raise HTTPException(status_code=404, detail=f"Lead not found: {body.leadenrich_id}")
+
+        company_linkedin = lead.get("company_linkedin") or ""
+
+        # Always parse raw_brightdata once — used in fallbacks + warning log
+        raw_bd = lead.get("raw_brightdata") or {}
+        if isinstance(raw_bd, str):
+            try:
+                raw_bd = json.loads(raw_bd)
+            except Exception:
+                raw_bd = {}
+
+        if not company_linkedin:
+            # ── Fallback 1: raw_brightdata — try all known BD field names ─────
+            for _bd_field in ("current_company_link", "company_linkedin_url", "company_url", "linkedin"):
+                _val = (raw_bd.get(_bd_field) or "").strip()
+                if _val:
+                    if "linkedin.com/company/" in _val:
+                        company_linkedin = _val
+                        break
+                    # BD sometimes returns just the company_id — construct URL
+                    elif _val and "/" not in _val and len(_val) < 80:
+                        company_linkedin = f"https://www.linkedin.com/company/{_val}/"
+                        break
+
+            # BD may store company_id as a separate field
+            if not company_linkedin:
+                _co_id = (raw_bd.get("current_company_company_id") or raw_bd.get("company_id") or "").strip()
+                if _co_id:
+                    company_linkedin = f"https://www.linkedin.com/company/{_co_id}/"
+
+            # BD experience[0] fallback
+            if not company_linkedin:
+                _exp = raw_bd.get("experience") or []
+                if _exp and isinstance(_exp[0], dict):
+                    _e0 = _exp[0]
+                    for _ef in ("url", "company_url", "linkedin_url", "company_linkedin_url"):
+                        _v = (_e0.get(_ef) or "").strip()
+                        if _v and "linkedin.com/company/" in _v:
+                            company_linkedin = _v
+                            break
+                    if not company_linkedin:
+                        _eid = (_e0.get("company_id") or _e0.get("linkedin_company_id") or
+                                _e0.get("company_linkedin_id") or "").strip()
+                        if _eid:
+                            company_linkedin = f"https://www.linkedin.com/company/{_eid}/"
+
+        if not company_linkedin:
+            # ── Fallback 2: apollo_raw organization.linkedin_url ──────────────
+            apollo_raw_str = lead.get("apollo_raw")
+            if apollo_raw_str:
+                try:
+                    apollo_raw_data = json.loads(apollo_raw_str) if isinstance(apollo_raw_str, str) else apollo_raw_str
+                    org = apollo_raw_data.get("organization") or {}
+                    _ap = (org.get("linkedin_url") or "").strip()
+                    if _ap:
+                        if "linkedin.com/company/" in _ap:
+                            company_linkedin = _ap
+                        elif "/" not in _ap and _ap:
+                            company_linkedin = f"https://www.linkedin.com/company/{_ap}/"
+                except Exception:
+                    pass
+
+        if not company_linkedin:
+            # ── Fallback 3: linkedin_enrich company_identity.linkedin_url ─────
+            _li_enrich = lead.get("linkedin_enrich") or {}
+            if isinstance(_li_enrich, str):
+                try:
+                    _li_enrich = json.loads(_li_enrich)
+                except Exception:
+                    _li_enrich = {}
+            _ci_url = ((_li_enrich.get("company_identity") or {}).get("linkedin_url") or "").strip()
+            if _ci_url and "linkedin.com/company/" in _ci_url:
+                company_linkedin = _ci_url
+
+        if not company_linkedin:
+            # ── Fallback 4: full_data ──────────────────────────────────────────
+            _full = lead.get("full_data") or {}
+            if isinstance(_full, str):
+                try:
+                    _full = json.loads(_full)
+                except Exception:
+                    _full = {}
+            for _path in [
+                (_full.get("company_identity") or {}).get("linkedin_url"),
+                (_full.get("company_profile") or {}).get("linkedin_url"),
+            ]:
+                if _path and "linkedin.com/company/" in str(_path):
+                    company_linkedin = str(_path)
+                    break
+
+        if not company_linkedin:
+            # ── Last resort: log what we have so caller can debug ─────────────
+            logger.warning(
+                "[ViewCompany] No company_linkedin for lead %s  "
+                "raw_bd_keys=%s  apollo_raw=%s  company=%s  website=%s",
+                body.leadenrich_id,
+                list(raw_bd.keys())[:10] if isinstance(raw_bd, dict) else "n/a",
+                bool(lead.get("apollo_raw")),
+                lead.get("company"),
+                lead.get("company_website"),
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"No company LinkedIn URL found for lead '{lead.get('name', body.leadenrich_id)}'. "
+                    f"Company: {lead.get('company') or 'unknown'}. "
+                    "Please pass company_linkedin_url directly in the request body."
+                ),
+            )
+
+        # Persist resolved URL — future calls will use company_linkedin directly
+        if company_linkedin and not lead.get("company_linkedin"):
+            try:
+                await svc._upsert_lead({"id": lead["id"], "company_linkedin": company_linkedin})
+                await _lead_cache_delete(body.leadenrich_id)  # invalidate stale cache
+            except Exception:
+                pass
+    else:
+        company_linkedin = body.company_linkedin_url
+        lead = None
+
+    org_id = lead.get("organization_id", "default") if lead else "default"
+
+    def _parse_json_field(val):
+        if isinstance(val, str):
+            try:
+                return json.loads(val)
+            except Exception:
+                return val
+        return val
+
+    # ── Cache check — return immediately if already enriched ─────────────────
+    try:
+        cached_company = await cs._get_company(company_linkedin, org_id)
+        if cached_company and cached_company.get("crm_brief"):
+            logger.info("[ViewCompany] Cache HIT for %s", company_linkedin)
+            resp = {
+                "success":          True,
+                "cached":           True,
+                "lead_id":          lead.get("id") if lead else None,
+                "linkedin_url":     lead.get("linkedin_url") if lead else None,
+                "company_linkedin": company_linkedin,
+                "crm_brief":        _parse_json_field(cached_company.get("crm_brief")),
+            }
+            if body.include_raw:
+                resp["brightdata"] = _parse_json_field(cached_company.get("raw_data")) or {}
+            return resp
+    except Exception as _ce:
+        logger.debug("[ViewCompany] Cache check failed: %s", _ce)
+
+    # ── Cache MISS — deduplicate concurrent requests via per-company lock ─────
+    # Same company ke multiple concurrent requests mein se sirf pehla kaam karta hai;
+    # baaki lock release hone ke baad cache se result lete hain.
+    company_id_key = cs._company_id(company_linkedin)
+    if company_id_key not in _company_locks:
+        _company_locks[company_id_key] = asyncio.Lock()
+    _company_locks_ref[company_id_key] = _company_locks_ref.get(company_id_key, 0) + 1
+    lock = _company_locks[company_id_key]
+
+    try:
+        async with lock:
+            # Re-check cache — pehli request ne kaam kar diya hoga
+            try:
+                cached_company = await cs._get_company(company_linkedin, org_id)
+                if cached_company and cached_company.get("crm_brief"):
+                    logger.info("[ViewCompany] Cache HIT (post-lock) for %s", company_linkedin)
+                    resp = {
+                        "success":          True,
+                        "cached":           True,
+                        "lead_id":          lead.get("id") if lead else None,
+                        "linkedin_url":     lead.get("linkedin_url") if lead else None,
+                        "company_linkedin": company_linkedin,
+                        "crm_brief":        _parse_json_field(cached_company.get("crm_brief")),
+                    }
+                    if body.include_raw:
+                        resp["brightdata"] = _parse_json_field(cached_company.get("raw_data")) or {}
+                    return resp
+            except Exception:
+                pass
+
+            # Pehli request — actual enrichment karo
+            logger.info("[ViewCompany] Starting enrichment for %s", company_linkedin)
+            try:
+                result = await asyncio.wait_for(
+                    _do_company_enrichment(company_linkedin, lead, org_id),
+                    timeout=150,
+                )
+                resp = {
+                    "success":          True,
+                    "cached":           False,
+                    "lead_id":          result.get("lead_id"),
+                    "linkedin_url":     result.get("linkedin_url"),
+                    "company_linkedin": result.get("company_linkedin"),
+                    "crm_brief":        result.get("crm_brief"),
+                }
+                if body.include_raw:
+                    resp["brightdata"] = result.get("brightdata") or {}
+                return resp
+            except asyncio.TimeoutError:
+                logger.error("[ViewCompany] Enrichment timed out for %s", company_linkedin)
+                return {
+                    "success": False,
+                    "error":   "Enrichment timed out (>150s). Please retry.",
+                    "company_linkedin": company_linkedin,
+                }
+            except Exception as _e:
+                logger.error("[ViewCompany] Enrichment failed for %s: %s", company_linkedin, _e)
+                return {
+                    "success": False,
+                    "error":   str(_e),
+                    "company_linkedin": company_linkedin,
+                }
+    finally:
+        _company_locks_ref[company_id_key] -= 1
+        if _company_locks_ref[company_id_key] == 0:
+            _company_locks.pop(company_id_key, None)
+            _company_locks_ref.pop(company_id_key, None)
+
+
+async def _enrich_company_with_ai(bd: dict) -> dict:
+    """
+    Pass raw BrightData company data to the LLM and generate lead-enrichment insights:
+    company summary, ICP fit, pain points, buying signals, intent signals, outreach angle.
+    """
+    now_iso = __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Build compact context from BD fields
+    posts_text = " | ".join(
+        p.get("text", "")[:200]
+        for p in (bd.get("updates") or bd.get("posts") or [])[:5]
+        if p.get("text")
+    )
+    similar = ", ".join(
+        s.get("title", "") for s in (bd.get("similar") or [])[:5] if s.get("title")
+    )
+    employees_sample = ", ".join(
+        e.get("title", "") for e in (bd.get("employees") or [])[:4] if e.get("title")
+    )
+    additional_info = str(bd.get("additional_information") or "")[:400]
+
+    context = f"""
+Company Name: {bd.get("name", "")}
+LinkedIn URL: {bd.get("url", "")}
+Industry: {bd.get("industries", "")}
+Organization Type: {bd.get("organization_type", "")}
+Company Size: {bd.get("company_size", "")}
+Employees on LinkedIn: {bd.get("employees_in_linkedin", "")}
+Headquarters: {bd.get("headquarters", "")}
+Founded: {bd.get("founded", "")}
+Website: {bd.get("website", "")}
+Followers: {bd.get("followers", "")}
+Slogan: {bd.get("slogan", "")}
+About: {str(bd.get("about") or bd.get("description") or "")[:600]}
+Recent Posts (sample): {posts_text[:600]}
+Similar Companies: {similar}
+Notable Employees: {employees_sample}
+Additional Info: {additional_info}
+""".strip()
+
+    system_prompt = (
+        "You are a B2B lead enrichment AI. Given raw LinkedIn company data from BrightData, "
+        "generate structured sales intelligence in JSON. Be concise and data-driven. "
+        "Return only valid JSON — no markdown, no explanation."
+    )
+
+    user_prompt = f"""Analyse this company as a B2B sales prospect and return JSON with these exact keys:
+
+{{
+  "company_summary": "2-3 sentence summary of what the company does and its market position",
+  "icp_fit": {{
+    "score": 0-100,
+    "tier": "HOT | WARM | COOL | COLD",
+    "explanation": "why this score"
+  }},
+  "pain_points": ["pain point 1", "pain point 2", "pain point 3"],
+  "buying_signals": ["signal 1", "signal 2"],
+  "intent_signals": {{
+    "hiring_activity": "what roles they are hiring — from additional_info/posts",
+    "recent_news": "any notable events from posts",
+    "growth_stage": "early / scaling / enterprise / government"
+  }},
+  "outreach": {{
+    "recommended_angle": "the best angle to approach this company",
+    "cold_email_subject": "subject line",
+    "cold_email_body": "max 100 words, personalised to their context",
+    "linkedin_note": "max 300 chars connection note"
+  }},
+  "tags": ["tag1", "tag2", "tag3", "tag4"],
+  "account_pitch": "one sentence pitch for this account"
+}}
+
+Company data:
+{context}
+
+Enrichment date: {now_iso}"""
+
+    try:
+        raw = await _quick_llm(system_prompt, user_prompt, max_tokens=2000)
+        # Parse JSON from response
+        m = __import__("re").search(r"\{.*\}", raw, __import__("re").DOTALL)
+        if m:
+            return json.loads(m.group())
+        return {"raw": raw}
+    except Exception as _e:
+        logger.warning("[ViewCompany] AI enrichment failed: %s", _e)
+        return {"error": str(_e)}
+
+
+async def _company_ai_analysis(lead: dict, full: dict, system_prompt: Optional[str]) -> Optional[dict]:
+    """Run LLM company analysis when caller provides a system_prompt."""
+    if not system_prompt or not lead.get("company"):
+        return None
+    try:
+        wi = full.get("website_intelligence") or {}
+        company_ctx = (
+            f"Company: {lead.get('company')} | Domain: {lead.get('company_domain','')} | "
+            f"Industry: {lead.get('industry','')} | Employees: {lead.get('employee_count','')} | "
+            f"Revenue: {lead.get('revenue','')} | Location: {lead.get('location','')} | "
+            f"Tech stack: {_parse_json_field(lead, 'wappalyzer_tech', [])} | "
+            f"Website summary: {str(wi)[:800]}"
+        )
+        result = await _quick_llm(
+            system_prompt,
+            f"Analyse this company as a potential sales prospect.\n\n{company_ctx}\n\n"
+            "Return JSON: {{\"fit_summary\": \"...\", \"key_pain_points\": [...], "
+            "\"buying_signals\": [...], \"recommended_approach\": \"...\", \"icp_score\": 0-100}}",
+            max_tokens=1500,
+        )
+        return {"company_analysis": result}
+    except Exception as _e:
+        logger.warning("[CompanyView] AI analysis failed: %s", _e)
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LIO Enrichment — system-prompt-driven AI analysis
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LioPromptRequest(BaseModel):
+    system_prompt: str
+    model: Optional[str] = None  # HF model override (e.g. "Qwen/Qwen2.5-7B-Instruct")
+
+
+class LioPromptsConfigRequest(BaseModel):
+    prompts: list  # List of 5 prompt config dicts
+
+
+class WorkspaceContextRequest(BaseModel):
+    product_name:      Optional[str] = None
+    value_proposition: Optional[str] = None
+    target_titles:     Optional[str] = None
+    tone:              Optional[str] = None
+    banned_phrases:    Optional[str] = None
+    case_study:        Optional[str] = None
+    cta_style:         Optional[str] = None
+
+
+class LioStageRequest(BaseModel):
+    stage_index: int                  # 0-6
+    context: dict = {}                # Accumulated results from previous stages
+                                      # Keys: company_intel, tags, signals, buying, pitch, outreach, score
+
+
+class LioContextBody(BaseModel):
+    system_prompt: str = ""
+    user_prompt: str = ""
+    brightdata_json: dict = {}
+    stage_idx: int = 0  # used to know which result key to save
+
+
+@router.get("/lio/prompt", include_in_schema=False)
+async def get_lio_prompt(request: Request):
+    """Get the saved LIO system prompt + model for this org."""
+    org_id = _get_org_id(request)
+    cfg = await cfg_svc.get_workspace_config(org_id)
+    return {
+        "system_prompt": cfg.get("lio_system_prompt", ""),
+        "model":         cfg.get("lio_model", ""),
+    }
+
+
+@router.post("/lio/prompt", include_in_schema=False)
+async def save_lio_prompt(body: LioPromptRequest, request: Request):
+    """Save the LIO system prompt (and optional model) for this org."""
+    org_id = _get_org_id(request)
+    updates = {"lio_system_prompt": body.system_prompt}
+    if body.model is not None:
+        updates["lio_model"] = body.model
+    await cfg_svc.save_workspace_config(org_id, updates)
+    return {"success": True}
+
+
+@router.get("/lio/config", include_in_schema=False)
+async def get_lio_config(request: Request):
+    """Get the 5 LIO prompt configurations for this org."""
+    org_id = _get_org_id(request)
+    prompts = await cfg_svc.get_lio_prompts(org_id)
+    return {"prompts": prompts}
+
+
+@router.put("/lio/config", include_in_schema=False)
+async def save_lio_config(body: LioPromptsConfigRequest, request: Request):
+    """Save the 5 LIO prompt configurations for this org."""
+    org_id = _get_org_id(request)
+    await cfg_svc.save_lio_prompts(org_id, body.prompts)
+    return {"success": True}
+
+
+@router.get("/lio/workspace", include_in_schema=False)
+async def get_lio_workspace(request: Request):
+    """Get workspace product context (product_name, value_prop, tone, etc.)."""
+    org_id = _get_org_id(request)
+    ctx = await cfg_svc.get_workspace_context(org_id)
+    return ctx
+
+
+@router.put("/lio/workspace", include_in_schema=False)
+async def save_lio_workspace(body: WorkspaceContextRequest, request: Request):
+    """Save workspace product context."""
+    org_id = _get_org_id(request)
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    existing = await cfg_svc.get_workspace_context(org_id)
+    existing.update(updates)
+    await cfg_svc.save_workspace_context(org_id, existing)
+    return {"success": True}
+
+
+@router.get("/lio/status", include_in_schema=False)
+async def get_lio_status(request: Request):
+    """
+    Return LIO provider status: which LLM providers have API keys configured,
+    and which LLM model is selected for LIO analysis.
+    """
+    org_id = _get_org_id(request)
+    wb_row    = await cfg_svc.get_tool_row(org_id, "wb_llm")
+    workspace = await cfg_svc.get_workspace_config(org_id)
+
+    wb_configured = bool(wb_row and wb_row.get("api_key") or wb_row and (wb_row.get("extra_config") or "{}") != "{}")
+    wb_enabled    = bool(wb_row and wb_row.get("is_enabled"))
+
+    hf_configured = bool(os.getenv("HF_TOKEN"))
+
+    if not wb_configured and os.getenv("WB_LLM_API_KEY"):
+        wb_configured = True
+        wb_enabled = True
+
+    return {
+        "wb_llm":          {"configured": wb_configured, "enabled": wb_enabled},
+        "huggingface":     {"configured": hf_configured, "enabled": hf_configured},
+        "active_provider": "wb_llm" if (wb_configured and wb_enabled) else ("huggingface" if hf_configured else None),
+        "lio_model":       workspace.get("lio_model", ""),
+    }
+
+
+@router.get("/lio/results/{lead_id}", include_in_schema=False)
+async def get_lio_results(lead_id: str, request: Request):
+    """Return persisted LIO stage results for a lead."""
+    lead = await svc.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    results = await svc.get_lead_lio_results(lead_id)
+    return {"lead_id": lead_id, "results": results}
+
+
+# ── 7 named LIO stage endpoints ──────────────────────────────────────────────
+# Frontend sends: { system_prompt, user_prompt (fully filled), brightdata_json, stage_idx }
+# Backend: calls HuggingFace → streams SSE with { status, stage, result, done }
+
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+_STAGE_MODEL_DEFAULTS = {
+    0: "llama-3.1-8b-instant",   # Company Intelligence
+    1: "llama-3.1-8b-instant",   # Auto Tags
+    2: "llama-3.1-8b-instant",   # Behavioural Signals
+    3: "llama-3.1-8b-instant",   # Buying Signals
+    4: "llama-3.3-70b-versatile",# Pitch Intelligence
+    5: "llama-3.3-70b-versatile",# Outreach Generator
+    6: "llama-3.1-8b-instant",   # Lead Score
+}
+
+
+async def _lio_stage_model(org_id: str, stage_idx: int) -> str:
+    """Read the model for a specific LIO stage from DB; fall back to hardcoded default."""
+    try:
+        prompts = await cfg_svc.get_lio_prompts(org_id)
+        if 0 <= stage_idx < len(prompts):
+            db_model = prompts[stage_idx].get("model", "").strip()
+            if db_model:
+                return db_model
+    except Exception:
+        pass
+    return _STAGE_MODEL_DEFAULTS.get(stage_idx, "llama-3.1-8b-instant")
+
+
+def _lio_stream_resp(lead_id: str, body: LioContextBody, keys: tuple, model: str):
+    wb_key, wb_host, wb_model = keys
+    return StreamingResponse(
+        _lio_stage_stream(lead_id, body.stage_idx, body.system_prompt, body.user_prompt,
+                          wb_key, wb_host, wb_model),
+        media_type="text/event-stream", headers=_SSE_HEADERS,
+    )
+
+
+@router.post("/{lead_id}/lio/company-intelligence", include_in_schema=False)
+async def lio_company_intelligence(lead_id: str, body: LioContextBody, request: Request):
+    """Stage 0 — Company Intelligence."""
+    org_id = _get_org_id(request)
+    keys = await _lio_llm_keys(request)
+    return _lio_stream_resp(lead_id, body, keys, await _lio_stage_model(org_id, 0))
+
+
+@router.post("/{lead_id}/lio/auto-tags", include_in_schema=False)
+async def lio_auto_tags(lead_id: str, body: LioContextBody, request: Request):
+    """Stage 1 — Auto Tags."""
+    org_id = _get_org_id(request)
+    keys = await _lio_llm_keys(request)
+    return _lio_stream_resp(lead_id, body, keys, await _lio_stage_model(org_id, 1))
+
+
+@router.post("/{lead_id}/lio/behavioural-signals", include_in_schema=False)
+async def lio_behavioural_signals(lead_id: str, body: LioContextBody, request: Request):
+    """Stage 2 — Behavioural Signals."""
+    org_id = _get_org_id(request)
+    keys = await _lio_llm_keys(request)
+    return _lio_stream_resp(lead_id, body, keys, await _lio_stage_model(org_id, 2))
+
+
+@router.post("/{lead_id}/lio/buying-signals", include_in_schema=False)
+async def lio_buying_signals(lead_id: str, body: LioContextBody, request: Request):
+    """Stage 3 — Buying Signals."""
+    org_id = _get_org_id(request)
+    keys = await _lio_llm_keys(request)
+    return _lio_stream_resp(lead_id, body, keys, await _lio_stage_model(org_id, 3))
+
+
+@router.post("/{lead_id}/lio/pitch-intelligence", include_in_schema=False)
+async def lio_pitch_intelligence(lead_id: str, body: LioContextBody, request: Request):
+    """Stage 4 — Pitch Intelligence."""
+    org_id = _get_org_id(request)
+    keys = await _lio_llm_keys(request)
+    return _lio_stream_resp(lead_id, body, keys, await _lio_stage_model(org_id, 4))
+
+
+@router.post("/{lead_id}/lio/outreach", include_in_schema=False)
+async def lio_outreach(lead_id: str, body: LioContextBody, request: Request):
+    """Stage 5 — Outreach Generator."""
+    org_id = _get_org_id(request)
+    keys = await _lio_llm_keys(request)
+    return _lio_stream_resp(lead_id, body, keys, await _lio_stage_model(org_id, 5))
+
+
+@router.post("/{lead_id}/lio/lead-score", include_in_schema=False)
+async def lio_lead_score(lead_id: str, body: LioContextBody, request: Request):
+    """Stage 6 — Lead Score."""
+    org_id = _get_org_id(request)
+    keys = await _lio_llm_keys(request)
+    return _lio_stream_resp(lead_id, body, keys, await _lio_stage_model(org_id, 6))
+
+
+@router.post("/lio/analyze/{lead_id}/stage", include_in_schema=False)
+async def lio_analyze_stage(lead_id: str, body: LioStageRequest, request: Request):
+    """
+    Run ONE LIO stage and stream result as SSE.
+    Pass accumulated previous stage results in body.context.
+
+    Result keys by stage:
+      0 → company_intel   1 → tags   2 → signals   3 → buying
+      4 → pitch           5 → outreach              6 → score
+
+    SSE events:
+      {"status": "running", "stage": N, "stage_name": "..."}
+      {"status": "done",    "stage": N, "stage_name": "...", "result": "..."}
+      {"error": "...", "done": true}
+    """
+    org_id = _get_org_id(request)
+
+    lead = await svc.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    prompts = await cfg_svc.get_lio_prompts(org_id)
+    si = body.stage_index
+    if si < 0 or si >= len(prompts):
+        raise HTTPException(status_code=400, detail=f"Invalid stage_index {si} (0–{len(prompts)-1})")
+
+    prompt_cfg = prompts[si]
+    ws_ctx     = await cfg_svc.get_workspace_context(org_id)
+    wb_row        = await cfg_svc.get_tool_row(org_id, "wb_llm")
+    wb_llm_key_db = (wb_row or {}).get("api_key") or None
+    wb_extra: dict = {}
+    try:
+        wb_extra = json.loads((wb_row or {}).get("extra_config") or "{}") if wb_row else {}
+    except Exception:
+        pass
+    wb_llm_host_db  = wb_extra.get("host") or None
+    wb_llm_model_db = wb_extra.get("model") or None
+
+    # ── Parse lead profile ──────────────────────────────────────────────────
+    full_data: dict = {}
+    try: full_data = json.loads(lead.get("full_data") or "{}")
+    except Exception: pass
+    raw_profile: dict = {}
+    try: raw_profile = json.loads(lead.get("raw_profile") or "{}")
+    except Exception: pass
+
+    # BrightData person profile field extraction
+    activity: list = raw_profile.get("activity", []) or []
+    own_posts: list = raw_profile.get("posts", []) or []  # person's own published posts
+
+    def _act_str(a) -> str:
+        """Extract readable text from an activity/post object."""
+        return (a.get("title") or a.get("attribution") or a.get("action") or a.get("text") or "")[:180]
+
+    name_parts = (lead.get("name") or "").split()
+
+    # ── Infer title / role ─────────────────────────────────────────────────
+    # BrightData person profiles often lack a `title` field — extract from `about`
+    import re as _re
+    about_text = (raw_profile.get("about") or raw_profile.get("summary")
+                  or raw_profile.get("headline") or lead.get("about") or "")
+    raw_title = (raw_profile.get("title") or raw_profile.get("headline")
+                 or full_data.get("title") or lead.get("title") or "")
+    if not raw_title and about_text:
+        # Try to pull role from first sentence: "I'm the CEO and Founder of ..."
+        m = _re.search(
+            r"(?:I(?:'m| am)(?: the)?\s+|^)(CEO|CTO|CFO|COO|CMO|Founder|Co-Founder|"
+            r"Director|VP|Head of \w+|President|Partner|Managing Director|MD)",
+            about_text, _re.IGNORECASE
+        )
+        if m:
+            raw_title = m.group(1)
+
+    # ── Industry inference ─────────────────────────────────────────────────
+    industry = (raw_profile.get("industry") or full_data.get("industry")
+                or lead.get("industry") or "")
+    if not industry and about_text:
+        # Infer from post topics if possible
+        all_post_text = " ".join(_act_str(p) for p in own_posts[:5]).lower()
+        if any(w in all_post_text for w in ("blockchain", "crypto", "web3", "defi", "nft")):
+            industry = "Blockchain / Web3 Technology"
+        elif any(w in all_post_text for w in ("ai", "artificial intelligence", "machine learning", "llm")):
+            industry = "Artificial Intelligence"
+        elif any(w in all_post_text for w in ("saas", "software", "platform", "app")):
+            industry = "Software / SaaS"
+        elif any(w in all_post_text for w in ("fintech", "finance", "banking", "payment")):
+            industry = "Fintech"
+
+    # ── Build rich company_description from all available signals ──────────
+    company_desc_parts = []
+    # 1. Direct company description fields (enrichment-stage data)
+    for k in ("company_description", "company_about", "company_summary",
+              "company_specialty", "company_overview"):
+        v = full_data.get(k) or raw_profile.get(k)
+        if v: company_desc_parts.append(str(v)[:400])
+    # 2. Prospect's own `about` bio (esp. useful for founders/CEOs)
+    if about_text:
+        company_desc_parts.append(f"Founder/Leader bio: {about_text[:400]}")
+    # 3. Own published posts reveal business focus
+    if own_posts:
+        post_lines = "\n".join(
+            f"  • {p.get('title', '')[:120]}" for p in own_posts[:4] if p.get("title")
+        )
+        if post_lines:
+            company_desc_parts.append(f"Published posts (topics they care about):\n{post_lines}")
+    # 4. Awards / recognition signal company credibility + domain
+    awards = raw_profile.get("honors_and_awards", []) or []
+    if awards:
+        award_lines = "; ".join(
+            f"{a.get('title','')} — {a.get('publication','')}" for a in awards[:3]
+        )
+        company_desc_parts.append(f"Awards/recognition: {award_lines}")
+    # 5. Education
+    edu = raw_profile.get("educations_details") or ""
+    if edu:
+        company_desc_parts.append(f"Education: {str(edu)[:200]}")
+    # 6. Company size signals
+    followers = raw_profile.get("followers") or 0
+    connections = raw_profile.get("connections") or 0
+    if followers or connections:
+        company_desc_parts.append(
+            f"LinkedIn presence: {followers} followers, {connections}+ connections"
+        )
+
+    company_description = "\n\n".join(company_desc_parts) or "No company description available"
+
+    # ── Activity feed: liked posts reveal what they engage with ────────────
+    def _act_feed_line(a) -> str:
+        interaction = a.get("interaction", "")
+        title = _act_str(a)
+        return f"- [{interaction}] {title}" if interaction else f"- {title}"
+
+    recent_posts_str = (
+        "\n".join(_act_feed_line(a) for a in (activity + own_posts)[:10])
+        or "No recent activity"
+    )
+    recent_activity_str = (
+        "\n".join(_act_feed_line(a) for a in activity[:12])
+        or "No activity data"
+    )
+
+    # ── Base context ────────────────────────────────────────────────────────
+    prev = body.context or {}
+
+    def _s(raw) -> str:
+        if isinstance(raw, (dict, list)): return json.dumps(raw)
+        return str(raw or "")
+
+    def _parse(raw) -> Any:
+        if isinstance(raw, (dict, list)): return raw
+        try: return json.loads(raw)
+        except Exception: return raw
+
+    # Extract sub-fields from previous stage results
+    ci_obj     = _parse(prev.get("company_intel", "")) if prev.get("company_intel") else {}
+    buying_obj = _parse(prev.get("buying", ""))        if prev.get("buying")        else {}
+    pitch_obj  = _parse(prev.get("pitch", ""))         if prev.get("pitch")         else {}
+
+    ctx: dict = {
+        # Identity
+        "first_name":     raw_profile.get("first_name")  or (name_parts[0] if name_parts else ""),
+        "last_name":      raw_profile.get("last_name")   or (" ".join(name_parts[1:]) if len(name_parts) > 1 else ""),
+        "inferred_title": raw_title,
+        "company":        (raw_profile.get("current_company_name") or raw_profile.get("current_company")
+                           or lead.get("company") or ""),
+        "about":          about_text,
+        "industry":       industry,
+        "city":           (raw_profile.get("city") or raw_profile.get("location") or "").split(",")[0].strip(),
+        "country":        raw_profile.get("country") or lead.get("location") or "",
+        "company_description": company_description,
+        # Activity
+        "recent_posts":    recent_posts_str,
+        "recent_activity": recent_activity_str,
+        # Scoring
+        "total_score":       str(lead.get("total_score") or 0),
+        "icp_fit_score":     str(lead.get("icp_score") or 0),
+        "score_tier":        lead.get("score_tier") or "",
+        "warm_signal_count": str(len(own_posts)),
+        "email_status":      "found" if lead.get("email") else "not found",
+        # Workspace
+        "product_name":      ws_ctx.get("product_name", ""),
+        "value_proposition": ws_ctx.get("value_proposition", ""),
+        "target_titles":     ws_ctx.get("target_titles", ""),
+        "tone":              ws_ctx.get("tone", "professional"),
+        "banned_phrases":    ws_ctx.get("banned_phrases", ""),
+        "case_study":        ws_ctx.get("case_study", ""),
+        "cta_style":         ws_ctx.get("cta_style", "question"),
+        # Previous stage outputs
+        "company_intel":       _s(prev.get("company_intel", "")),
+        "auto_tags":           _s(prev.get("tags", "[]")),
+        "behavioural_signals": _s(prev.get("signals", "")),
+        "buying_signals":      _s(prev.get("buying", "")),
+        "pitch_intelligence":  _s(prev.get("pitch", "")),
+        # Sub-fields extracted from previous stage JSON
+        "company_stage":        ci_obj.get("company_stage", "")      if isinstance(ci_obj, dict)     else "",
+        "intent_level":         buying_obj.get("intent_level", "")   if isinstance(buying_obj, dict) else "",
+        "timing_score":         str(buying_obj.get("timing_score", 0)) if isinstance(buying_obj, dict) else "0",
+        "trigger_events":       json.dumps(buying_obj.get("trigger_events", [])) if isinstance(buying_obj, dict) else "[]",
+        "personalization_hook": pitch_obj.get("personalization_hook", "") if isinstance(pitch_obj, dict) else "",
+        "core_pain":            pitch_obj.get("core_pain", "")        if isinstance(pitch_obj, dict) else "",
+    }
+
+    async def _stream():
+        import httpx as _httpx
+
+        def _fill(template: str, ctx: dict) -> str:
+            """Replace {var} placeholders using regex — safe against literal JSON braces."""
+            import re as _re
+            def _sub(m):
+                key = m.group(1)
+                val = ctx.get(key)
+                return str(val) if val is not None else m.group(0)
+            return _re.sub(r'\{([a-zA-Z_][a-zA-Z0-9_]*)\}', _sub, template)
+
+        async def _call(system: str, user: str, model: str, temp: float) -> str:
+            errors = []
+            wb_host = wb_llm_host_db or svc._wb_llm_host()
+            wb_key  = wb_llm_key_db  or svc._wb_llm_key()
+            wb_mdl  = wb_llm_model_db or svc._wb_llm_model()
+            if wb_host and wb_key:
+                try:
+                    async with _httpx.AsyncClient(timeout=90) as c:
+                        r = await c.post(f"{wb_host.rstrip('/')}/v1/chat/completions",
+                            headers={"Content-Type": "application/json", "Authorization": f"Bearer {wb_key}"},
+                            json={"model": wb_mdl, "messages": [{"role":"system","content":system},{"role":"user","content":user}], "temperature": temp, "max_tokens": 2000})
+                        if r.is_success: return r.json()["choices"][0]["message"]["content"].strip()
+                        errors.append(f"WB LLM: HTTP {r.status_code}")
+                except Exception as e: errors.append(f"WB LLM: {e}")
+            hf_token = svc._hf_token()
+            if hf_token:
+                try:
+                    async with _httpx.AsyncClient(timeout=90) as c:
+                        r = await c.post("https://router.huggingface.co/v1/chat/completions",
+                            headers={"Content-Type": "application/json", "Authorization": f"Bearer {hf_token}"},
+                            json={"model": svc._hf_model(), "messages": [{"role":"system","content":system},{"role":"user","content":user}], "temperature": temp, "max_tokens": 2000})
+                        if r.is_success: return r.json()["choices"][0]["message"]["content"].strip()
+                        body_txt = ""
+                        try: body_txt = r.json().get("error", {}).get("message") or r.text
+                        except Exception: body_txt = r.text
+                        errors.append(f"HuggingFace: HTTP {r.status_code}: {body_txt}")
+                except Exception as e: errors.append(f"HuggingFace: {e}")
+            raise RuntimeError(" | ".join(errors) if errors else "No LLM provider configured — add HF_TOKEN or WB_LLM_HOST.")
+
+        import re as _re
+
+        def _strip_md(text: str) -> str:
+            """Strip markdown code fences that some LLMs wrap JSON in."""
+            text = text.strip()
+            text = _re.sub(r'^```(?:json)?\s*', '', text, flags=_re.MULTILINE)
+            text = _re.sub(r'\s*```$', '', text, flags=_re.MULTILINE)
+            return text.strip()
+
+        # Result-key map: stage index → context key used in frontend + DB
+        _RESULT_KEYS = {0: "company_intel", 1: "tags", 2: "signals",
+                        3: "buying", 4: "pitch", 5: "outreach", 6: "score"}
+
+        stage_name = prompt_cfg.get("name", f"Stage {si}")
+        yield f"data: {json.dumps({'status': 'running', 'stage': si, 'stage_name': stage_name})}\n\n"
+        try:
+            user_prompt = _fill(prompt_cfg.get("user_template", ""), ctx)
+            result = await _call(
+                prompt_cfg.get("system", ""),
+                user_prompt,
+                prompt_cfg.get("model", "llama-3.1-8b-instant"),
+                float(prompt_cfg.get("temperature", 0.3)),
+            )
+            result = _strip_md(result)
+            # Persist this stage's result into the lead's lio_results_json
+            rk = _RESULT_KEYS.get(si)
+            if rk:
+                try:
+                    await svc.save_lead_lio_results(lead_id, {rk: result})
+                except Exception as _e:
+                    logger.warning("[LIO save stage %d] %s", si, _e)
+            yield f"data: {json.dumps({'status': 'done', 'stage': si, 'stage_name': stage_name, 'result': result, 'done': True})}\n\n"
+        except Exception as e:
+            logger.error("[LIO Stage %d] %s", si, e)
+            yield f"data: {json.dumps({'error': str(e), 'done': True})}\n\n"
+
+    return StreamingResponse(_stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@router.post("/lio/analyze/{lead_id}", include_in_schema=False)
+async def lio_analyze(lead_id: str, request: Request):
+    """
+    Run LIO 5-step enrichment chain. Each step uses its own prompt config,
+    passes results to subsequent steps, and streams SSE events per step.
+
+    SSE event shapes:
+      {"step": N, "step_name": "...", "status": "running"|"done"|"error", "result"?: "...", "total": 5}
+      {"done": true, "result": {"Auto Tags": "...", ...}}   ← final
+      {"error": "...", "done": true}                        ← fatal error
+    """
+    org_id = _get_org_id(request)
+
+    lead = await svc.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    # ── Load 5-prompt configs + workspace context ───────────────────────────
+    prompts   = await cfg_svc.get_lio_prompts(org_id)
+    ws_ctx    = await cfg_svc.get_workspace_context(org_id)
+
+    # ── Load API keys from DB tool configs ─────────────────────────────────
+    wb_row        = await cfg_svc.get_tool_row(org_id, "wb_llm")
+    wb_llm_key_db = (wb_row or {}).get("api_key") or None
+    wb_extra: dict = {}
+    try:
+        wb_extra = json.loads((wb_row or {}).get("extra_config") or "{}") if wb_row else {}
+    except Exception:
+        pass
+    wb_llm_host_db  = wb_extra.get("host") or None
+    wb_llm_model_db = wb_extra.get("model") or None
+
+    # ── Parse lead profile data ─────────────────────────────────────────────
+    full_data: dict = {}
+    try: full_data = json.loads(lead.get("full_data") or "{}")
+    except Exception: pass
+    raw_profile: dict = {}
+    try: raw_profile = json.loads(lead.get("raw_profile") or "{}")
+    except Exception: pass
+
+    # ── Extract activity / post signals ─────────────────────────────────────
+    activity: list = raw_profile.get("activity", []) or []
+    posts:    list = raw_profile.get("posts", []) or []
+
+    def _act_title(a) -> str:
+        return (a.get("title") or a.get("action") or a.get("text") or "")[:150]
+
+    top_3_activity_titles = "\n".join(f"- {_act_title(a)}" for a in activity[:3]) or "No recent activity"
+    activity_sample       = "\n".join(f"- {_act_title(a)}" for a in activity[:10]) or "No activity data"
+    warm_signal_posts     = "\n".join(
+        f"- {p.get('title') or p.get('text', '')[:150]}" for p in posts[:5]
+    ) or "No brand engagement found"
+    warm_signal_posts_titles = "\n".join(
+        f"- {p.get('title') or p.get('text', '')[:80]}" for p in posts[:3]
+    ) or "None"
+
+    # ── Build base context dict (all {variable} placeholders for all 5 steps) ─
+    name_parts = (lead.get("name") or "").split()
+    base_ctx: dict = {
+        # Identity
+        "first_name":    raw_profile.get("first_name")  or (name_parts[0] if name_parts else ""),
+        "last_name":     raw_profile.get("last_name")   or (" ".join(name_parts[1:]) if len(name_parts) > 1 else ""),
+        "inferred_title": raw_profile.get("title")      or lead.get("title") or "",
+        "company":       (raw_profile.get("current_company_name") or raw_profile.get("current_company")
+                          or lead.get("company") or ""),
+        "about":         raw_profile.get("about") or raw_profile.get("summary") or raw_profile.get("headline") or "",
+        "industry":      raw_profile.get("industry") or full_data.get("industry") or "",
+        "city":          raw_profile.get("city") or "",
+        "country":       raw_profile.get("country") or lead.get("location") or "",
+        # Activity
+        "top_3_activity_titles":  top_3_activity_titles,
+        "activity_sample":        activity_sample,
+        "warm_signal_posts":      warm_signal_posts,
+        "warm_signal_posts_titles": warm_signal_posts_titles,
+        "warm_signal_count":      str(len(posts)),
+        # Scoring
+        "total_score":          str(lead.get("total_score") or 0),
+        "icp_fit_score":        str(lead.get("icp_score") or 0),
+        "intent_score":         str(lead.get("intent_score") or 0),
+        "timing_score":         str(full_data.get("timing_score") or 0),
+        "score_tier":           lead.get("score_tier") or "",
+        "score_anomaly":        str(full_data.get("score_anomaly") or False),
+        "score_anomaly_reason": str(full_data.get("score_anomaly_reason") or ""),
+        "email_status":         "found" if lead.get("email") else "not found",
+        # Step-chain placeholders (filled as steps complete)
+        "behavioural_signals": "",
+        "top_pain_point": "", "best_value_prop": "", "trigger_event": "",
+        "best_angle": "", "do_not_pitch": "", "suggested_cta": "", "opening_line": "",
+        # Workspace / product context
+        "product_name":      ws_ctx.get("product_name", ""),
+        "value_proposition": ws_ctx.get("value_proposition", ""),
+        "target_titles":     ws_ctx.get("target_titles", ""),
+        "tone":              ws_ctx.get("tone", "professional"),
+        "banned_phrases":    ws_ctx.get("banned_phrases", ""),
+        "case_study":        ws_ctx.get("case_study", ""),
+        "cta_style":         ws_ctx.get("cta_style", "question"),
+    }
+
+    async def stream_steps():
+        import httpx as _httpx
+
+        def _fill(template: str, ctx: dict) -> str:
+            """Replace {var} placeholders using regex — safe against literal JSON braces."""
+            import re as _re
+            def _sub(m):
+                key = m.group(1)
+                val = ctx.get(key)
+                return str(val) if val is not None else m.group(0)
+            return _re.sub(r'\{([a-zA-Z_][a-zA-Z0-9_]*)\}', _sub, template)
+
+        async def _call_llm(system: str, user: str, model: str, temperature: float) -> str:
+            """Try WB LLM (if configured) then HuggingFace. Raises on all failures."""
+            errors = []
+
+            wb_host = wb_llm_host_db or svc._wb_llm_host()
+            wb_key  = wb_llm_key_db  or svc._wb_llm_key()
+            wb_mdl  = wb_llm_model_db or svc._wb_llm_model()
+
+            if wb_host and wb_key:
+                try:
+                    async with _httpx.AsyncClient(timeout=90) as c:
+                        r = await c.post(
+                            f"{wb_host.rstrip('/')}/v1/chat/completions",
+                            headers={"Content-Type": "application/json", "Authorization": f"Bearer {wb_key}"},
+                            json={"model": wb_mdl,
+                                  "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                                  "temperature": temperature, "max_tokens": 2000},
+                        )
+                        if r.is_success:
+                            return r.json()["choices"][0]["message"]["content"].strip()
+                        body = ""
+                        try: body = r.json().get("error", {}).get("message") or r.text
+                        except Exception: body = r.text
+                        errors.append(f"WB LLM: HTTP {r.status_code}: {body}")
+                except Exception as e:
+                    errors.append(f"WB LLM: {e}")
+
+            hf_token = svc._hf_token()
+            if hf_token:
+                try:
+                    async with _httpx.AsyncClient(timeout=90) as c:
+                        r = await c.post(
+                            "https://router.huggingface.co/v1/chat/completions",
+                            headers={"Content-Type": "application/json", "Authorization": f"Bearer {hf_token}"},
+                            json={"model": svc._hf_model(),
+                                  "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                                  "temperature": temperature, "max_tokens": 2000},
+                        )
+                        if r.is_success:
+                            return r.json()["choices"][0]["message"]["content"].strip()
+                        body = ""
+                        try: body = r.json().get("error", {}).get("message") or r.text
+                        except Exception: body = r.text
+                        errors.append(f"HuggingFace: HTTP {r.status_code}: {body}")
+                except Exception as e:
+                    errors.append(f"HuggingFace: {e}")
+
+            raise RuntimeError(
+                " | ".join(errors) if errors
+                else "No LLM provider configured — add HF_TOKEN or WB_LLM_HOST."
+            )
+
+        ctx = dict(base_ctx)
+        step_results: dict = {}
+        total = len(prompts)
+
+        for i, prompt_cfg in enumerate(prompts):
+            step_num  = i + 1
+            step_name = prompt_cfg.get("name", f"Step {step_num}")
+            model     = prompt_cfg.get("model", "llama-3.1-8b-instant")
+            temp      = float(prompt_cfg.get("temperature", 0.3))
+            system    = prompt_cfg.get("system", "")
+            user_tpl  = prompt_cfg.get("user_template", "")
+
+            yield f"data: {json.dumps({'step': step_num, 'step_name': step_name, 'status': 'running', 'total': total})}\n\n"
+
+            try:
+                user_prompt = _fill(user_tpl, ctx)
+                result = await _call_llm(system, user_prompt, model, temp)
+                step_results[step_name] = result
+
+                # Feed results into context for downstream steps
+                if step_num == 2:
+                    ctx["behavioural_signals"] = result
+                elif step_num == 3:
+                    try:
+                        pitch = json.loads(result)
+                        ctx["top_pain_point"]  = pitch.get("top_pain_point", "")
+                        ctx["best_value_prop"] = pitch.get("best_value_prop", "")
+                        ctx["trigger_event"]   = str(pitch.get("trigger_event") or "")
+                        ctx["best_angle"]      = pitch.get("best_angle", "")
+                        ctx["do_not_pitch"]    = ", ".join(pitch.get("do_not_pitch") or [])
+                        ctx["suggested_cta"]   = pitch.get("suggested_cta", "")
+                        ctx["opening_line"]    = pitch.get("opening_line", "")
+                    except Exception:
+                        ctx["top_pain_point"] = result[:300]
+                elif step_num == 4:
+                    try:
+                        outreach = json.loads(result)
+                        if not ctx.get("trigger_event"):
+                            ctx["trigger_event"] = outreach.get("email_subject", "")
+                    except Exception:
+                        pass
+
+                yield f"data: {json.dumps({'step': step_num, 'step_name': step_name, 'status': 'done', 'result': result, 'total': total})}\n\n"
+
+            except Exception as e:
+                error_msg = str(e)
+                logger.error("[LIO] Step %d (%s) failed: %s", step_num, step_name, error_msg)
+                yield f"data: {json.dumps({'step': step_num, 'step_name': step_name, 'status': 'error', 'error': error_msg, 'total': total})}\n\n"
+                yield f"data: {json.dumps({'error': f'Step {step_num} ({step_name}): {error_msg}', 'done': True})}\n\n"
+                return
+
+        yield f"data: {json.dumps({'done': True, 'result': step_results})}\n\n"
+
+    return StreamingResponse(
+        stream_steps(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _format_lead(lead: dict, full: bool = False) -> dict:
+    """Parse JSON fields and format for API response."""
+    out = {k: v for k, v in lead.items() if k not in ("raw_profile", "skills")}
+
+    # Parse score_reasons JSON → list
+    try:
+        out["score_reasons"] = json.loads(lead.get("score_reasons") or "[]")
+    except Exception:
+        out["score_reasons"] = []
+
+    # Parse outreach_sequence JSON → dict
+    try:
+        out["outreach_sequence"] = json.loads(lead.get("outreach_sequence") or "{}")
+    except Exception:
+        out["outreach_sequence"] = {}
+
+    # Parse skills JSON → list
+    try:
+        out["skills"] = json.loads(lead.get("skills") or "[]")
+    except Exception:
+        out["skills"] = []
+
+    # Always parse full_data from JSON string → dict so the modal shows structured data
+    try:
+        out["full_data"] = json.loads(lead.get("full_data") or "{}")
+    except Exception:
+        out["full_data"] = {}
+
+    if full:
+        # Include raw BrightData profile as parsed dict
+        try:
+            out["raw_profile"] = json.loads(lead.get("raw_profile") or "{}")
+        except Exception:
+            out["raw_profile"] = {}
+
+    return out
