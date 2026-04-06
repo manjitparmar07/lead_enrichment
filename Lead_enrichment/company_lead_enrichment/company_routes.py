@@ -73,6 +73,10 @@ async def get_lead_company(
         if not lead_row:
             raise HTTPException(status_code=404, detail="Lead not found")
 
+        company_linkedin = lead_row["company_linkedin"]
+        if not company_linkedin:
+            return {"company": None, "message": "No LinkedIn company URL found for this lead. Cannot fetch company information."}
+
         cid = lead_row["company_id"]
         if not cid:
             return {"company": None, "message": "No company enrichment linked to this lead"}
