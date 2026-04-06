@@ -480,7 +480,7 @@ async def _worker(worker_id: int, r: Any) -> None:
       - Retry: total-failure chunks are re-queued up to MAX_TASK_ATTEMPTS times.
       - DLQ: chunks exceeding MAX_TASK_ATTEMPTS are pushed to wb:leads:dlq.
     """
-    from lead_enrichment_brightdata_service import (
+    from Lead_enrichment.bulk_lead_enrichment.lead_enrichment_brightdata_service import (
         enrich_single,
         _publish_lead_done,
         _publish_job_done,
