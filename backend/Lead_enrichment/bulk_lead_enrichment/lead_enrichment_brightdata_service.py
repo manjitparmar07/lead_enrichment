@@ -1502,14 +1502,28 @@ async def _upsert_lead(lead: dict) -> None:
     # ── Step 5: build SQL ──────────────────────────────────────────────────────
     cols = [k for k in lead if k != "id"]
     all_keys = ["id"] + cols
-    placeholders = ", ".join(f"${i + 1}" for i in range(len(all_keys)))
-    updates = ", ".join(f"{k}=EXCLUDED.{k}" for k in cols)
-    sql = f"""
-        INSERT INTO enriched_leads ({', '.join(all_keys)})
-        VALUES ({placeholders})
-        ON CONFLICT(id) DO UPDATE SET {updates}
-    """
-    args = [lead[k] for k in all_keys]
+
+    # If only a few fields are being updated (partial patch like company_linkedin),
+    # use UPDATE only to avoid NOT NULL constraint failures on INSERT.
+    _REQUIRED_INSERT_FIELDS = {"linkedin_url", "organization_id"}
+    _is_partial = not _REQUIRED_INSERT_FIELDS.issubset(set(cols))
+
+    if _is_partial:
+        # Pure UPDATE — safe for partial patches
+        set_clause = ", ".join(f"{k}=${i + 2}" for i, k in enumerate(cols))
+        sql = f"UPDATE enriched_leads SET {set_clause} WHERE id=$1"
+        args = [lead["id"]] + [lead[k] for k in cols]
+        _pipeline_log.info("[DB-SAVE] [STEP-5] SQL built — partial UPDATE %d cols, executing", len(cols))
+    else:
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(all_keys)))
+        updates = ", ".join(f"{k}=EXCLUDED.{k}" for k in cols)
+        sql = f"""
+            INSERT INTO enriched_leads ({', '.join(all_keys)})
+            VALUES ({placeholders})
+            ON CONFLICT(id) DO UPDATE SET {updates}
+        """
+        args = [lead[k] for k in all_keys]
+        _pipeline_log.info("[DB-SAVE] [STEP-5] SQL built — %d columns, executing INSERT/UPDATE", len(all_keys))
     _pipeline_log.info("[DB-SAVE] [STEP-5] SQL built — %d columns, executing INSERT/UPDATE", len(all_keys))
 
     # ── Step 6: execute ────────────────────────────────────────────────────────
@@ -2059,7 +2073,7 @@ async def _call_llm(
                 logger.info("[LLM] HuggingFace (%s) attempt %d/3 payload=%d chars", hf_model, attempt + 1, payload_chars)
                 result = await _post("https://router.huggingface.co", hf_token, hf_model, messages)
                 logger.info("[LLM] HuggingFace OK — attempt %d", attempt + 1)
-                asyncio.create_task(_usage.track("huggingface", "llm_call"))
+                await _usage.track("huggingface", "llm_call")
                 return result
             except Exception as e:
                 logger.warning("[LLM] HuggingFace failed (attempt %d/3): %s", attempt + 1, e)
@@ -2699,7 +2713,7 @@ async def fetch_profile_sync(linkedin_url: str) -> dict:
                     headers=_bd_headers(),
                     json=[{"url": url}],
                 )
-                asyncio.create_task(_usage.track("brightdata", "profile"))
+                await _usage.track("brightdata", "profile")
 
                 if resp.status_code == 429:
                     wait = _bd_rate_limit_wait(resp)
@@ -3032,7 +3046,7 @@ async def _try_apollo(first: str, last: str, domain: str, linkedin_url: str = ""
             headers={"Content-Type": "application/json", "X-Api-Key": _apollo_api_key()},
             json=payload,
         )
-        asyncio.create_task(_usage.track("apollo", "person_match"))
+        await _usage.track("apollo", "person_match")
         body = r.json()
         p   = body.get("person") or {}
         org = body.get("organization") or {}
@@ -3624,7 +3638,7 @@ async def _try_bd_company(company_linkedin_url: str) -> dict:
                 headers=_bd_headers(),
                 json={"input": [{"url": company_linkedin_url}]},
             )
-            asyncio.create_task(_usage.track("brightdata", "company"))
+            await _usage.track("brightdata", "company")
             logger.debug("[BD Company] /scrape status=%s body=%.300s", resp.status_code, resp.text)
 
             if resp.status_code not in (200, 202):

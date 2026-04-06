@@ -111,8 +111,7 @@ async def _verify_email(email: str) -> dict:
         logger.info("[ValidEmail] %s → valid=%s result=%s bounce_risk=%s",
                     email, valid, result, bounce_risk)
 
-        import asyncio
-        asyncio.create_task(_usage.track("validemail", "verify"))
+        await _usage.track("validemail", "verify")
         return {"verified": valid, "bounce_risk": bounce_risk}
 
     except Exception as e:

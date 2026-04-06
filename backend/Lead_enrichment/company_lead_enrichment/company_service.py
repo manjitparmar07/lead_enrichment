@@ -706,7 +706,7 @@ async def _call_llm(messages: list[dict], max_tokens: int = 600) -> Optional[str
                     },
                 )
                 if r.status_code == 200:
-                    asyncio.create_task(_usage.track("huggingface", "llm_call"))
+                    await _usage.track("huggingface", "llm_call")
                     return r.json()["choices"][0]["message"]["content"]
         except Exception as e:
             logger.debug("[CompanyAI] WB LLM failed: %s", e)
@@ -727,7 +727,7 @@ async def _call_llm(messages: list[dict], max_tokens: int = 600) -> Optional[str
                     },
                 )
                 if r.status_code == 200:
-                    asyncio.create_task(_usage.track("huggingface", "llm_call"))
+                    await _usage.track("huggingface", "llm_call")
                     return r.json()["choices"][0]["message"]["content"]
         except Exception as e:
             logger.debug("[CompanyAI] HuggingFace failed: %s", e)
