@@ -1,0 +1,71 @@
+:root {
+  --bg-base: #f5f7fa;
+  --bg-card: #ffffff;
+  --bg-input: #f0f1f3;
+  --bg-header: #ffffff;
+  --bg-sidebar: #fafafa;
+  --bg-elevated: #f4f4f5;
+  --border-1: #e4e4e7;
+  --border-2: #ececee;
+  --text-1: #18181b;
+  --text-2: #52525b;
+  --text-3: #a1a1aa;
+  --text-4: #d4d4d8;
+  --scrollbar-thumb: #d4d4d8;
+  --scrollbar-hover: #a1a1aa;
+  --accent: #6366f1;
+  --accent-hover: #4f46e5;
+  --accent-light: rgba(99, 102, 241, 0.1);
+}
+
+[data-theme="dark"] {
+  --bg-base: #0d0d0d;
+  --bg-card: #111111;
+  --bg-input: #1a1a1a;
+  --bg-header: #111111;
+  --bg-sidebar: #161616;
+  --bg-elevated: #1e1e1e;
+  --border-1: #2a2a2a;
+  --border-2: #1a1a1a;
+  --text-1: #e8e8e8;
+  --text-2: #888888;
+  --text-3: #555555;
+  --text-4: #333333;
+  --scrollbar-thumb: #333333;
+  --scrollbar-hover: #444444;
+  --accent: #818cf8;
+  --accent-hover: #6366f1;
+  --accent-light: rgba(129, 140, 248, 0.12);
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  background: var(--bg-base);
+  color: var(--text-1);
+  overflow: hidden; /* chat layout needs this — pages with scroll set their own overflow */
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-hover);
+}
