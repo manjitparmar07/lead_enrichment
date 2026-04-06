@@ -277,7 +277,7 @@ export default function ApiUsagePage() {
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
               {apis.map(api => {
                 const meta = getMeta(api)
-                const pct = Math.round((totals[api] / totalCalls) * 100)
+                const pct = totalCalls > 0 ? Math.round(((totals[api] || 0) / totalCalls) * 100) : 0
                 return (
                   <div key={api} style={{
                     display: 'flex', alignItems: 'center', gap: 6,
