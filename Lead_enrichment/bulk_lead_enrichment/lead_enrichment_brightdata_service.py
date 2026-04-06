@@ -106,7 +106,7 @@ def _outreach_threshold() -> int:
 async def _outreach_threshold_for_org(org_id: str) -> int:
     """Read outreach threshold from workspace_configs for org; fall back to env/default."""
     try:
-        from enrichment_config_service import get_scoring_config
+        from config.enrichment_config_service import get_scoring_config
         sc = await get_scoring_config(org_id)
         return int(sc.get("outreach_threshold", 50))
     except Exception:
@@ -4534,7 +4534,7 @@ async def run_lio_pipeline(
       company_intel, tags, behavioural_signals, buying_signals,
       pitch_intelligence, outreach, lead_score
     """
-    from enrichment_config_service import get_lio_prompts, get_workspace_context
+    from config.enrichment_config_service import get_lio_prompts, get_workspace_context
 
     prompts = await get_lio_prompts(org_id)
     ctx     = await get_workspace_context(org_id)
@@ -4717,7 +4717,7 @@ async def generate_outreach_with_lio(lead: dict, org_id: str = "default") -> dic
           "linkedin_follow_up": ...,
         }
     """
-    from enrichment_config_service import get_lio_prompts, get_workspace_context
+    from config.enrichment_config_service import get_lio_prompts, get_workspace_context
 
     prompts = await get_lio_prompts(org_id)
     ctx     = await get_workspace_context(org_id)
@@ -4931,7 +4931,7 @@ async def build_comprehensive_enrichment(
     Falls back to a rule-based assembly if LLM is unavailable.
     If system_prompt_override is provided it takes precedence over the config value.
     """
-    from enrichment_config_service import get_workspace_config, get_scoring_config
+    from config.enrichment_config_service import get_workspace_config, get_scoring_config
 
     now    = datetime.now(timezone.utc).isoformat()
 
@@ -7504,6 +7504,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             "connections": _safe_int(profile.get("connections")),
             "status": "scraping",
             "job_id": job_id,
+            "organization_id": org_id,
             "enriched_at": datetime.now(timezone.utc).isoformat(),
         })
         _plog(job_id, url, "SCRAPING", f"saved to DB — name={name!r} company={company!r}")
@@ -7909,7 +7910,7 @@ async def regenerate_company_for_lead(lead_id: str) -> Optional[dict]:
         return None
 
     import company_service as cs
-    from enrichment_config_service import get_workspace_config
+    from config.enrichment_config_service import get_workspace_config
 
     company_linkedin = lead.get("company_linkedin") or ""
     org_id = lead.get("organization_id") or "default"
@@ -7974,7 +7975,7 @@ async def regenerate_crm_brief_for_lead(lead_id: str, org_id: str = "") -> Optio
     the lead's stored organization_id so the right config is always loaded.
     """
     import re as _re
-    from enrichment_config_service import get_workspace_config
+    from config.enrichment_config_service import get_workspace_config
 
     lead = await get_lead(lead_id)
     if not lead:
