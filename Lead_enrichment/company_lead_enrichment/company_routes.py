@@ -67,19 +67,27 @@ async def get_lead_company(
 
     async with get_pool().acquire() as conn:
         lead_row = await conn.fetchrow(
-            "SELECT company_id, company_linkedin FROM enriched_leads WHERE id=$1 AND organization_id=$2",
+            "SELECT company_id, company_linkedin, linkedin_url FROM enriched_leads WHERE id=$1 AND organization_id=$2",
             lead_id, org_id,
         )
         if not lead_row:
             raise HTTPException(status_code=404, detail="Lead not found")
 
         company_linkedin = lead_row["company_linkedin"]
+        linkedin_url = lead_row["linkedin_url"]
+
+        base = {
+            "lead_id": lead_id,
+            "linkedin_url": linkedin_url,
+            "company_linkedin": company_linkedin,
+        }
+
         if not company_linkedin:
-            return {"company": None, "message": "No LinkedIn company URL found for this lead. Cannot fetch company information."}
+            return {**base, "success": False, "company": None, "message": "No LinkedIn company URL found for this lead. Cannot fetch company information."}
 
         cid = lead_row["company_id"]
         if not cid:
-            return {"company": None, "message": "No company enrichment linked to this lead"}
+            return {**base, "success": False, "company": None, "message": "No company enrichment linked to this lead"}
 
         row = await conn.fetchrow(
             "SELECT * FROM company_enrichments WHERE id=$1 AND org_id=$2",
@@ -87,9 +95,9 @@ async def get_lead_company(
         )
 
     if not row:
-        return {"company": None, "message": "Company enrichment not yet available"}
+        return {**base, "success": False, "company": None, "message": "Company enrichment not yet available"}
 
-    return {"company": cs._deserialise_record(dict(row))}
+    return {**base, "success": True, "company": cs._deserialise_record(dict(row))}
 
 
 # ── Force-refresh a company ───────────────────────────────────────────────────
