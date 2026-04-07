@@ -7432,6 +7432,9 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
 
         def _is_private_profile(p: dict) -> bool:
             """Detect BrightData private/hidden profile responses — no retry needed."""
+            # BrightData may return is_private as a boolean field
+            if p.get("is_private"):
+                return True
             _PRIVATE_SIGNALS = ("hidden or private", "profile is private", "private profile", "profile not found")
             for _field in ("error", "_error", "_bd_message", "message", "about", "name"):
                 _val = str(p.get(_field) or "").lower()
@@ -7478,7 +7481,22 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
                 # Check if retry itself returned a private profile
                 if retried and _is_private_profile(retried):
                     logger.warning("[Pipeline] Retry confirmed private profile for %s — stopping retries", url)
-                    break
+                    _err_msg_retry = retried.get("error") or retried.get("_bd_message") or "Profile is private or hidden"
+                    _lead_id_val = _lead_id(url)
+                    try:
+                        await _upsert_lead({
+                            "id": _lead_id_val,
+                            "linkedin_url": url,
+                            "status": "failed",
+                            "job_id": job_id,
+                            "organization_id": org_id,
+                            "score_explanation": "Profile is private or hidden on LinkedIn — BrightData cannot access it.",
+                            "enriched_at": datetime.now(timezone.utc).isoformat(),
+                        })
+                    except Exception:
+                        pass
+                    asyncio.create_task(send_to_lio_failed(url, org_id, sso_id, reason="private_profile", error_message=_err_msg_retry))
+                    return None
             else:
                 _plog(job_id, url, "VALIDATION", "all 3 retries returned empty/invalid profile — skipping", "error")
                 logger.error("[Pipeline] All 3 retries returned empty/invalid profile for %s — skipping", url)
