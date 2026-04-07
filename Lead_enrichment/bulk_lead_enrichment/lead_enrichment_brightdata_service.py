@@ -29,7 +29,12 @@ from typing import Any, Optional
 
 import httpx
 from db import get_pool, named_args
-from analytics import api_usage_service as _usage
+try:
+    from analytics import api_usage_service as _usage
+except ImportError:
+    class _usage:  # type: ignore
+        @staticmethod
+        async def track(*args, **kwargs): pass
 try:
     import redis.asyncio as aioredis
     _REDIS_AVAILABLE = True
