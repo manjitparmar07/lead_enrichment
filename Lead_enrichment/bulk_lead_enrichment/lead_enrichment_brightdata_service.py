@@ -5927,32 +5927,8 @@ async def enrich_company_url(
     logger.info("[Company-A] BD result: name=%r  website=%r  domain=%r  fields=%d",
                 company_name, website, domain, len(bd_co))
 
-    # ── Phase B: Apollo fill-in ───────────────────────────────────────────────
-    logger.info("━━━ [Company-B] Apollo enrichment for: %r (domain=%s)", company_name, domain)
-    apollo_data: dict = {}
-
-    # Try by domain first (if BD gave us one)
-    if domain:
-        apollo_data = await _try_apollo_org(domain) or {}
-        if apollo_data:
-            logger.info("[Company-B] Apollo by domain OK — %d fields", len(apollo_data))
-
-    # Fallback: search by name
-    if not apollo_data and company_name:
-        apollo_data = await _try_apollo_company_search(company_name) or {}
-        if apollo_data:
-            # Extract verified domain from Apollo result
-            ap_web = apollo_data.get("company_website", "")
-            if ap_web:
-                m2 = re.search(r"https?://(?:www\.)?([^/?\s]+)", ap_web)
-                if m2 and m2.group(1).lower() not in _SOCIAL_DOMAINS:
-                    domain = m2.group(1).lower()
-                    website = ap_web
-            logger.info("[Company-B] Apollo by name OK — %d fields, domain=%s", len(apollo_data), domain)
-
-    # Merge: BD takes priority, Apollo fills missing fields
+    # Merge: BD data only (Apollo removed)
     company_data: dict = {}
-    company_data.update(apollo_data)
     company_data.update({k: v for k, v in bd_co.items() if v})
 
     # Re-sync website/domain from merged data
@@ -7341,30 +7317,16 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             except Exception:
                 pass
 
-        # Company waterfall + contact lookup both removed from bulk path.
-        # Company enrichment → POST /api/leads/view/company
-        # Email enrichment  → POST /api/leads/view/email
-        company_extras = {}
-        company_wf_log = []
-        contact = {}
-
-        verified_domain = domain
-        # real_website not used in bulk — website scrape is done via /view/company only
-        profile["_company_extras"] = {}
-
-        # ── Stage 2: ENRICHING — LLM only (website scrape removed from bulk path) ──
-        # Website scrape (11 concurrent fetches + LLM ~30-60s) is NOT called here.
-        # Use POST /view/company to fetch company/website intelligence on demand.
+        # ── Stage 2: ENRICHING — LLM only ────────────────────────────────────────
         async with get_pool().acquire() as _conn:
             await _conn.execute(
                 "UPDATE enriched_leads SET status='enriching', updated_at=NOW() WHERE id=$1",
                 lead_id,
             )
-        _plog(job_id, url, "ENRICHING", f"email={contact.get('email') if isinstance(contact, dict) else '?'!r}")
+        _plog(job_id, url, "ENRICHING", "sending to LLM")
         logger.info("[Pipeline] %s → enriching", url)
 
-        website_intel = {}  # populated via /view/company — not in bulk path
-        enrichment = await build_comprehensive_enrichment(url, profile, contact, website_intel={}, org_id=org_id)
+        enrichment = await build_comprehensive_enrichment(url, profile, {}, website_intel={}, org_id=org_id)
 
         scoring = enrichment.get("lead_scoring", enrichment.get("scoring", {}))
         tier_raw = scoring.get("icp_match_tier") or scoring.get("score_tier", "")
@@ -7382,18 +7344,11 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
         outreach = enrichment.get("outreach", {})
         crm = enrichment.get("crm", {})
         ls = enrichment.get("lead_scoring", scoring)
-        wi = enrichment.get("website_intelligence", website_intel or {})
+        wi = enrichment.get("website_intelligence", {})
 
         # Build waterfall log
         waterfall_log = [
             {"step": 0, "source": "Bright Data", "fields_found": ["profile"], "note": f"LinkedIn scrape: {url}"},
-            *company_wf_log,
-            {
-                "step": 10,
-                "source": contact.get("source") or "none",
-                "fields_found": ["email"],
-                "note": f"email={contact.get('email')}",
-            },
         ]
 
         lead = {
@@ -7405,7 +7360,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             "work_email": None,
             "personal_email": None,
             "direct_phone": pp.get("direct_phone") or ident.get("direct_phone"),
-            "twitter": pp.get("twitter") or ident.get("twitter") or contact.get("twitter"),
+            "twitter": pp.get("twitter") or ident.get("twitter"),
             "city": pp.get("city") or ident.get("city"),
             "country": pp.get("country") or ident.get("country"),
             "timezone": pp.get("timezone") or ident.get("timezone"),
@@ -7431,16 +7386,16 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             "annual_revenue": cp.get("annual_revenue_est") or comp_legacy.get("annual_revenue_est"),
             "tech_stack": _safe_json(cp.get("tech_stack") or comp_legacy.get("tech_stack")),
             "hiring_velocity": cin.get("hiring_velocity") or comp_legacy.get("hiring_velocity"),
-            "avatar_url": _extract_avatar(profile) or contact.get("avatar_url"),
-            "company_logo": cp.get("company_logo") or company_extras.get("company_logo"),
-            "company_email": cp.get("company_email") or company_extras.get("company_email"),
-            "company_description": wi.get("company_description") or company_extras.get("company_description"),
-            "company_linkedin": ci.get("linkedin_url") or company_extras.get("company_linkedin") or contact.get("company_linkedin"),
-            "company_twitter": cp.get("company_twitter") or company_extras.get("company_twitter"),
-            "company_phone": cp.get("company_phone") or company_extras.get("company_phone"),
+            "avatar_url": _extract_avatar(profile),
+            "company_logo": cp.get("company_logo"),
+            "company_email": cp.get("company_email"),
+            "company_description": wi.get("company_description"),
+            "company_linkedin": ci.get("linkedin_url"),
+            "company_twitter": cp.get("company_twitter"),
+            "company_phone": cp.get("company_phone"),
             "waterfall_log": json.dumps(waterfall_log),
             # Stage 3 — Website Intelligence
-            "website_intelligence": json.dumps(website_intel or {}),
+            "website_intelligence": json.dumps({}),
             "product_offerings": _safe_json(wi.get("product_offerings")),
             "value_proposition": wi.get("value_proposition"),
             "target_customers": _safe_json(wi.get("target_customers")),
@@ -7486,7 +7441,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             "full_data": json.dumps({
                 "person_profile": enrichment.get("person_profile", {}),
                 "company_identity": enrichment.get("company_identity", {}),
-                "website_intelligence": enrichment.get("website_intelligence", website_intel or {}),
+                "website_intelligence": enrichment.get("website_intelligence", {}),
                 "company_profile": enrichment.get("company_profile", {}),
                 "company_intelligence": enrichment.get("company_intelligence", {}),
                 "intent_signals": enrichment.get("intent_signals", {}),
@@ -7525,8 +7480,8 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
                 _patch_crm_brief_scores(
                     _patch_crm_brief_images(
                         enrichment.get("crm_brief"),
-                        avatar_url=_extract_avatar(profile) or contact.get("avatar_url") or "",
-                        company_logo=cp.get("company_logo") or company_extras.get("company_logo") or "",
+                        avatar_url=_extract_avatar(profile) or "",
+                        company_logo=cp.get("company_logo") or "",
                     ),
                     icp_fit_score=_safe_int(ls.get("icp_fit_score")),
                     intent_score=_safe_int(ls.get("intent_score")),
