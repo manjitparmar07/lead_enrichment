@@ -29,6 +29,7 @@ from typing import Any, Optional
 
 import httpx
 from db import get_pool, named_args
+from analytics import api_usage_service as _usage
 try:
     import redis.asyncio as aioredis
     _REDIS_AVAILABLE = True
@@ -65,11 +66,6 @@ _job_webhook_locks: dict[str, asyncio.Lock] = {}
 _BD_TRIGGER_CONCURRENCY = int(os.getenv("BD_TRIGGER_CONCURRENCY", "50"))
 _bd_trigger_semaphore: asyncio.Semaphore = asyncio.Semaphore(_BD_TRIGGER_CONCURRENCY)
 
-# ── Sequential fallback concurrency cap ────────────────────────────────────────
-# When Redis is unavailable, enrich_bulk falls back to asyncio.create_task().
-# This semaphore prevents unbounded concurrent background tasks under that path.
-_SEQUENTIAL_FALLBACK_CONCURRENCY = int(os.getenv("SEQUENTIAL_FALLBACK_CONCURRENCY", "10"))
-_sequential_fallback_sem: asyncio.Semaphore = asyncio.Semaphore(_SEQUENTIAL_FALLBACK_CONCURRENCY)
 
 # ── Bright Data ───────────────────────────────────────────────────────────────
 # All keys read lazily from keys_service so admin hot-reload works at request time.
@@ -86,7 +82,6 @@ def _k(name: str, default: str = "") -> str:
 def _bd_api_key()         -> str:  return _k("BRIGHT_DATA_API_KEY")
 def _bd_profile_dataset() -> str:  return _k("BD_PROFILE_DATASET_ID", "gd_l1viktl72bvl7bjuj0")
 def _bd_company_dataset() -> str:  return _k("BD_COMPANY_DATASET_ID", "gd_l1vikfnt1wgvvqz95w")
-def _hunter_api_key()     -> str:  return _k("HUNTER_API_KEY")
 def _apollo_api_key()     -> str:  return _k("APOLLO_API_KEY")
 def _dropcontact_key()    -> str:  return _k("DROPCONTACT_API_KEY")
 def _pdl_api_key()        -> str:  return _k("PDL_API_KEY")
@@ -94,10 +89,8 @@ def _zerobounce_key()     -> str:  return _k("ZEROBOUNCE_API_KEY")
 def _wb_llm_host()        -> str:  return _k("WB_LLM_HOST", "http://ai-llm.worksbuddy.ai")
 def _wb_llm_key()         -> str:  return _k("WB_LLM_API_KEY")
 def _wb_llm_model()       -> str:  return _k("WB_LLM_DEFAULT_MODEL", "wb-pro")
-def _groq_key()           -> str:  return _k("GROQ_API_KEY")
-def _groq_model()         -> str:  return _k("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")
 def _hf_token()           -> str:  return _k("HF_TOKEN")
-def _hf_model()           -> str:  return _k("HF_MODEL", "Qwen/Qwen2.5-72B-Instruct")
+def _hf_model()           -> str:  return _k("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 def _outreach_threshold() -> int:
     try: return int(_k("LEAD_OUTREACH_THRESHOLD", "50"))
     except ValueError: return 50
@@ -115,13 +108,10 @@ async def _outreach_threshold_for_org(org_id: str) -> int:
 # Backward-compat module-level names (read once at import; services use _fn() at call time)
 BD_API_KEY         = ""  # use _bd_api_key() inside functions
 BD_PROFILE_DATASET = ""  # use _bd_profile_dataset() inside functions
-HUNTER_API_KEY     = ""  # use _hunter_api_key() inside functions
 APOLLO_API_KEY     = ""  # use _apollo_api_key() inside functions
 WB_LLM_HOST        = ""  # use _wb_llm_host() inside functions
 WB_LLM_KEY         = ""  # use _wb_llm_key() inside functions
 WB_LLM_MODEL       = ""  # use _wb_llm_model() inside functions
-GROQ_KEY           = ""  # use _groq_key() inside functions
-GROQ_MODEL         = ""  # use _groq_model() inside functions
 OUTREACH_THRESHOLD = 50  # use _outreach_threshold() inside functions
 
 # ── DB ────────────────────────────────────────────────────────────────────────
@@ -310,7 +300,7 @@ LIO_RECEIVE_URL = os.getenv("LIO_RECEIVE_URL", "https://api-lio.worksbuddy.ai/ap
 _JWT_SECRET     = os.getenv("JWT_SECRET", "")
 _LIO_TOKEN      = os.getenv("LIO_TOKEN", "")   # dedicated bearer token for LIO auth
 _lio_client: Optional[httpx.AsyncClient] = None
-_api_client: Optional[httpx.AsyncClient] = None   # Hunter / Apollo / Dropcontact / PDL / ZeroBounce
+_api_client: Optional[httpx.AsyncClient] = None   # Apollo / Dropcontact / PDL / ZeroBounce
 _bd_client: Optional[httpx.AsyncClient] = None    # Bright Data
 _web_client: Optional[httpx.AsyncClient] = None   # Website scraping (follow redirects)
 
@@ -342,7 +332,7 @@ def _get_lio_client() -> httpx.AsyncClient:
 
 
 def _get_api_client() -> httpx.AsyncClient:
-    """Shared client for Hunter, Apollo, Dropcontact, PDL, ZeroBounce."""
+    """Shared client for Apollo, Dropcontact, PDL, ZeroBounce."""
     global _api_client
     if _api_client is None or _api_client.is_closed:
         _api_client = httpx.AsyncClient(timeout=25.0, limits=_HTTP_LIMITS)
@@ -519,6 +509,7 @@ async def send_to_lio_failed(
     org_id: str,
     sso_id: str = "",
     reason: str = "enrichment_failed",
+    message: str = "",
 ) -> None:
     """
     Notify LIO that a LinkedIn URL failed enrichment.
@@ -527,19 +518,22 @@ async def send_to_lio_failed(
     url = LIO_RECEIVE_URL
     if not url:
         return
+    enrichment_data: dict = {
+        "status":       "failed",
+        "linkedin_url": linkedin_url,
+        "error_reason": reason,
+    }
+    if message:
+        enrichment_data["message"] = message
     payload = {
-        "enrichment_data": {
-            "status":       "failed",
-            "linkedin_url": linkedin_url,
-            "error_reason": reason,
-        },
+        "enrichment_data": enrichment_data,
         "sso_id":          sso_id,
         "organization_id": org_id,
     }
     try:
         client = _get_lio_client()
         resp = await client.post(url, json=payload)
-        logger.info("[LIO-FAILED] Sent failure for %s → HTTP %s", linkedin_url, resp.status_code)
+        logger.info("[LIO-FAILED] Sent failure for %s → HTTP %s (reason=%s)", linkedin_url, resp.status_code, reason)
     except Exception as e:
         logger.warning("[LIO-FAILED] Could not notify LIO for %s: %s", linkedin_url, e)
 
@@ -1512,14 +1506,28 @@ async def _upsert_lead(lead: dict) -> None:
     # ── Step 5: build SQL ──────────────────────────────────────────────────────
     cols = [k for k in lead if k != "id"]
     all_keys = ["id"] + cols
-    placeholders = ", ".join(f"${i + 1}" for i in range(len(all_keys)))
-    updates = ", ".join(f"{k}=EXCLUDED.{k}" for k in cols)
-    sql = f"""
-        INSERT INTO enriched_leads ({', '.join(all_keys)})
-        VALUES ({placeholders})
-        ON CONFLICT(id) DO UPDATE SET {updates}
-    """
-    args = [lead[k] for k in all_keys]
+
+    # If only a few fields are being updated (partial patch like company_linkedin),
+    # use UPDATE only to avoid NOT NULL constraint failures on INSERT.
+    _REQUIRED_INSERT_FIELDS = {"linkedin_url", "organization_id"}
+    _is_partial = not _REQUIRED_INSERT_FIELDS.issubset(set(cols))
+
+    if _is_partial:
+        # Pure UPDATE — safe for partial patches
+        set_clause = ", ".join(f"{k}=${i + 2}" for i, k in enumerate(cols))
+        sql = f"UPDATE enriched_leads SET {set_clause} WHERE id=$1"
+        args = [lead["id"]] + [lead[k] for k in cols]
+        _pipeline_log.info("[DB-SAVE] [STEP-5] SQL built — partial UPDATE %d cols, executing", len(cols))
+    else:
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(all_keys)))
+        updates = ", ".join(f"{k}=EXCLUDED.{k}" for k in cols)
+        sql = f"""
+            INSERT INTO enriched_leads ({', '.join(all_keys)})
+            VALUES ({placeholders})
+            ON CONFLICT(id) DO UPDATE SET {updates}
+        """
+        args = [lead[k] for k in all_keys]
+        _pipeline_log.info("[DB-SAVE] [STEP-5] SQL built — %d columns, executing INSERT/UPDATE", len(all_keys))
     _pipeline_log.info("[DB-SAVE] [STEP-5] SQL built — %d columns, executing INSERT/UPDATE", len(all_keys))
 
     # ── Step 6: execute ────────────────────────────────────────────────────────
@@ -2035,7 +2043,6 @@ async def _call_llm(
     max_tokens: int = 1800,
     temperature: float = 0.3,
     model_override: Optional[str] = None,
-    groq_api_key: Optional[str] = None,
     wb_llm_host_override: Optional[str] = None,
     wb_llm_key_override: Optional[str] = None,
     wb_llm_model_override: Optional[str] = None,
@@ -2070,6 +2077,7 @@ async def _call_llm(
                 logger.info("[LLM] HuggingFace (%s) attempt %d/3 payload=%d chars", hf_model, attempt + 1, payload_chars)
                 result = await _post("https://router.huggingface.co", hf_token, hf_model, messages)
                 logger.info("[LLM] HuggingFace OK — attempt %d", attempt + 1)
+                await _usage.track("huggingface", "llm_call")
                 return result
             except Exception as e:
                 logger.warning("[LLM] HuggingFace failed (attempt %d/3): %s", attempt + 1, e)
@@ -2259,9 +2267,6 @@ def _normalize_bd_profile(raw: dict) -> dict:
     # BD returns "avatar" at top level; service uses "avatar_url"
     if not p.get("avatar_url"):
         p["avatar_url"] = p.get("avatar") or p.get("profile_image") or p.get("photo") or ""
-    # Suppress generic LinkedIn placeholder — BD sets default_avatar: true when no real photo
-    if p.get("default_avatar"):
-        p["avatar_url"] = ""
 
     # ── Banner image ─────────────────────────────────────────────────────────
     if not p.get("banner_image"):
@@ -2712,6 +2717,7 @@ async def fetch_profile_sync(linkedin_url: str) -> dict:
                     headers=_bd_headers(),
                     json=[{"url": url}],
                 )
+                await _usage.track("brightdata", "profile")
 
                 if resp.status_code == 429:
                     wait = _bd_rate_limit_wait(resp)
@@ -3030,23 +3036,6 @@ def _extract_domain(company_name: str, website: str = "") -> str:
     return ""
 
 
-async def _try_hunter(first: str, last: str, domain: str) -> Optional[dict]:
-    if not _hunter_api_key() or not domain:
-        return None
-    try:
-        c = _get_api_client()
-        r = await c.get("https://api.hunter.io/v2/email-finder", params={
-            "domain": domain, "first_name": first, "last_name": last, "api_key": _hunter_api_key(),
-        })
-        d = r.json().get("data", {})
-        if d.get("email") and d.get("score", 0) >= 50:
-            logger.info("[Hunter] Found: %s (score=%s)", d["email"], d["score"])
-            return {"email": d["email"], "source": "hunter", "confidence": "high" if d["score"] >= 80 else "medium"}
-    except Exception as e:
-        logger.warning("[Hunter] %s", e)
-    return None
-
-
 async def _try_apollo(first: str, last: str, domain: str, linkedin_url: str = "") -> Optional[dict]:
     if not _apollo_api_key() or (not domain and not linkedin_url):
         return None
@@ -3061,6 +3050,7 @@ async def _try_apollo(first: str, last: str, domain: str, linkedin_url: str = ""
             headers={"Content-Type": "application/json", "X-Api-Key": _apollo_api_key()},
             json=payload,
         )
+        await _usage.track("apollo", "person_match")
         body = r.json()
         p   = body.get("person") or {}
         org = body.get("organization") or {}
@@ -3192,47 +3182,34 @@ async def find_contact_info(
     last: str,
     domain: str,
     linkedin_url: str = "",
-    skip_hunter: bool = False,
     skip_apollo: bool = False,
 ) -> dict:
     """
-    6-step email discovery waterfall:
-      1. Hunter.io   — name + domain lookup
-      2. Apollo.io   — person match
-      3. Dropcontact — LinkedIn URL or name+domain
-      4. PDL         — People Data Labs person enrichment
-      5. Pattern guess — first.last@domain, flast@domain, first@domain
-      6. ZeroBounce  — verify whichever email was found
+    5-step email discovery waterfall:
+      1. Apollo.io   — person match
+      2. Dropcontact — LinkedIn URL or name+domain
+      3. PDL         — People Data Labs person enrichment
+      4. Pattern guess — first.last@domain, flast@domain, first@domain
+      5. ZeroBounce  — verify whichever email was found
 
     Returns: {email, phone, source, confidence, verified, bounce_risk}
     """
     result: Optional[dict] = None
 
-    # Steps 1 + 2 — Hunter and Apollo in parallel (saves 2-4s vs sequential)
-    run_hunter = not skip_hunter and bool(_hunter_api_key()) and bool(domain)
-    run_apollo = not skip_apollo and bool(_apollo_api_key()) and bool(domain)
-
     async def _noop() -> None:
         return None
 
-    if run_hunter or run_apollo:
-        hunter_coro = _try_hunter(first, last, domain) if run_hunter else _noop()
-        apollo_coro = _try_apollo(first, last, domain) if run_apollo else _noop()
-        hunter_res, apollo_res = await asyncio.gather(hunter_coro, apollo_coro, return_exceptions=True)
-
-        if isinstance(hunter_res, dict) and hunter_res.get("email"):
-            result = hunter_res
-            logger.info("[ContactWaterfall] Step 1 Hunter hit: %s", result.get("email"))
-        elif isinstance(apollo_res, dict) and apollo_res.get("email"):
+    # Step 1 — Apollo
+    run_apollo = not skip_apollo and bool(_apollo_api_key()) and bool(domain)
+    if run_apollo:
+        apollo_res = await _try_apollo(first, last, domain)
+        if isinstance(apollo_res, dict) and apollo_res.get("email"):
             result = apollo_res
-            logger.info("[ContactWaterfall] Step 2 Apollo hit: %s", result.get("email"))
+            logger.info("[ContactWaterfall] Step 1 Apollo hit: %s", result.get("email"))
         else:
-            if not run_hunter:
-                logger.info("[ContactWaterfall] Step 1 Hunter skipped (disabled/no credits)")
-            if not run_apollo:
-                logger.info("[ContactWaterfall] Step 2 Apollo skipped (disabled/no credits)")
+            logger.info("[ContactWaterfall] Step 1 Apollo skipped (disabled/no credits)")
 
-    # Steps 3 + 4 — Dropcontact and PDL in parallel (saves 2-4s vs sequential)
+    # Steps 2 + 3 — Dropcontact and PDL in parallel (saves 2-4s vs sequential)
     if not result:
         run_dc  = bool(_dropcontact_key())
         run_pdl = bool(_pdl_api_key())
@@ -3242,12 +3219,12 @@ async def find_contact_info(
             dc_res, pdl_res = await asyncio.gather(dc_coro, pdl_coro, return_exceptions=True)
             if isinstance(dc_res, dict) and dc_res.get("email"):
                 result = dc_res
-                logger.info("[ContactWaterfall] Step 3 Dropcontact hit: %s", result.get("email"))
+                logger.info("[ContactWaterfall] Step 2 Dropcontact hit: %s", result.get("email"))
             elif isinstance(pdl_res, dict) and pdl_res.get("email"):
                 result = pdl_res
-                logger.info("[ContactWaterfall] Step 4 PDL hit: %s", result.get("email"))
+                logger.info("[ContactWaterfall] Step 3 PDL hit: %s", result.get("email"))
 
-    # Step 5 — Pattern guess
+    # Step 4 — Pattern guess
     if not result and first and last and domain:
         last_clean = last.lower().replace(" ", "")
         guesses = [
@@ -3256,7 +3233,7 @@ async def find_contact_info(
             f"{first.lower()}@{domain}",
         ]
         result = {"email": guesses[0], "phone": None, "source": "pattern_guess", "confidence": "low"}
-        logger.info("[ContactWaterfall] Step 5 Pattern guess: %s", guesses[0])
+        logger.info("[ContactWaterfall] Step 4 Pattern guess: %s", guesses[0])
 
     if not result:
         return {"email": None, "phone": None, "source": None, "confidence": None,
@@ -3268,7 +3245,7 @@ async def find_contact_info(
                        result.get("source"), result.get("email"))
         result["email"] = None
 
-    # Step 6 — ZeroBounce verification (always run if email found)
+    # Step 5 — ZeroBounce verification (always run if email found)
     email = result.get("email")
     if email:
         zb = await _try_zerobounce(email)
@@ -3439,43 +3416,6 @@ def _guess_domain_variants(company_name: str) -> list[str]:
             variants.insert(0, f"{acronym}.com")
 
     return variants
-
-
-async def _try_hunter_domain(domain: str) -> dict:
-    """Hunter.io domain search — company emails, description, social links."""
-    if not _hunter_api_key() or not domain:
-        return {}
-    try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get("https://api.hunter.io/v2/domain-search", params={
-                "domain": domain, "api_key": _hunter_api_key(), "limit": 10,
-            })
-            if r.status_code != 200:
-                return {}
-            data = r.json().get("data", {})
-            emails = data.get("emails") or []
-            generic_prefixes = ["info", "contact", "hello", "support", "sales", "admin", "team", "hi"]
-            company_email = None
-            for e in emails:
-                prefix = e.get("value", "").split("@")[0].lower()
-                if any(p in prefix for p in generic_prefixes):
-                    company_email = e["value"]
-                    break
-            if not company_email and emails:
-                company_email = emails[0].get("value")
-            logger.info("[Hunter Domain] %d emails found, company_email=%s", len(emails), company_email)
-            return {
-                "company_email": company_email,
-                "company_description": data.get("description"),
-                "company_twitter": data.get("twitter"),
-                "company_linkedin": data.get("linkedin"),
-                "company_phone": data.get("phone_number"),
-                "company_website": f"https://{domain}" if not data.get("website") else data["website"],
-                "employee_count": data.get("employees") or 0,
-            }
-    except Exception as e:
-        logger.warning("[Hunter Domain] %s", e)
-    return {}
 
 
 def _normalize_bd_company(c: dict) -> dict:
@@ -3702,6 +3642,7 @@ async def _try_bd_company(company_linkedin_url: str) -> dict:
                 headers=_bd_headers(),
                 json={"input": [{"url": company_linkedin_url}]},
             )
+            await _usage.track("brightdata", "company")
             logger.debug("[BD Company] /scrape status=%s body=%.300s", resp.status_code, resp.text)
 
             if resp.status_code not in (200, 202):
@@ -3745,7 +3686,7 @@ async def _try_bd_company(company_linkedin_url: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Company CRM LLM Enrichment — Qwen2.5-72B via HuggingFace Router
+# Company CRM LLM Enrichment — Qwen2.5-7B via HuggingFace Router
 # ─────────────────────────────────────────────────────────────────────────────
 
 _COMPANY_CRM_SYSTEM_PROMPT = """You are an expert B2B CRM data analyst. Your job is to enrich raw company data from LinkedIn and Apollo into a fully structured, CRM-ready profile.
@@ -3846,14 +3787,14 @@ async def _fetch_apollo_company_raw(company_name: str, domain: str) -> dict:
 
 async def _enrich_company_with_llm(bd_raw: dict, apollo_raw: dict, company_name: str) -> dict:
     """
-    Call Qwen2.5-72B (HuggingFace Router) with combined BD + Apollo company data.
+    Call Qwen2.5-7B (HuggingFace Router) with combined BD + Apollo company data.
     Returns parsed CRM profile dict, or {} on failure.
     """
     if not bd_raw and not apollo_raw:
         return {}
     try:
         user_prompt = _build_company_crm_user_prompt(bd_raw, apollo_raw, company_name)
-        logger.info("[CompanyLLM] Calling Qwen2.5-72B for company: %s", company_name)
+        logger.info("[CompanyLLM] Calling Qwen2.5-7B for company: %s", company_name)
         raw = await _call_llm(
             [
                 {"role": "system", "content": _COMPANY_CRM_SYSTEM_PROMPT},
@@ -3861,7 +3802,7 @@ async def _enrich_company_with_llm(bd_raw: dict, apollo_raw: dict, company_name:
             ],
             max_tokens=4000,
             temperature=0.2,
-            hf_first=True,  # Qwen2.5-72B via HF router → Groq fallback
+            hf_first=True,  # Qwen2.5-7B via HF router
         )
         if not raw:
             logger.warning("[CompanyLLM] No response from LLM for %s", company_name)
@@ -3895,7 +3836,7 @@ async def enrich_company_waterfall(company_name: str, domain: str, profile: dict
       1. Bright Data person profile fields (logo, industry, employee count, etc.)
       2. Clearbit Logo API (free, logo-only fallback when BD returns no logo)
       3. Apollo.io raw data fetch (parallel with step 2)
-      4. Qwen2.5-72B LLM enrichment — BD + Apollo → full CRM profile
+      4. Qwen2.5-7B LLM enrichment — BD + Apollo → full CRM profile
     Returns (company_data dict, waterfall_log list)
     """
     log: list[dict] = []
@@ -3981,7 +3922,7 @@ async def enrich_company_waterfall(company_name: str, domain: str, profile: dict
         if apollo_raw:
             log.append({"step": 3, "source": "Apollo.io (API)", "fields_found": list(apollo_raw.keys())[:8], "note": apollo_raw.get("name", "")})
 
-    # Step 4: Qwen2.5-72B LLM enrichment — BD + Apollo → full CRM profile
+    # Step 4: Qwen2.5-7B LLM enrichment — BD + Apollo → full CRM profile
     # Merge profile company fields into bd_raw for richer LLM context
     bd_for_llm = {
         **bd_raw,
@@ -4030,11 +3971,7 @@ async def enrich_company_waterfall(company_name: str, domain: str, profile: dict
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_avatar(profile: dict) -> Optional[str]:
-    """Extract avatar/photo URL from Bright Data profile fields.
-    Returns None when BD signals a generic placeholder (default_avatar: true).
-    """
-    if profile.get("default_avatar"):
-        return None
+    """Extract avatar/photo URL from Bright Data profile fields."""
     for key in ["avatar_url", "profile_pic_src", "profile_picture", "image_url", "image", "photo", "avatar"]:
         v = profile.get(key)
         if v and isinstance(v, str) and v.startswith("http"):
@@ -4464,7 +4401,7 @@ Use empty string "" for unknown text, 0 for unknown numbers, [] for unknown arra
   }},
   "crm": {{
     "lead_source": "LinkedIn URL",
-    "enrichment_source": "Bright Data + Hunter.io",
+    "enrichment_source": "Bright Data + Apollo",
     "enrichment_date": "{now_iso}",
     "enrichment_depth": "Deep",
     "data_completeness": 0,
@@ -4488,7 +4425,7 @@ SCORING GUIDE:
 - OUTREACH: Use website_intelligence.value_proposition and website_intelligence.problem_solved as primary angle
 - Cold email: max 120 words, natural tone, reference real company context
 - LinkedIn note: max 300 chars
-- email_status: "Valid — verified" if hunter/apollo found it, "Pattern guess — unverified" otherwise
+- email_status: "Valid — verified" if apollo found it, "Pattern guess — unverified" otherwise
 - tags: 3-6 relevant tags like ["SaaS","VP-Eng","Series-B","Hot","San Francisco"]"""
 
 
@@ -4818,7 +4755,7 @@ async def generate_outreach_with_lio(lead: dict, org_id: str = "default") -> dic
     if not raw:
         raise RuntimeError(
             "LLM unavailable — outreach could not be generated. "
-            "Check that GROQ_API_KEY or WB_LLM_HOST is configured."
+            "Check that HF_TOKEN or WB_LLM_HOST is configured."
         )
 
     result = _parse_json_from_llm(raw)
@@ -5002,23 +4939,21 @@ async def build_comprehensive_enrichment(
     )
     if effective_crm_prompt:
         try:
-            # Send FULL profile — no trimming. Qwen2.5-72B has 128K context window.
-            # Groq has a 6K token limit so trimming was needed there, but HF Qwen handles full data.
+            # Send FULL profile — no trimming. Qwen2.5-7B has 128K context window.
+            # HF Qwen handles full data with 128K context window.
             _optimized = _build_llm_profile(profile)
             raw_profile_str = json.dumps(_optimized, separators=(",", ":"), ensure_ascii=False, default=str)
             crm_brief_user = f"Analyze this LinkedIn prospect data and return the JSON exactly as specified:\n\n{raw_profile_str}"
-            hf_ok  = bool(_hf_token())
-            grq_ok = bool(_groq_key())
-            logger.info("[Enrichment] CRM brief LLM call — hf=%s groq=%s org=%s model=Qwen2.5-72B-Instruct", hf_ok, grq_ok, org_id)
-            # HuggingFace (Qwen2.5-72B) first → Groq fallback
-            # hf_first=True skips WB LLM and goes directly to HF router
+            hf_ok = bool(_hf_token())
+            logger.info("[Enrichment] CRM brief LLM call — hf=%s org=%s model=Qwen2.5-7B-Instruct", hf_ok, org_id)
+            # HuggingFace (Qwen2.5-7B) — hf_first=True skips WB LLM and goes directly to HF router
             brief = await _call_llm([
                 {"role": "system", "content": effective_crm_prompt},
                 {"role": "user",   "content": crm_brief_user},
             ], max_tokens=4500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override,
                hf_first=True)
             if not brief:
-                logger.warning("[Enrichment] CRM brief — all LLM providers returned None (hf=%s groq=%s)", hf_ok, grq_ok)
+                logger.warning("[Enrichment] CRM brief — HuggingFace returned None (hf=%s)", hf_ok)
             else:
                 import re as _re
                 # Strip ALL <think>...</think> blocks (qwen3, deepseek, etc.)
@@ -5058,7 +4993,7 @@ def _build_llm_profile(profile: dict) -> dict:
     Strips pure noise (people_also_viewed, HTML duplicates, logo URLs, internal IDs)
     but keeps ALL signal content — experience descriptions, posts, activity, recommendations,
     volunteer work, languages, groups — to maximise model context utilisation.
-    Qwen2.5-72B has a 128K context window; we target ~30-40K chars of signal-dense content.
+    Qwen2.5-7B has a 128K context window; we target ~30-40K chars of signal-dense content.
     """
     # ── Experience — full descriptions, drop HTML + logo URLs + internal IDs ───────
     def _clean_exp(items):
@@ -5416,7 +5351,7 @@ def _rule_based_enrichment(
 
     # Email status
     src = contact.get("source") or ""
-    email_status = ("Valid — verified" if src in ("hunter", "apollo")
+    email_status = ("Valid — verified" if src in ("apollo",)
                     else "Pattern guess — unverified" if src == "pattern_guess"
                     else "Not found")
 
@@ -5510,7 +5445,7 @@ def _rule_based_enrichment(
             "linkedin_activity": f"{profile.get('followers', 0):,} followers" if profile.get("followers") else "",
             "followers": _safe_int(profile.get("followers")),
             "connections": _safe_int(profile.get("connections")),
-            "work_email": email if src in ("hunter", "apollo") else "",
+            "work_email": email if src == "apollo" else "",
             "personal_email": None,
             "direct_phone": contact.get("phone"),
             "twitter": contact.get("twitter"),
@@ -5625,7 +5560,7 @@ def _rule_based_enrichment(
         # ── Legacy compatibility keys ──────────────────────────────────────
         "identity": {
             "full_name": name,
-            "work_email": email if src in ("hunter", "apollo") else "",
+            "work_email": email if src == "apollo" else "",
             "personal_email": None,
             "direct_phone": contact.get("phone"),
             "linkedin_url": linkedin_url,
@@ -5874,9 +5809,8 @@ async def enrich_company_url(
 
     Phase A — Bright Data company dataset scrape
     Phase B — Apollo company name/website search (fills gaps)
-    Phase C — Hunter.io domain search (company emails, links)
-    Phase D — Website intelligence (deep scrape)
-    Phase E — Score + store
+    Phase C — Website intelligence (deep scrape)
+    Phase D — Score + store
 
     Returns the same flat DB dict as enrich_single() so the same
     UI and API response shape is used for both person and company enrichment.
@@ -5939,29 +5873,10 @@ async def enrich_company_url(
         if m3:
             domain = m3.group(1).lower()
 
-    # ── Phase C: Hunter domain search ─────────────────────────────────────────
-    logger.info("━━━ [Company-C] Hunter domain search: %s", domain)
     company_email = company_data.get("company_email", "")
-    if domain and not company_email:
-        try:
-            async with httpx.AsyncClient(timeout=20) as c:
-                r = await c.get(
-                    "https://api.hunter.io/v2/domain-search",
-                    params={"domain": domain, "api_key": _hunter_api_key(), "limit": 3},
-                )
-                hd = r.json().get("data", {})
-                if hd.get("organization"):
-                    company_data.setdefault("company_name_verified", hd["organization"])
-                emails = hd.get("emails", [])
-                if emails:
-                    company_email = emails[0].get("value", "")
-                    company_data["company_email"] = company_email
-                    logger.info("[Company-C] Hunter found email: %s", company_email)
-        except Exception as e:
-            logger.debug("[Company-C] Hunter error: %s", e)
 
-    # ── Phase D: Website intelligence ─────────────────────────────────────────
-    logger.info("━━━ [Company-D] Website intelligence: %s", website or "none")
+    # ── Phase C: Website intelligence ─────────────────────────────────────────
+    logger.info("━━━ [Company-C] Website intelligence: %s", website or "none")
     website_intel = await scrape_website_intelligence(website) if website else {}
     if website_intel:
         logger.info("[Company-D] Scraped %d pages, category=%s",
@@ -6027,10 +5942,8 @@ async def enrich_company_url(
         waterfall_log.append({"step": 0, "source": "Bright Data Company", "fields_found": list(bd_co.keys()), "note": url})
     if apollo_data:
         waterfall_log.append({"step": 1, "source": "Apollo.io", "fields_found": list(apollo_data.keys()), "note": domain})
-    if company_email:
-        waterfall_log.append({"step": 2, "source": "Hunter.io", "fields_found": ["company_email"], "note": domain})
     if website_intel:
-        waterfall_log.append({"step": 3, "source": "Website Scrape", "fields_found": website_intel.get("pages_scraped", []), "note": website})
+        waterfall_log.append({"step": 2, "source": "Website Scrape", "fields_found": website_intel.get("pages_scraped", []), "note": website})
 
     wi = website_intel or {}
     lead: dict = {
@@ -6136,7 +6049,7 @@ async def enrich_company_url(
         "about": company_data.get("company_description", ""),
         "followers": _safe_int(company_data.get("followers_count") or company_data.get("employee_count")),
         "connections": 0,
-        "email_source": "hunter" if company_email else "",
+        "email_source": "apollo" if company_email else "",
         "email_confidence": "medium" if company_email else "",
         "status": "enriched",
         "job_id": job_id or "",
@@ -6182,16 +6095,15 @@ async def enrich_single(
     Phase B — Company Identification (using person profile data)
       Stage 3: Bright Data LinkedIn Company page scrape (company_link from profile)
       Stage 4: Apollo company name search → verify real domain + logo + description
-      Stage 5: Hunter.io domain search → company emails, social links
-      Stage 6: Clearbit logo fallback
+      Stage 5: Clearbit logo fallback
 
     Phase C — Person Contact Waterfall (now with VERIFIED company domain)
-      Stage 7: Hunter.io person email finder (correct domain)
-      Stage 8: Apollo.io person match (correct domain)
+      Stage 6: Apollo.io person match (correct domain)
+      Stage 7: Dropcontact / PDL fallback
 
     Phase D — Deep Intelligence
-      Stage 9: Website scrape (verified real company URL)
-      Stage 10: Lead scoring + outreach generation
+      Stage 8: Website scrape (verified real company URL)
+      Stage 9: Lead scoring + outreach generation
     """
     url = _normalize_linkedin_url(linkedin_url)
     lead_id = _lead_id(url)
@@ -6234,7 +6146,6 @@ async def enrich_single(
     # ── Tool availability (from enrichment config) ────────────────────────────
     _tools = tools or {}
     _brightdata_ok = _tools.get("brightdata", True)
-    _hunter_ok     = _tools.get("hunter",     True)
     _apollo_ok     = _tools.get("apollo",      True)
 
     if not _brightdata_ok:
@@ -6272,89 +6183,36 @@ async def enrich_single(
     logger.info("[Phase B] Verified domain: %s  website: %s  logo: %s",
                 verified_domain, real_website, "✓" if company_extras.get("company_logo") else "✗")
 
-    # ── Phases C + 1C + D in parallel (all independent once verified_domain is known) ──
-    logger.info("━━━ [Phase C+1C+D] Running contact / company / website in parallel")
+    # ── Phases C + 1C + D — DISABLED in bulk flow ─────────────────────────────
+    # Phase C (Email find)    → handled separately via /api/email-enrich/start
+    # Phase 1C (Company enrich) → handled separately via company enrichment API
+    # Phase D (Website scrape)  → commented out, not needed in bulk flow
+    logger.info("━━━ [Bulk] Skipping Phase C (email) / Phase 1C (company) / Phase D (website)")
 
     activity_emails = profile.get("_activity_emails") or []
     activity_phones = profile.get("_activity_phones") or []
 
-    async def _phase_c() -> dict:
-        if skip_contact:
-            return {}
-        if activity_emails:
-            matched = next((e for e in activity_emails if verified_domain and verified_domain.split(".")[0] in e), None)
-            pre_contact = matched or activity_emails[0]
-            result = {"email": pre_contact, "source": "linkedin_activity", "confidence": "high"}
-            if activity_phones:
-                result["phone"] = activity_phones[0]
-            return result
-        c = await find_contact_info(
-            first, last, verified_domain, linkedin_url=url,
-            skip_hunter=not _hunter_ok,
-            skip_apollo=not _apollo_ok,
-        )
-        if not c.get("phone") and activity_phones:
-            c["phone"] = activity_phones[0]
-        return c
+    # Phase C — skipped in bulk; email enrichment runs separately
+    contact: dict = {}
 
-    async def _phase_1c() -> tuple[dict, str, int]:
-        if not (raw_link and "linkedin.com/company/" in raw_link):
-            return {}, "", 0
-        try:
-            import company_service as _cs
-            from workspace import workspace_service as _ws_svc
-            _ws_cfg = await _ws_svc.get_workspace_config(org_id)
-            _known = {
-                "name":              company or company_extras.get("company_name") or "",
-                "domain":            verified_domain,
-                "website":           real_website,
-                "logo":              company_extras.get("company_logo") or "",
-                "description":       company_extras.get("company_description") or "",
-                "industry":          company_extras.get("industry") or "",
-                "employee_count":    company_extras.get("employee_count") or 0,
-                "hq_location":       company_extras.get("hq_location") or "",
-                "founded_year":      company_extras.get("founded_year") or "",
-                "funding_stage":     company_extras.get("funding_stage") or "",
-                "total_funding":     company_extras.get("total_funding") or "",
-                "last_funding_date": company_extras.get("last_funding_date") or "",
-                "lead_investor":     company_extras.get("lead_investor") or "",
-                "company_twitter":   company_extras.get("company_twitter") or "",
-                "company_email":     company_extras.get("company_email") or "",
-                "company_phone":     company_extras.get("company_phone") or "",
-                "linkedin_followers": company_extras.get("linkedin_followers") or 0,
-                "company_slogan":    company_extras.get("company_slogan") or "",
-                "organization_type": company_extras.get("organization_type") or "",
-            }
-            rec = await _cs.enrich_company(
-                company_linkedin_url=raw_link,
-                org_id=org_id,
-                ws_config=_ws_cfg,
-                known_data=_known,
-            )
-            return rec, rec.get("id") or "", int(rec.get("company_score") or 0)
-        except Exception as _ce:
-            logger.warning("[Phase 1C] Company enrichment failed: %s", _ce)
-            return {}, "", 0
+    # Phase 1C — skipped in bulk; company enrichment runs separately
+    _company_record: dict = {}
+    _company_id_val: str  = ""
+    _company_score: int   = 0
 
-    (contact, (_company_record, _company_id_val, _company_score), website_intel) = await asyncio.gather(
-        _phase_c(),
-        _phase_1c(),
-        scrape_website_intelligence(real_website),
-    )
+    # Phase D — website scrape commented out; not needed in bulk flow
+    # website_intel = await scrape_website_intelligence(real_website)
+    website_intel: dict = {}
+
     _combined_score: int = 0
 
-    logger.info("[Phase C] Contact: email=%s  source=%s  phone=%s",
-                contact.get("email") or "not found",
-                contact.get("source") or "—",
-                contact.get("phone") or "none")
-    if _company_record:
-        logger.info("[Phase 1C] Company done: score=%d tier=%s",
-                    _company_score, _company_record.get("company_score_tier", "?"))
-    if website_intel:
-        logger.info("[Phase D] Scraped %d pages, category=%s, biz_model=%s",
-                    len(website_intel.get("pages_scraped", [])),
-                    website_intel.get("product_category") or "?",
-                    website_intel.get("business_model") or "?")
+    logger.info("[Phase C] Skipped — email will be found via email enrichment API")
+    logger.info("[Phase 1C] Skipped — company will be enriched via company enrichment API")
+    # Phase D log — commented out (website scrape disabled in bulk flow)
+    # logger.info("[Phase D] Scraped %d pages, category=%s, biz_model=%s",
+    #             len(website_intel.get("pages_scraped", [])),
+    #             website_intel.get("product_category") or "?",
+    #             website_intel.get("business_model") or "?")
 
     logger.info("━━━ [Phase E] Scoring + Outreach — building 8-stage report")
 
@@ -6608,7 +6466,7 @@ async def enrich_single(
         "email_status": outreach.get("email_status"),
         # ── CRM ───────────────────────────────────────────────────────────────
         "lead_source": crm.get("lead_source", "LinkedIn URL"),
-        "enrichment_source": crm.get("enrichment_source", "Bright Data + Hunter.io"),
+        "enrichment_source": crm.get("enrichment_source", "Bright Data + Apollo"),
         "data_completeness": int(crm.get("data_completeness") or 0),
         "crm_stage": crm.get("crm_stage"),
         "tags": _safe_json(crm.get("tags")),
@@ -6732,8 +6590,8 @@ async def enrich_single_stream(
     Async generator that yields SSE events after each enrichment stage.
 
     Stage 1 — profile:   Bright Data person scrape
-    Stage 2 — company:   Company waterfall (BD + Apollo + Hunter + Clearbit)
-    Stage 3 — contact:   Email / phone waterfall (Hunter → Apollo → pattern)
+    Stage 2 — company:   Company waterfall (BD + Apollo + Clearbit)
+    Stage 3 — contact:   Email / phone waterfall (Apollo → Dropcontact → PDL → pattern)
     Stage 4 — website:   Website intelligence scrape + LLM extraction
     Stage 5 — scoring:   Comprehensive LLM scoring + outreach generation
     Stage 6 — complete:  Save to DB, return final lead object
@@ -7059,7 +6917,7 @@ async def enrich_single_stream(
             "last_contacted": outreach.get("last_contacted"),
             "email_status": outreach.get("email_status"),
             "lead_source": crm.get("lead_source", "LinkedIn URL"),
-            "enrichment_source": crm.get("enrichment_source", "Bright Data + Hunter.io"),
+            "enrichment_source": crm.get("enrichment_source", "Bright Data + Apollo"),
             "data_completeness": _safe_int(crm.get("data_completeness")),
             "crm_stage": crm.get("crm_stage"),
             "tags": _safe_json(crm.get("tags")),
@@ -7142,13 +7000,6 @@ def _bd_chunk_size(total: int) -> int:
     return 1
 
 
-def _dynamic_chunk_size(total: int) -> int:
-    """
-    1 URL per chunk — each lead is processed independently for granular progress.
-    """
-    return 1
-
-
 async def enrich_bulk(
     urls: list[str],
     webhook_url: Optional[str] = None,
@@ -7160,12 +7011,10 @@ async def enrich_bulk(
     system_prompt: Optional[str] = None,
 ) -> dict:
     """
-    Bulk enrichment pipeline — multi-tenant aware.
+    Bulk enrichment pipeline — BrightData webhook only.
 
-    Strategy:
-    - If webhook_url provided → trigger Bright Data batch (results arrive via webhook)
-    - If Redis available → push individual tasks to priority queue (worker pool processes them)
-    - Otherwise → in-process sequential asyncio task (guaranteed progress, single-server only)
+    Triggers a BrightData batch snapshot for each URL.
+    Results arrive via POST /api/leads/webhook/brightdata when scraping completes.
     """
     job_id = str(uuid.uuid4())
     now    = datetime.now(timezone.utc)
@@ -7175,8 +7024,6 @@ async def enrich_bulk(
 
     # Base app URL — used to build per-chunk webhook URLs
     app_url = os.getenv("APP_URL", "").rstrip("/")
-
-    bd_triggered = False  # tracks whether BD path succeeded — prevents queue double-run
 
     # Insert the parent job row FIRST so FK constraints on enrichment_sub_jobs are satisfied
     job = {
@@ -7236,13 +7083,12 @@ async def enrich_bulk(
             if not webhook_url and app_url:
                 webhook_url = f"{app_url}/api/leads/webhook/brightdata?job_id={job_id}"
             status = "running"
-            bd_triggered = True
             logger.info(
                 "[BulkEnrich] %d URLs → %d sub-jobs triggered for job %s (org=%s)",
                 len(urls), total_chunks, job_id, org_id,
             )
         except Exception as e:
-            logger.error("[BulkEnrich] BD chunk trigger failed: %s — falling back to queue", e)
+            logger.error("[BulkEnrich] BD chunk trigger failed: %s", e)
             error_msg = str(e)
 
     # Update parent job with results from BD trigger (snapshot_id, status, error, webhook_url)
@@ -7256,143 +7102,7 @@ async def enrich_bulk(
         "created_at": now, "updated_at": now,
     }
 
-    if not webhook_url and not bd_triggered:
-        # Fair multi-tenant queue (per-tenant queues + round-robin scheduler)
-        r = await _get_redis()
-        if r:
-            try:
-                import queue_manager
-                chunk_size = _dynamic_chunk_size(len(urls))
-                url_chunks = [urls[i: i + chunk_size] for i in range(0, len(urls), chunk_size)]
-                sub_job_ids = [str(uuid.uuid4()) for _ in url_chunks]
-                for idx, (sjid, chunk) in enumerate(zip(sub_job_ids, url_chunks)):
-                    await _create_sub_job(sjid, job_id, idx, len(chunk), org_id)
-                num_chunks = await queue_manager.push_job(
-                    job_id=job_id,
-                    org_id=org_id,
-                    chunks=url_chunks,
-                    sub_job_ids=sub_job_ids,
-                    r=r,
-                    generate_outreach=True,
-                    sso_id=sso_id,
-                    forward_to_lio=forward_to_lio,
-                    system_prompt=system_prompt,
-                )
-                await _update_job(job_id, status="running")
-                job["status"] = "running"
-                # Proactively scale AI workers so the LLM pipeline keeps up with
-                # incoming enriched leads — 1 extra worker per 10 URLs, capped by AI_WORKER_MAX
-                extra_ai = max(1, len(urls) // 10)
-                await queue_manager.scale_up_ai_workers(extra_ai)
-                logger.info(
-                    "[BulkEnrich] %d URLs → %d chunks queued for job %s (org=%s)",
-                    len(urls), num_chunks, job_id, org_id,
-                )
-                return job
-            except Exception as e:
-                logger.warning("[BulkEnrich] Queue push failed (%s) — falling back to in-process", e)
-
-        # Fallback: in-process sequential task (Redis unavailable)
-        chunk_size = _dynamic_chunk_size(len(urls))
-        url_chunks = [urls[i: i + chunk_size] for i in range(0, len(urls), chunk_size)]
-        sub_job_ids = [str(uuid.uuid4()) for _ in url_chunks]
-        for idx, (sjid, chunk) in enumerate(zip(sub_job_ids, url_chunks)):
-            await _create_sub_job(sjid, job_id, idx, len(chunk), org_id)
-        logger.info(
-            "[BulkEnrich] Starting in-process batch for %d URLs → %d chunks (org=%s)",
-            len(urls), len(url_chunks), org_id,
-        )
-        async def _sequential_with_cap():
-            async with _sequential_fallback_sem:
-                await _process_sequential_batch(job_id, url_chunks, sub_job_ids, org_id=org_id, sso_id=sso_id, forward_to_lio=forward_to_lio, system_prompt=system_prompt)
-
-        asyncio.create_task(_sequential_with_cap())
-
     return job
-
-
-async def _process_sequential_batch(
-    job_id: str,
-    url_chunks: list[list[str]],
-    sub_job_ids: list[str],
-    org_id: str = "default",
-    sso_id: str = "",
-    forward_to_lio: bool = False,
-    system_prompt: Optional[str] = None,
-) -> None:
-    """
-    In-process sequential bulk enrichment — fallback when Redis is unavailable.
-    Processes URL chunks sequentially; each chunk maps to a sub-job record.
-    """
-    await _update_job(job_id, status="running")
-    total_processed = total_failed = 0
-    total_urls = sum(len(c) for c in url_chunks)
-    logger.info(
-        "[BulkBatch] Starting %d URLs in %d chunks for job %s (org=%s)",
-        total_urls, len(url_chunks), job_id, org_id,
-    )
-
-    for chunk_idx, (sub_job_id, chunk) in enumerate(zip(sub_job_ids, url_chunks)):
-        # Check if job was cancelled before each chunk
-        _job_row = await get_job(job_id)
-        if _job_row and _job_row.get("status") == "cancelled":
-            logger.info("[BulkBatch] Job %s cancelled — stopping at chunk %d", job_id, chunk_idx)
-            await _update_sub_job(sub_job_id, status="cancelled")
-            break
-
-        await _update_sub_job(sub_job_id, status="running")
-        chunk_ok = chunk_fail = 0
-        for i, url in enumerate(chunk):
-            # Check cancellation between each URL
-            _job_row = await get_job(job_id)
-            if _job_row and _job_row.get("status") == "cancelled":
-                logger.info("[BulkBatch] Job %s cancelled mid-chunk — stopping", job_id)
-                break
-            try:
-                lead = await enrich_single(url, job_id=job_id, org_id=org_id, sso_id=sso_id, forward_to_lio=forward_to_lio, system_prompt=system_prompt, skip_contact=True)
-                chunk_ok += 1
-                logger.info(
-                    "[BulkBatch] Chunk %d/%d · URL %d/%d OK: %s",
-                    chunk_idx + 1, len(url_chunks), i + 1, len(chunk), url,
-                )
-                await _publish_lead_done(org_id, job_id, lead)
-            except Exception as e:
-                logger.warning(
-                    "[BulkBatch] Chunk %d/%d · URL %d/%d FAIL: %s — %s",
-                    chunk_idx + 1, len(url_chunks), i + 1, len(chunk), url, e,
-                )
-                chunk_fail += 1
-            await _update_sub_job(sub_job_id, processed=chunk_ok, failed=chunk_fail)
-
-        chunk_status = (
-            "completed" if chunk_fail == 0
-            else ("failed" if chunk_ok == 0 else "completed_with_errors")
-        )
-        await _update_sub_job(sub_job_id, status=chunk_status, processed=chunk_ok, failed=chunk_fail)
-
-        total_processed += chunk_ok
-        total_failed += chunk_fail
-        await _update_job(job_id, processed=total_processed, failed=total_failed)
-
-    final_status = (
-        "completed" if total_failed == 0
-        else ("failed" if total_processed == 0 else "completed_with_errors")
-    )
-    await _update_job(job_id, status=final_status, processed=total_processed, failed=total_failed)
-    await _publish_job_done(org_id, job_id, total_processed, total_failed)
-    logger.info(
-        "[BulkBatch] Job %s done — processed=%d failed=%d", job_id, total_processed, total_failed
-    )
-
-
-# Keep old name as alias for webhook-delivered batch processing
-async def _process_fallback_batch(job_id: str, urls: list[str]) -> None:
-    chunk_size = 5
-    url_chunks = [urls[i: i + chunk_size] for i in range(0, len(urls), chunk_size)]
-    sub_job_ids = [str(uuid.uuid4()) for _ in url_chunks]
-    for idx, (sjid, chunk) in enumerate(zip(sub_job_ids, url_chunks)):
-        await _create_sub_job(sjid, job_id, idx, len(chunk), "default")
-    await _process_sequential_batch(job_id, url_chunks, sub_job_ids)
 
 
 async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org_id: str, sub_job_id: Optional[str] = None, sso_id: str = "") -> Optional[dict]:
@@ -7428,6 +7138,8 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
 
         def _is_private_profile(p: dict) -> bool:
             """Detect BrightData private/hidden profile responses — no retry needed."""
+            if str(p.get("error_code") or "").lower() == "dead_page":
+                return True
             _PRIVATE_SIGNALS = ("hidden or private", "profile is private", "private profile", "profile not found")
             for _field in ("error", "_error", "_bd_message", "message", "about", "name"):
                 _val = str(p.get(_field) or "").lower()
@@ -7453,7 +7165,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
                 })
             except Exception:
                 pass
-            asyncio.create_task(send_to_lio_failed(url, org_id, sso_id, reason="private_profile"))
+            asyncio.create_task(send_to_lio_failed(url, org_id, sso_id, reason="private_profile", message=_err_msg))
             return None
 
         # ── Retry if BrightData returned empty/partial/error profile ─────────────
