@@ -38,7 +38,7 @@ async def init_pool() -> None:
     if not db_url:
         raise RuntimeError(
             "DATABASE_URL environment variable is not set. "
-            "Set it in Railway → your service → Variables."
+            "Add it to /app/.env on the server."
         )
     _pool = await asyncpg.create_pool(
         db_url,
