@@ -1,0 +1,89 @@
+version: "3.9"
+
+# ── WorksBuddy Lead Enrichment — Ubuntu Production Stack ─────────────────────
+# Domains:
+#   Backend  → https://api-lead-enrichment-worksbuddy.lbmdemo.com
+#   Frontend → https://lead-enrichment-worksbuddy.lbmdemo.com
+#
+# Usage:
+#   cp .env.example .env        # fill in real API keys
+#   docker compose up -d        # start all services
+#   docker compose logs -f      # watch logs
+
+services:
+
+  # ── Redis — queue + real-time cache ────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: lead-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    networks:
+      - lead-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Backend — FastAPI + Gunicorn ────────────────────────────────────────────
+  backend:
+    build:
+      context: .           # Dockerfile is at repo root
+      dockerfile: Dockerfile
+    container_name: lead-backend
+    restart: unless-stopped
+    env_file:
+      - .env               # put this file on the server (never commit real .env)
+    environment:
+      PORT: "8020"
+      REDIS_URL: "redis://redis:6379/0"
+      APP_URL: "https://api-lead-enrichment-worksbuddy.lbmdemo.com"
+      ALLOWED_ORIGINS: "https://lead-enrichment-worksbuddy.lbmdemo.com,http://localhost:5174"
+    ports:
+      - "8020:8020"
+    volumes:
+      - configs_data:/app/configs
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - lead-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8020/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── Frontend — React (Vite build) + Nginx ──────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Frontend calls backend directly (different subdomain)
+        VITE_BACKEND_URL: "https://api-lead-enrichment-worksbuddy.lbmdemo.com"
+    container_name: lead-frontend
+    restart: unless-stopped
+    environment:
+      PORT: "80"
+      BACKEND_HOST: "http://backend:8020"
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - lead-net
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  redis_data:
+  configs_data:
+
+# ── Network ───────────────────────────────────────────────────────────────────
+networks:
+  lead-net:
+    driver: bridge
