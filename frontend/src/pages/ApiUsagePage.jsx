@@ -1,7 +1,7 @@
 // ApiUsagePage.jsx — API Usage Analytics
 import { useState, useEffect, useCallback } from 'react'
 
-const API_BASE = import.meta.env.VITE_BACKEND_URL || 'http://localhost:4064'
+const API_BASE = import.meta.env.VITE_BACKEND_URL || 'https://api-lead-enrichment-worksbuddy.lbmdemo.com'
 
 const API_META = {
   brightdata:  { label: 'BrightData',   color: '#3b82f6', bg: 'rgba(59,130,246,0.12)'  },

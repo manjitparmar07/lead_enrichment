@@ -2,7 +2,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import toast from 'react-hot-toast'
 
-const BACKEND = `${import.meta.env.VITE_BACKEND_URL || 'https://leadenrichment-production-5b78.up.railway.app'}/api`
+const BACKEND = `${import.meta.env.VITE_BACKEND_URL || 'https://api-lead-enrichment-worksbuddy.lbmdemo.com'}/api`
 const jsonHdr = () => ({ 'Content-Type': 'application/json' })
 
 const RESULT_OPTIONS = [10, 20, 50, 100]

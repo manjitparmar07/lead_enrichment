@@ -10,7 +10,7 @@ function docAuthHeaders() {
   return { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }
 }
 
-const BASE = import.meta.env.VITE_BACKEND_URL || 'https://leadenrichment-production-5b78.up.railway.app'
+const BASE = import.meta.env.VITE_BACKEND_URL || 'https://api-lead-enrichment-worksbuddy.lbmdemo.com'
 const TOKEN   = '<YOUR_TOKEN>'
 
 const PROFILE_EXAMPLE = `{

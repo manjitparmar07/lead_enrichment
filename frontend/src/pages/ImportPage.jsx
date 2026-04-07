@@ -3,7 +3,7 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import toast from 'react-hot-toast'
 import { saveJob, updateJob, removeJob, getActiveJobs } from '../utils/importStore'
 
-const API_BASE = `${import.meta.env.VITE_BACKEND_URL || 'https://leadenrichment-production-5b78.up.railway.app'}/api`
+const API_BASE = `${import.meta.env.VITE_BACKEND_URL || 'https://api-lead-enrichment-worksbuddy.lbmdemo.com'}/api`
 const MAX_FILE_BYTES = 500 * 1024 * 1024  // 500 MB
 const IMPORT_STORE_EVENT = 'wb-import-store-updated'
 
