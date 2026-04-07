@@ -535,6 +535,20 @@ async def send_to_lio_failed(
     raw_name    = p.get("name") or p.get("full_name") or ""
     first_name  = p.get("first_name") or (raw_name.split()[0] if raw_name else "")
     last_name   = p.get("last_name") or (" ".join(raw_name.split()[1:]) if len(raw_name.split()) > 1 else "")
+
+    # Fallback: parse name from LinkedIn URL slug when BD returned no name
+    # e.g. /in/omar-aldirini-7130b8141 → first="Omar" last="Aldirini"
+    if not raw_name and linkedin_url:
+        _slug_match = re.search(r"/in/([^/?#\s]+)", linkedin_url, re.IGNORECASE)
+        if _slug_match:
+            _slug = _slug_match.group(1).rstrip("/")
+            # Strip trailing numeric ID (e.g. "-7130b8141")
+            _slug_clean = re.sub(r"-[a-z0-9]{6,}$", "", _slug)
+            _slug_parts = [p.capitalize() for p in _slug_clean.split("-") if p]
+            if _slug_parts:
+                raw_name   = " ".join(_slug_parts)
+                first_name = _slug_parts[0]
+                last_name  = " ".join(_slug_parts[1:]) if len(_slug_parts) > 1 else ""
     title       = p.get("title") or p.get("headline") or ""
     company     = p.get("current_company_name") or p.get("current_company") or ""
     location    = p.get("city") or p.get("location") or ""
