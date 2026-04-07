@@ -332,14 +332,10 @@ async def _build_lio_ctx(lead: dict, ws_ctx: dict, prev: dict) -> dict:
 
 
 async def _lio_stage_stream(lead_id: str, stage_idx: int, system_prompt: str, user_prompt: str,
-                             groq_api_key, wb_llm_key_db, wb_llm_host_db, wb_llm_model_db,
-                             groq_model: str = "llama-3.3-70b-versatile"):
+                             wb_llm_key_db, wb_llm_host_db, wb_llm_model_db):
     """Async generator: calls LLM with pre-filled prompts and streams SSE result."""
     import httpx as _httpx
     import json as _json
-
-    # Stage 1 (auto-tags) returns a JSON array — json_object mode not valid for arrays
-    _use_json_object = stage_idx != 1
 
     async def _call_llm(system: str, user: str) -> str:
         errors = []
@@ -356,23 +352,20 @@ async def _lio_stage_stream(lead_id: str, stage_idx: int, system_prompt: str, us
                     if r.is_success: return r.json()["choices"][0]["message"]["content"].strip()
                     errors.append(f"WB LLM: HTTP {r.status_code}")
             except Exception as e: errors.append(f"WB LLM: {e}")
-        g_key = groq_api_key or svc._groq_key()
-        if g_key:
+        hf_token = svc._hf_token()
+        if hf_token:
             try:
-                payload = {"model": groq_model,
-                           "messages": [{"role":"system","content":system},{"role":"user","content":user}],
-                           "temperature": 0.3, "max_tokens": 2000}
-                if _use_json_object:
-                    payload["response_format"] = {"type": "json_object"}
                 async with _httpx.AsyncClient(timeout=90) as c:
-                    r = await c.post("https://api.groq.com/openai/v1/chat/completions",
-                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {g_key}"},
-                        json=payload)
+                    r = await c.post("https://router.huggingface.co/v1/chat/completions",
+                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {hf_token}"},
+                        json={"model": svc._hf_model(),
+                              "messages": [{"role":"system","content":system},{"role":"user","content":user}],
+                              "temperature": 0.3, "max_tokens": 2000})
                     if r.is_success: return r.json()["choices"][0]["message"]["content"].strip()
                     try: body_txt = r.json().get("error", {}).get("message") or r.text
                     except Exception: body_txt = r.text
-                    errors.append(f"Groq ({groq_model}): HTTP {r.status_code}: {body_txt}")
-            except Exception as e: errors.append(f"Groq ({groq_model}): {e}")
+                    errors.append(f"HuggingFace: HTTP {r.status_code}: {body_txt}")
+            except Exception as e: errors.append(f"HuggingFace: {e}")
         raise RuntimeError(" | ".join(errors) if errors else "No LLM provider configured.")
 
     stage_name = _LIO_RESULT_KEYS.get(stage_idx, f"stage_{stage_idx}")
@@ -408,30 +401,26 @@ async def _lio_setup(lead_id: str, stage_idx: int, prev: dict, request: Request)
         raise HTTPException(status_code=400, detail=f"Stage {stage_idx} not configured")
     prompt_cfg = prompts[stage_idx]
     ws_ctx = await cfg_svc.get_workspace_context(org_id)
-    groq_row = await cfg_svc.get_tool_row(org_id, "groq")
-    wb_row   = await cfg_svc.get_tool_row(org_id, "wb_llm")
-    groq_api_key  = (groq_row or {}).get("api_key") or None
-    wb_llm_key_db = (wb_row  or {}).get("api_key") or None
+    wb_row        = await cfg_svc.get_tool_row(org_id, "wb_llm")
+    wb_llm_key_db = (wb_row or {}).get("api_key") or None
     wb_extra: dict = {}
     try: wb_extra = json.loads((wb_row or {}).get("extra_config") or "{}") if wb_row else {}
     except Exception: pass
     wb_llm_host_db  = wb_extra.get("host") or None
     wb_llm_model_db = wb_extra.get("model") or None
     ctx = await _build_lio_ctx(lead, ws_ctx, prev)
-    return lead_id, stage_idx, prompt_cfg, ctx, groq_api_key, wb_llm_key_db, wb_llm_host_db, wb_llm_model_db
+    return lead_id, stage_idx, prompt_cfg, ctx, wb_llm_key_db, wb_llm_host_db, wb_llm_model_db
 
 
 async def _lio_llm_keys(request: Request):
     """Fetch LLM provider keys for the org — used by named LIO routes."""
     org_id = _get_org_id(request)
-    groq_row = await cfg_svc.get_tool_row(org_id, "groq")
-    wb_row   = await cfg_svc.get_tool_row(org_id, "wb_llm")
-    groq_api_key  = (groq_row or {}).get("api_key") or None
-    wb_llm_key_db = (wb_row  or {}).get("api_key") or None
+    wb_row        = await cfg_svc.get_tool_row(org_id, "wb_llm")
+    wb_llm_key_db = (wb_row or {}).get("api_key") or None
     wb_extra: dict = {}
     try: wb_extra = json.loads((wb_row or {}).get("extra_config") or "{}") if wb_row else {}
     except Exception: pass
-    return groq_api_key, wb_llm_key_db, wb_extra.get("host"), wb_extra.get("model")
+    return wb_llm_key_db, wb_extra.get("host"), wb_extra.get("model")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -590,10 +579,8 @@ async def enrich_single(body: SingleEnrichRequest, request: Request, background_
         if lead and not lead.get("error"):
             lead_id = lead.get("id")
             await cfg_svc.deduct_credit(org_id, "brightdata", lead_id=lead_id, reason="profile enrichment")
-            email_source = str(lead.get("enrichment_source") or "")
-            if "hunter" in email_source:
-                await cfg_svc.deduct_credit(org_id, "hunter", lead_id=lead_id, reason="email discovery")
-            elif "apollo" in email_source:
+            email_source = str(lead.get("email_source") or "")
+            if "apollo" in email_source:
                 await cfg_svc.deduct_credit(org_id, "apollo", lead_id=lead_id, reason="email discovery")
             background_tasks.add_task(
                 svc.audit_log, org_id, "enrich_single",
@@ -697,10 +684,8 @@ async def enrich_single_public(body: SingleEnrichPublicRequest):
             lead_id = lead.get("id")
             if not lead.get("_cache_hit"):
                 await cfg_svc.deduct_credit(org_id, "brightdata", lead_id=lead_id, reason="profile enrichment")
-                email_source = str(lead.get("enrichment_source") or "")
-                if "hunter" in email_source:
-                    await cfg_svc.deduct_credit(org_id, "hunter", lead_id=lead_id, reason="email discovery")
-                elif "apollo" in email_source:
+                email_source = str(lead.get("email_source") or "")
+                if "apollo" in email_source:
                     await cfg_svc.deduct_credit(org_id, "apollo", lead_id=lead_id, reason="email discovery")
         return {
             "success":        True,
@@ -1227,7 +1212,7 @@ class _AIProcessRequest(BaseModel):
 @router.post("/jobs/ai-process", include_in_schema=False)
 async def enqueue_ai_processing(request: Request):
     """
-    Enqueue raw_profile leads for AI processing via Qwen 70B / Groq / WB LLM.
+    Enqueue raw_profile leads for AI processing via Qwen 70B / HuggingFace / WB LLM.
 
     Body:
       token         — JWT for org_id / sso_id
@@ -1692,7 +1677,7 @@ def _extract_outreach_from_prompt(prompt: str) -> dict | None:
 
 
 async def _quick_llm(system: str, user: str, max_tokens: int = 2000) -> str:
-    """Lightweight LLM call for view-endpoint AI generation. WB LLM → Groq fallback."""
+    """Lightweight LLM call for view-endpoint AI generation. WB LLM → HuggingFace fallback."""
     import httpx as _httpx
     errors = []
     wb_host = svc._wb_llm_host()
@@ -1712,14 +1697,14 @@ async def _quick_llm(system: str, user: str, max_tokens: int = 2000) -> str:
                 errors.append(f"WB LLM: HTTP {r.status_code}")
         except Exception as e:
             errors.append(f"WB LLM: {e}")
-    g_key = svc._groq_key()
-    if g_key:
+    hf_token = svc._hf_token()
+    if hf_token:
         try:
             async with _httpx.AsyncClient(timeout=60) as c:
                 r = await c.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {g_key}"},
-                    json={"model": svc._groq_model() if hasattr(svc, "_groq_model") else "llama-3.3-70b-versatile",
+                    "https://router.huggingface.co/v1/chat/completions",
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {hf_token}"},
+                    json={"model": svc._hf_model(),
                           "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                           "temperature": 0.35, "max_tokens": max_tokens},
                 )
@@ -1729,9 +1714,9 @@ async def _quick_llm(system: str, user: str, max_tokens: int = 2000) -> str:
                     body_txt = r.json().get("error", {}).get("message") or r.text
                 except Exception:
                     body_txt = r.text
-                errors.append(f"Groq: HTTP {r.status_code}: {body_txt}")
+                errors.append(f"HuggingFace: HTTP {r.status_code}: {body_txt}")
         except Exception as e:
-            errors.append(f"Groq: {e}")
+            errors.append(f"HuggingFace: {e}")
     raise RuntimeError(" | ".join(errors) if errors else "No LLM provider configured.")
 
 
@@ -2046,223 +2031,8 @@ async def linkedin_enrichment(
     return svc._format_linkedin_enrich(lead)
 
 
-# ── 2. Email Enrichment ───────────────────────────────────────────────────────
-
-_email_enrich_router = APIRouter(
-    prefix="/leads",
-    tags=["Email Enrichment"],
-)
-
-_EMAIL_DESC = """
-Returns email enrichment via Apollo only, using BD raw data for lookup parameters.
-
-**How to call:**
-```
-POST /api/leads/view/email
-Content-Type: application/json
-
-{ "leadenrich_id": "abc123def456" }
-```
-
-**Flow:**
-1. Fetch lead + BD raw data from DB using leadenrich_id
-2. Extract first_name, last_name, domain from BD raw data
-3. Call Apollo person match API
-4. Save apollo_raw to DB
-5. Return email result
-"""
-
-
-@_email_enrich_router.post(
-    "/view/email",
-    summary="Email Enrichment",
-    description=_EMAIL_DESC,
-)
-async def email_enrichment(body: ViewEmailRequest):
-    from db import get_pool as _get_pool
-
-    lead = await _resolve_lead(body.leadenrich_id)
-
-    # ── Parse BD raw data ────────────────────────────────────────────────────
-    raw_bd = lead.get("raw_brightdata") or {}
-    if isinstance(raw_bd, str):
-        try:
-            raw_bd = json.loads(raw_bd)
-        except Exception:
-            raw_bd = {}
-
-    # Extract name from BD raw data first, fallback to lead row
-    first = (raw_bd.get("first_name") or "").strip()
-    last  = (raw_bd.get("last_name") or "").strip()
-    if not first:
-        first, last = svc._parse_name(raw_bd.get("name") or lead.get("name") or "")
-
-    # Clean last_name for Apollo:
-    #   1. Strip trailing initials like "N." or "A." (e.g. "Djernæs N." → "Djernæs")
-    #   2. Normalize special chars (æ→ae, ø→o, ü→ue etc.) for better match rate
-    import re as _re, unicodedata as _ud
-    last = _re.sub(r'\s+[A-Z]\.$', '', last).strip()
-    first = _re.sub(r'\s+[A-Z]\.$', '', first).strip()
-    def _normalize_name(s: str) -> str:
-        _char_map = {'æ':'ae','ø':'o','å':'aa','ö':'oe','ü':'ue','ä':'ae',
-                     'é':'e','è':'e','ê':'e','ë':'e','ñ':'n','ç':'c',
-                     'í':'i','ì':'i','î':'i','ï':'i','ó':'o','ò':'o','ô':'o',
-                     'ú':'u','ù':'u','û':'u','ý':'y','ß':'ss'}
-        return ''.join(_char_map.get(c.lower(), c) for c in s)
-    first_apollo = _normalize_name(first)
-    last_apollo  = _normalize_name(last)
-
-    # Extract domain — try company_website first, then raw_brightdata fields
-    domain = ""
-    _co_website = lead.get("company_website") or ""
-    if _co_website:
-        try:
-            from urllib.parse import urlparse as _urlparse
-            netloc = _urlparse(_co_website if _co_website.startswith("http") else f"https://{_co_website}").netloc
-            domain = netloc.replace("www.", "").split(":")[0].lower()
-        except Exception:
-            pass
-
-    linkedin_url = lead.get("linkedin_url") or raw_bd.get("url") or ""
-
-    # ── Already has email — return immediately ───────────────────────────────
-    if lead.get("work_email"):
-        apollo_raw_stored = lead.get("apollo_raw")
-        apollo_raw = {}
-        if apollo_raw_stored:
-            try:
-                apollo_raw = json.loads(apollo_raw_stored) if isinstance(apollo_raw_stored, str) else apollo_raw_stored
-            except Exception:
-                apollo_raw = {}
-        return {
-            "lead_id":           lead.get("id"),
-            "linkedin_url":      linkedin_url,
-            "name":              lead.get("name"),
-            "company":           lead.get("company"),
-            "work_email":        lead.get("work_email"),
-            "email":             lead.get("work_email"),
-            "source":            lead.get("email_source"),
-            "message":           f"Email already found: {lead.get('work_email')}" + (f" | Phone: {lead.get('direct_phone')}" if lead.get("direct_phone") else ""),
-            "confidence":        lead.get("email_confidence"),
-            "verified":          bool(lead.get("email_verified")),
-            "bounce_risk":       lead.get("bounce_risk"),
-            "enrichment_source": lead.get("enrichment_source"),
-            "phone":             lead.get("direct_phone") or lead.get("phone"),
-            "all_emails":        [lead.get("work_email")],
-            "activity_emails":   [],
-            "activity_phones":   [],
-            "ai_generated":      None,
-        }
-
-    # ── Apollo lookup — domain OR linkedin_url required ──────────────────────
-    if not first_apollo or (not domain and not linkedin_url):
-        logger.warning("[EmailView] Cannot call Apollo — missing first=%r domain=%r linkedin=%r for lead %s",
-                       first, domain, linkedin_url, lead.get("id"))
-        return {
-            "lead_id":    lead.get("id"),
-            "linkedin_url": linkedin_url,
-            "name":       lead.get("name"),
-            "company":    lead.get("company"),
-            "work_email": None, "email": None,
-            "source": "missing_params",
-            "message": "Cannot search email — missing required data (first name and company domain or LinkedIn URL not available for this lead).",
-            "confidence": None,
-            "verified": False, "bounce_risk": None,
-            "enrichment_source": None, "phone": None,
-            "all_emails": [], "activity_emails": [], "activity_phones": [],
-            "ai_generated": None,
-        }
-
-    try:
-        apollo_result = await svc._try_apollo(first_apollo, last_apollo, domain, linkedin_url=linkedin_url)
-    except Exception as _e:
-        logger.warning("[EmailView] Apollo call failed for %s: %s", lead.get("id"), _e)
-        apollo_result = None
-
-    # Credit exhausted — return immediately with clear message, do NOT mark as not_found
-    if apollo_result and apollo_result.get("_credit_exhausted"):
-        return {
-            "lead_id":           lead.get("id"),
-            "linkedin_url":      linkedin_url,
-            "name":              lead.get("name"),
-            "company":           lead.get("company"),
-            "work_email":        None,
-            "email":             None,
-            "source":            "not_found",
-            "message":           "Apollo credit balance exhausted — email could not be fetched. Please recharge your Apollo plan to continue email enrichment.",
-            "confidence":        None,
-            "verified":          False,
-            "bounce_risk":       None,
-            "enrichment_source": None,
-            "phone":             None,
-            "all_emails":        [],
-            "activity_emails":   [],
-            "activity_phones":   [],
-            "ai_generated":      None,
-        }
-
-    work_email  = None
-    phone       = None
-    source      = "apollo"
-    confidence  = None
-    apollo_raw  = {}
-
-    if apollo_result and apollo_result.get("email"):
-        work_email = apollo_result["email"]
-        phone      = apollo_result.get("phone")
-        confidence = apollo_result.get("confidence")
-        apollo_raw = apollo_result.get("_apollo_raw") or {}
-
-        # Save email + apollo_raw to DB
-        async with _get_pool().acquire() as _conn:
-            await _conn.execute(
-                """UPDATE enriched_leads
-                   SET work_email=$1, email_source=$2, email_confidence=$3,
-                       enrichment_source=$4, direct_phone=COALESCE(direct_phone, $5),
-                       apollo_raw=$6, updated_at=NOW()
-                   WHERE id=$7""",
-                work_email,
-                source,
-                str(confidence) if confidence else None,
-                "apollo",
-                phone,
-                json.dumps(apollo_raw, default=str) if apollo_raw else None,
-                lead["id"],
-            )
-        logger.info("[EmailView] Apollo found email=%s for lead %s", work_email, lead.get("id"))
-    else:
-        # No email found — mark to avoid retrying on every request
-        async with _get_pool().acquire() as _conn:
-            await _conn.execute(
-                "UPDATE enriched_leads SET email_source='not_found', updated_at=NOW() WHERE id=$1",
-                lead["id"],
-            )
-        logger.info("[EmailView] Apollo found no email for lead %s", lead.get("id"))
-
-    if work_email:
-        _message = f"Email found: {work_email}" + (f" | Phone: {phone}" if phone else "")
-    else:
-        _message = f"No email found for {lead.get('name', 'this lead')} at {lead.get('company', 'their company')} via Apollo."
-
-    return {
-        "lead_id":           lead.get("id"),
-        "linkedin_url":      linkedin_url,
-        "name":              lead.get("name"),
-        "company":           lead.get("company"),
-        "work_email":        work_email,
-        "email":             work_email,
-        "source":            source if work_email else "not_found",
-        "message":           _message,
-        "confidence":        confidence,
-        "verified":          False,
-        "bounce_risk":       None,
-        "enrichment_source": "apollo" if work_email else None,
-        "phone":             phone,
-        "all_emails":        [work_email] if work_email else [],
-        "activity_emails":   [],
-        "activity_phones":   [],
-        "ai_generated":      None,
-    }
+# ── 2. Email Enrichment — moved to email_lead_enrichment/email_enrichment_routes.py ──
+from Lead_enrichment.email_lead_enrichment.email_enrichment_routes import router as _email_enrich_router
 
 
 # ── Default outreach system prompt (universal — used when tenant passes no system_prompt) ──────
@@ -2602,7 +2372,7 @@ _company_locks: dict = {}       # company_id → asyncio.Lock
 _company_locks_ref: dict = {}   # company_id → waiter count
 
 # Outreach LLM concurrency cap — prevents 1000 simultaneous LLM calls from
-# exhausting Groq/HF quotas. Requests above this limit queue in the event loop.
+# exhausting HF quotas. Requests above this limit queue in the event loop.
 _OUTREACH_CONCURRENCY = int(os.getenv("OUTREACH_CONCURRENCY", "30"))
 _outreach_sem: asyncio.Semaphore = asyncio.Semaphore(_OUTREACH_CONCURRENCY)
 
@@ -2610,7 +2380,7 @@ _outreach_sem: asyncio.Semaphore = asyncio.Semaphore(_OUTREACH_CONCURRENCY)
 async def _do_company_enrichment(
     company_linkedin: str, lead: Optional[dict], org_id: str
 ) -> dict:
-    """Full enrichment pipeline: BrightData scrape → Apollo → LLM → DB save. Returns result dict."""
+    """Full enrichment pipeline: BrightData scrape → LLM → DB save. Returns result dict."""
     from Lead_enrichment.company_lead_enrichment import company_service as cs
     from datetime import datetime, timezone
 
@@ -2619,7 +2389,7 @@ async def _do_company_enrichment(
     if not bd_data:
         raise ValueError("BrightData returned no data for this company LinkedIn URL")
 
-    # Step 2: Apollo raw from DB
+    # Step 2: Apollo raw from DB (read previously saved data — no live Apollo API call)
     apollo_raw: dict = {}
     if lead and lead.get("id"):
         try:
@@ -3036,7 +2806,7 @@ async def _company_ai_analysis(lead: dict, full: dict, system_prompt: Optional[s
 
 class LioPromptRequest(BaseModel):
     system_prompt: str
-    model: Optional[str] = None  # Groq model override (e.g. "deepseek-r1-distill-llama-70b")
+    model: Optional[str] = None  # HF model override (e.g. "Qwen/Qwen2.5-7B-Instruct")
 
 
 class LioPromptsConfigRequest(BaseModel):
@@ -3127,32 +2897,26 @@ async def save_lio_workspace(body: WorkspaceContextRequest, request: Request):
 async def get_lio_status(request: Request):
     """
     Return LIO provider status: which LLM providers have API keys configured,
-    and which Groq model is selected for LIO analysis.
+    and which LLM model is selected for LIO analysis.
     """
     org_id = _get_org_id(request)
-    # Check tool configs for WB LLM and Groq
-    wb_row   = await cfg_svc.get_tool_row(org_id, "wb_llm")
-    groq_row = await cfg_svc.get_tool_row(org_id, "groq")
+    wb_row    = await cfg_svc.get_tool_row(org_id, "wb_llm")
     workspace = await cfg_svc.get_workspace_config(org_id)
 
-    wb_configured   = bool(wb_row and wb_row.get("api_key") or wb_row and (wb_row.get("extra_config") or "{}") != "{}")
-    groq_configured = bool(groq_row and groq_row.get("api_key"))
-    wb_enabled      = bool(wb_row and wb_row.get("is_enabled"))
-    groq_enabled    = bool(groq_row and groq_row.get("is_enabled"))
+    wb_configured = bool(wb_row and wb_row.get("api_key") or wb_row and (wb_row.get("extra_config") or "{}") != "{}")
+    wb_enabled    = bool(wb_row and wb_row.get("is_enabled"))
 
-    # Also check env-level keys (fallback if no DB config)
+    hf_configured = bool(os.getenv("HF_TOKEN"))
+
     if not wb_configured and os.getenv("WB_LLM_API_KEY"):
         wb_configured = True
         wb_enabled = True
-    if not groq_configured and os.getenv("GROQ_API_KEY"):
-        groq_configured = True
-        groq_enabled = True
 
     return {
-        "wb_llm":  {"configured": wb_configured,   "enabled": wb_enabled},
-        "groq":    {"configured": groq_configured,  "enabled": groq_enabled},
-        "active_provider": "wb_llm" if (wb_configured and wb_enabled) else ("groq" if groq_configured else None),
-        "lio_model": workspace.get("lio_model", ""),
+        "wb_llm":          {"configured": wb_configured, "enabled": wb_enabled},
+        "huggingface":     {"configured": hf_configured, "enabled": hf_configured},
+        "active_provider": "wb_llm" if (wb_configured and wb_enabled) else ("huggingface" if hf_configured else None),
+        "lio_model":       workspace.get("lio_model", ""),
     }
 
 
@@ -3168,7 +2932,7 @@ async def get_lio_results(lead_id: str, request: Request):
 
 # ── 7 named LIO stage endpoints ──────────────────────────────────────────────
 # Frontend sends: { system_prompt, user_prompt (fully filled), brightdata_json, stage_idx }
-# Backend: calls Groq → streams SSE with { status, stage, result, done }
+# Backend: calls HuggingFace → streams SSE with { status, stage, result, done }
 
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
@@ -3197,10 +2961,10 @@ async def _lio_stage_model(org_id: str, stage_idx: int) -> str:
 
 
 def _lio_stream_resp(lead_id: str, body: LioContextBody, keys: tuple, model: str):
-    groq_key, wb_key, wb_host, wb_model = keys
+    wb_key, wb_host, wb_model = keys
     return StreamingResponse(
         _lio_stage_stream(lead_id, body.stage_idx, body.system_prompt, body.user_prompt,
-                          groq_key, wb_key, wb_host, wb_model, groq_model=model),
+                          wb_key, wb_host, wb_model),
         media_type="text/event-stream", headers=_SSE_HEADERS,
     )
 
@@ -3289,10 +3053,8 @@ async def lio_analyze_stage(lead_id: str, body: LioStageRequest, request: Reques
 
     prompt_cfg = prompts[si]
     ws_ctx     = await cfg_svc.get_workspace_context(org_id)
-    groq_row   = await cfg_svc.get_tool_row(org_id, "groq")
-    wb_row     = await cfg_svc.get_tool_row(org_id, "wb_llm")
-    groq_api_key  = (groq_row or {}).get("api_key") or None
-    wb_llm_key_db = (wb_row  or {}).get("api_key") or None
+    wb_row        = await cfg_svc.get_tool_row(org_id, "wb_llm")
+    wb_llm_key_db = (wb_row or {}).get("api_key") or None
     wb_extra: dict = {}
     try:
         wb_extra = json.loads((wb_row or {}).get("extra_config") or "{}") if wb_row else {}
@@ -3491,20 +3253,20 @@ async def lio_analyze_stage(lead_id: str, body: LioStageRequest, request: Reques
                         if r.is_success: return r.json()["choices"][0]["message"]["content"].strip()
                         errors.append(f"WB LLM: HTTP {r.status_code}")
                 except Exception as e: errors.append(f"WB LLM: {e}")
-            g_key = groq_api_key or svc._groq_key()
-            if g_key:
+            hf_token = svc._hf_token()
+            if hf_token:
                 try:
                     async with _httpx.AsyncClient(timeout=90) as c:
-                        r = await c.post("https://api.groq.com/openai/v1/chat/completions",
-                            headers={"Content-Type": "application/json", "Authorization": f"Bearer {g_key}"},
-                            json={"model": model, "messages": [{"role":"system","content":system},{"role":"user","content":user}], "temperature": temp, "max_tokens": 2000})
+                        r = await c.post("https://router.huggingface.co/v1/chat/completions",
+                            headers={"Content-Type": "application/json", "Authorization": f"Bearer {hf_token}"},
+                            json={"model": svc._hf_model(), "messages": [{"role":"system","content":system},{"role":"user","content":user}], "temperature": temp, "max_tokens": 2000})
                         if r.is_success: return r.json()["choices"][0]["message"]["content"].strip()
                         body_txt = ""
                         try: body_txt = r.json().get("error", {}).get("message") or r.text
                         except Exception: body_txt = r.text
-                        errors.append(f"Groq ({model}): HTTP {r.status_code}: {body_txt}")
-                except Exception as e: errors.append(f"Groq ({model}): {e}")
-            raise RuntimeError(" | ".join(errors) if errors else "No LLM provider configured — add Groq or WB LLM key in Tool Configuration.")
+                        errors.append(f"HuggingFace: HTTP {r.status_code}: {body_txt}")
+                except Exception as e: errors.append(f"HuggingFace: {e}")
+            raise RuntimeError(" | ".join(errors) if errors else "No LLM provider configured — add HF_TOKEN or WB_LLM_HOST.")
 
         import re as _re
 
@@ -3568,10 +3330,8 @@ async def lio_analyze(lead_id: str, request: Request):
     ws_ctx    = await cfg_svc.get_workspace_context(org_id)
 
     # ── Load API keys from DB tool configs ─────────────────────────────────
-    groq_row = await cfg_svc.get_tool_row(org_id, "groq")
-    wb_row   = await cfg_svc.get_tool_row(org_id, "wb_llm")
-    groq_api_key  = (groq_row or {}).get("api_key") or None
-    wb_llm_key_db = (wb_row  or {}).get("api_key") or None
+    wb_row        = await cfg_svc.get_tool_row(org_id, "wb_llm")
+    wb_llm_key_db = (wb_row or {}).get("api_key") or None
     wb_extra: dict = {}
     try:
         wb_extra = json.loads((wb_row or {}).get("extra_config") or "{}") if wb_row else {}
@@ -3659,7 +3419,7 @@ async def lio_analyze(lead_id: str, request: Request):
             return _re.sub(r'\{([a-zA-Z_][a-zA-Z0-9_]*)\}', _sub, template)
 
         async def _call_llm(system: str, user: str, model: str, temperature: float) -> str:
-            """Try WB LLM (if configured) then Groq. Raises on all failures."""
+            """Try WB LLM (if configured) then HuggingFace. Raises on all failures."""
             errors = []
 
             wb_host = wb_llm_host_db or svc._wb_llm_host()
@@ -3685,14 +3445,14 @@ async def lio_analyze(lead_id: str, request: Request):
                 except Exception as e:
                     errors.append(f"WB LLM: {e}")
 
-            g_key = groq_api_key or svc._groq_key()
-            if g_key:
+            hf_token = svc._hf_token()
+            if hf_token:
                 try:
                     async with _httpx.AsyncClient(timeout=90) as c:
                         r = await c.post(
-                            "https://api.groq.com/openai/v1/chat/completions",
-                            headers={"Content-Type": "application/json", "Authorization": f"Bearer {g_key}"},
-                            json={"model": model,
+                            "https://router.huggingface.co/v1/chat/completions",
+                            headers={"Content-Type": "application/json", "Authorization": f"Bearer {hf_token}"},
+                            json={"model": svc._hf_model(),
                                   "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                                   "temperature": temperature, "max_tokens": 2000},
                         )
@@ -3701,13 +3461,13 @@ async def lio_analyze(lead_id: str, request: Request):
                         body = ""
                         try: body = r.json().get("error", {}).get("message") or r.text
                         except Exception: body = r.text
-                        errors.append(f"Groq ({model}): HTTP {r.status_code}: {body}")
+                        errors.append(f"HuggingFace: HTTP {r.status_code}: {body}")
                 except Exception as e:
-                    errors.append(f"Groq ({model}): {e}")
+                    errors.append(f"HuggingFace: {e}")
 
             raise RuntimeError(
                 " | ".join(errors) if errors
-                else "No LLM provider configured — add Groq or WB LLM key in Tool Configuration."
+                else "No LLM provider configured — add HF_TOKEN or WB_LLM_HOST."
             )
 
         ctx = dict(base_ctx)
