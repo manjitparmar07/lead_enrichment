@@ -35,7 +35,7 @@ services:
     container_name: lead-backend
     restart: unless-stopped
     env_file:
-      - .env               # put this file on the server (never commit real .env)
+      - backend/.env       # real secrets — never commit this file
     environment:
       PORT: "8020"
       REDIS_URL: "redis://redis:6379/0"
