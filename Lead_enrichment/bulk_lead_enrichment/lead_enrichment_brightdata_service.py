@@ -519,6 +519,7 @@ async def send_to_lio_failed(
     org_id: str,
     sso_id: str = "",
     reason: str = "enrichment_failed",
+    error_message: str = "",
 ) -> None:
     """
     Notify LIO that a LinkedIn URL failed enrichment.
@@ -527,12 +528,15 @@ async def send_to_lio_failed(
     url = LIO_RECEIVE_URL
     if not url:
         return
+    enrichment_data = {
+        "status":        "failed",
+        "input_url":     linkedin_url,
+        "linkedin_url":  linkedin_url,
+        "error_reason":  reason,
+        "error_message": error_message or reason,
+    }
     payload = {
-        "enrichment_data": {
-            "status":       "failed",
-            "linkedin_url": linkedin_url,
-            "error_reason": reason,
-        },
+        "enrichment_data": enrichment_data,
         "sso_id":          sso_id,
         "organization_id": org_id,
     }
@@ -7453,7 +7457,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
                 })
             except Exception:
                 pass
-            asyncio.create_task(send_to_lio_failed(url, org_id, sso_id, reason="private_profile"))
+            asyncio.create_task(send_to_lio_failed(url, org_id, sso_id, reason="private_profile", error_message=_err_msg))
             return None
 
         # ── Retry if BrightData returned empty/partial/error profile ─────────────
@@ -7478,7 +7482,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             else:
                 _plog(job_id, url, "VALIDATION", "all 3 retries returned empty/invalid profile — skipping", "error")
                 logger.error("[Pipeline] All 3 retries returned empty/invalid profile for %s — skipping", url)
-                asyncio.create_task(send_to_lio_failed(url, org_id, sso_id, reason="empty_after_retries"))
+                asyncio.create_task(send_to_lio_failed(url, org_id, sso_id, reason="empty_after_retries", error_message="BrightData returned empty or invalid profile after 3 retries"))
                 return None
 
         name = profile.get("name", "")
