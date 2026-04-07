@@ -520,32 +520,105 @@ async def send_to_lio_failed(
     sso_id: str = "",
     reason: str = "enrichment_failed",
     error_message: str = "",
+    profile_data: Optional[dict] = None,
 ) -> None:
     """
     Notify LIO that a LinkedIn URL failed enrichment.
     Sends status=failed so LIO can mark the lead accordingly.
+    Uses the same crm_brief envelope shape as send_to_lio so LIO accepts it.
+
+    profile_data: raw BrightData profile dict — pass whatever BD returned so LIO
+                  gets the most complete picture available (name, company, title, etc.)
     """
-    url = LIO_RECEIVE_URL
-    if not url:
+    lio_url = LIO_RECEIVE_URL
+    if not lio_url:
+        logger.warning("[LIO-FAILED] LIO_RECEIVE_URL not set — skipping failure notification for %s", linkedin_url)
         return
+    lead_id_val = _lead_id(linkedin_url) if linkedin_url else "unknown"
+    p = profile_data or {}
+
+    # Extract whatever identity data BrightData returned (often empty for private profiles,
+    # but may include name, company, or location depending on the BD plan/response)
+    raw_name     = p.get("name") or p.get("full_name") or ""
+    first_name   = p.get("first_name") or (raw_name.split()[0] if raw_name else "")
+    last_name    = p.get("last_name") or (" ".join(raw_name.split()[1:]) if len(raw_name.split()) > 1 else "")
+    title        = p.get("title") or p.get("headline") or ""
+    company      = p.get("current_company_name") or p.get("current_company") or ""
+    location     = p.get("city") or p.get("location") or ""
+    country      = p.get("country") or p.get("country_code") or ""
+    followers    = p.get("followers") or 0
+    connections  = p.get("connections") or 0
+    avatar_url   = p.get("profile_image_url") or p.get("avatar") or ""
+    about        = p.get("about") or p.get("summary") or p.get("headline") or ""
+
+    # Mirror the crm_brief envelope shape so LIO's receive endpoint processes it
     enrichment_data = {
         "status":        "failed",
         "input_url":     linkedin_url,
         "linkedin_url":  linkedin_url,
         "error_reason":  reason,
         "error_message": error_message or reason,
+        "who_they_are": {
+            "lead_id":      lead_id_val,
+            "linkedin_url": linkedin_url,
+            "name":         raw_name,
+            "first_name":   first_name,
+            "last_name":    last_name,
+            "title":        title,
+            "company":      company,
+            "location":     location,
+            "country":      country,
+            "followers":    followers,
+            "connections":  connections,
+            "profile_image": avatar_url,
+            "about":        about[:500] if about else "",
+        },
+        "their_company": {
+            "name":     company,
+            "industry": p.get("industry") or "",
+        },
+        "contact": {
+            "work_email": None,
+            "phone":      None,
+        },
+        "crm_scores": {
+            "icp_fit":          0,
+            "engagement_score": 0,
+            "timing_score":     0,
+            "priority":         "cold",
+        },
+        "crm_import_fields": {
+            "analyst_summary": (
+                f"Profile is private or hidden on LinkedIn. "
+                f"Enrichment failed: {error_message or reason}."
+            ),
+            "tags": [],
+        },
     }
     payload = {
         "enrichment_data": enrichment_data,
         "sso_id":          sso_id,
         "organization_id": org_id,
     }
-    try:
-        client = _get_lio_client()
-        resp = await client.post(url, json=payload)
-        logger.info("[LIO-FAILED] Sent failure for %s → HTTP %s", linkedin_url, resp.status_code)
-    except Exception as e:
-        logger.warning("[LIO-FAILED] Could not notify LIO for %s: %s", linkedin_url, e)
+    logger.info("[LIO-FAILED] Sending failure for %s | reason=%s | org=%s | sso=%s",
+                linkedin_url, reason, org_id, sso_id)
+    _pipeline_log.info("[LIO-FAILED-PAYLOAD] url=%s\n%s", linkedin_url, json.dumps(payload, indent=2, default=str))
+    _LIO_MAX_ATTEMPTS = 3
+    for attempt in range(1, _LIO_MAX_ATTEMPTS + 1):
+        try:
+            client = _get_lio_client()
+            resp = await client.post(lio_url, json=payload)
+            logger.info("[LIO-FAILED] Response for %s → HTTP %s | body=%s",
+                        linkedin_url, resp.status_code, resp.text[:500])
+            resp.raise_for_status()
+            logger.info("[LIO-FAILED] Successfully sent failure for %s (attempt %d)", linkedin_url, attempt)
+            return
+        except Exception as e:
+            logger.warning("[LIO-FAILED] Attempt %d/%d failed for %s: %s",
+                           attempt, _LIO_MAX_ATTEMPTS, linkedin_url, e)
+            if attempt < _LIO_MAX_ATTEMPTS:
+                await asyncio.sleep(5 * attempt)
+    logger.error("[LIO-FAILED] All %d attempts failed for %s — giving up", _LIO_MAX_ATTEMPTS, linkedin_url)
 
 
 async def send_to_lio(lead: dict, sso_id: str = "", force: bool = False) -> None:
@@ -7460,7 +7533,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
                 })
             except Exception:
                 pass
-            asyncio.create_task(send_to_lio_failed(url, org_id, sso_id, reason="private_profile", error_message=_err_msg))
+            asyncio.create_task(send_to_lio_failed(url, org_id, sso_id, reason="private_profile", error_message=_err_msg, profile_data=profile))
             return None
 
         # ── Retry if BrightData returned empty/partial/error profile ─────────────
@@ -7495,7 +7568,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
                         })
                     except Exception:
                         pass
-                    asyncio.create_task(send_to_lio_failed(url, org_id, sso_id, reason="private_profile", error_message=_err_msg_retry))
+                    asyncio.create_task(send_to_lio_failed(url, org_id, sso_id, reason="private_profile", error_message=_err_msg_retry, profile_data=retried))
                     return None
             else:
                 _plog(job_id, url, "VALIDATION", "all 3 retries returned empty/invalid profile — skipping", "error")
