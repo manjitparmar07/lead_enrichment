@@ -16,7 +16,12 @@ import re
 import httpx
 from fastapi import APIRouter
 from pydantic import BaseModel
-from analytics import api_usage_service as _usage
+try:
+    from analytics import api_usage_service as _usage
+except ImportError:
+    class _usage:  # type: ignore
+        @staticmethod
+        async def track(*args, **kwargs): pass
 
 import Lead_enrichment.bulk_lead_enrichment.lead_enrichment_brightdata_service as svc
 from db import get_pool

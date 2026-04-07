@@ -17,7 +17,7 @@ async def _init_table() -> None:
     """Create api_usage_log table if not exists."""
     try:
         from db import get_pool
-        pool = await get_pool()
+        pool = get_pool()
         async with pool.acquire() as conn:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS api_usage_log (
@@ -42,7 +42,7 @@ async def track(api: str, call_type: str = "call") -> None:
     """
     try:
         from db import get_pool
-        pool = await get_pool()
+        pool = get_pool()
         today = date.today()
         async with pool.acquire() as conn:
             await conn.execute("""
@@ -59,7 +59,7 @@ async def get_usage(days: int = 30) -> list[dict]:
     """Return raw daily rows from api_usage_log for the last N days."""
     try:
         from db import get_pool
-        pool = await get_pool()
+        pool = get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT api, call_type, day::text AS day, count

@@ -29,7 +29,12 @@ from typing import Any, Optional
 
 import httpx
 from db import get_pool, named_args
-from analytics import api_usage_service as _usage
+try:
+    from analytics import api_usage_service as _usage
+except ImportError:
+    class _usage:  # type: ignore
+        @staticmethod
+        async def track(*args, **kwargs): pass
 try:
     import redis.asyncio as aioredis
     _REDIS_AVAILABLE = True
@@ -509,29 +514,117 @@ async def send_to_lio_failed(
     org_id: str,
     sso_id: str = "",
     reason: str = "enrichment_failed",
+    error_message: str = "",
+    profile_data: Optional[dict] = None,
 ) -> None:
     """
     Notify LIO that a LinkedIn URL failed enrichment.
-    Sends status=failed so LIO can mark the lead accordingly.
+    Sends status=failed with full crm_brief envelope so LIO accepts it.
+
+    profile_data: raw BrightData profile dict — pass whatever BD returned so LIO
+                  gets the most complete picture available (name, company, etc.)
     """
-    url = LIO_RECEIVE_URL
-    if not url:
+    lio_url = LIO_RECEIVE_URL
+    if not lio_url:
+        logger.warning("[LIO-FAILED] LIO_RECEIVE_URL not set — skipping failure notification for %s", linkedin_url)
         return
-    payload = {
-        "enrichment_data": {
-            "status":       "failed",
+    lead_id_val = _lead_id(linkedin_url) if linkedin_url else "unknown"
+    p = profile_data or {}
+
+    # Extract whatever identity data BrightData returned (often empty for private profiles)
+    raw_name    = p.get("name") or p.get("full_name") or ""
+    first_name  = p.get("first_name") or (raw_name.split()[0] if raw_name else "")
+    last_name   = p.get("last_name") or (" ".join(raw_name.split()[1:]) if len(raw_name.split()) > 1 else "")
+
+    # Fallback: parse name from LinkedIn URL slug when BD returned no name
+    # e.g. /in/omar-aldirini-7130b8141 → first="Omar" last="Aldirini"
+    if not raw_name and linkedin_url:
+        _slug_match = re.search(r"/in/([^/?#\s]+)", linkedin_url, re.IGNORECASE)
+        if _slug_match:
+            _slug = _slug_match.group(1).rstrip("/")
+            # Strip trailing numeric ID (e.g. "-7130b8141")
+            _slug_clean = re.sub(r"-[a-z0-9]{6,}$", "", _slug)
+            _slug_parts = [p.capitalize() for p in _slug_clean.split("-") if p]
+            if _slug_parts:
+                raw_name   = " ".join(_slug_parts)
+                first_name = _slug_parts[0]
+                last_name  = " ".join(_slug_parts[1:]) if len(_slug_parts) > 1 else ""
+    title       = p.get("title") or p.get("headline") or ""
+    company     = p.get("current_company_name") or p.get("current_company") or ""
+    location    = p.get("city") or p.get("location") or ""
+    country     = p.get("country") or p.get("country_code") or ""
+    followers   = p.get("followers") or 0
+    connections = p.get("connections") or 0
+    avatar_url  = p.get("profile_image_url") or p.get("avatar") or ""
+    about       = p.get("about") or p.get("summary") or p.get("headline") or ""
+
+    enrichment_data = {
+        "status":        "failed",
+        "input_url":     linkedin_url,
+        "linkedin_url":  linkedin_url,
+        "error_reason":  reason,
+        "error_message": error_message or reason,
+        "who_they_are": {
+            "lead_id":      lead_id_val,
             "linkedin_url": linkedin_url,
-            "error_reason": reason,
+            "name":         raw_name,
+            "first_name":   first_name,
+            "last_name":    last_name,
+            "title":        title,
+            "company":      company,
+            "location":     location,
+            "country":      country,
+            "followers":    followers,
+            "connections":  connections,
+            "profile_image": avatar_url,
+            "about":        about[:500] if about else "",
         },
+        "their_company": {
+            "name":     company,
+            "industry": p.get("industry") or "",
+        },
+        "contact": {
+            "work_email": None,
+            "phone":      None,
+        },
+        "crm_scores": {
+            "icp_fit":          0,
+            "engagement_score": 0,
+            "timing_score":     0,
+            "priority":         "cold",
+        },
+        "crm_import_fields": {
+            "analyst_summary": (
+                f"Profile is private or hidden on LinkedIn. "
+                f"Enrichment failed: {error_message or reason}."
+            ),
+            "tags": [],
+        },
+    }
+    payload = {
+        "enrichment_data": enrichment_data,
         "sso_id":          sso_id,
         "organization_id": org_id,
     }
-    try:
-        client = _get_lio_client()
-        resp = await client.post(url, json=payload)
-        logger.info("[LIO-FAILED] Sent failure for %s → HTTP %s", linkedin_url, resp.status_code)
-    except Exception as e:
-        logger.warning("[LIO-FAILED] Could not notify LIO for %s: %s", linkedin_url, e)
+    logger.info("[LIO-FAILED] Sending failure for %s | reason=%s | org=%s | sso=%s",
+                linkedin_url, reason, org_id, sso_id)
+    _pipeline_log.info("[LIO-FAILED-PAYLOAD] url=%s\n%s", linkedin_url, json.dumps(payload, indent=2, default=str))
+    _LIO_MAX_ATTEMPTS = 3
+    for attempt in range(1, _LIO_MAX_ATTEMPTS + 1):
+        try:
+            client = _get_lio_client()
+            resp = await client.post(lio_url, json=payload)
+            logger.info("[LIO-FAILED] Response for %s → HTTP %s | body=%s",
+                        linkedin_url, resp.status_code, resp.text[:500])
+            resp.raise_for_status()
+            logger.info("[LIO-FAILED] Successfully sent failure for %s (attempt %d)", linkedin_url, attempt)
+            return
+        except Exception as e:
+            logger.warning("[LIO-FAILED] Attempt %d/%d failed for %s: %s",
+                           attempt, _LIO_MAX_ATTEMPTS, linkedin_url, e)
+            if attempt < _LIO_MAX_ATTEMPTS:
+                await asyncio.sleep(5 * attempt)
+    logger.error("[LIO-FAILED] All %d attempts failed for %s — giving up", _LIO_MAX_ATTEMPTS, linkedin_url)
 
 
 async def send_to_lio(lead: dict, sso_id: str = "", force: bool = False) -> None:
@@ -5834,32 +5927,8 @@ async def enrich_company_url(
     logger.info("[Company-A] BD result: name=%r  website=%r  domain=%r  fields=%d",
                 company_name, website, domain, len(bd_co))
 
-    # ── Phase B: Apollo fill-in ───────────────────────────────────────────────
-    logger.info("━━━ [Company-B] Apollo enrichment for: %r (domain=%s)", company_name, domain)
-    apollo_data: dict = {}
-
-    # Try by domain first (if BD gave us one)
-    if domain:
-        apollo_data = await _try_apollo_org(domain) or {}
-        if apollo_data:
-            logger.info("[Company-B] Apollo by domain OK — %d fields", len(apollo_data))
-
-    # Fallback: search by name
-    if not apollo_data and company_name:
-        apollo_data = await _try_apollo_company_search(company_name) or {}
-        if apollo_data:
-            # Extract verified domain from Apollo result
-            ap_web = apollo_data.get("company_website", "")
-            if ap_web:
-                m2 = re.search(r"https?://(?:www\.)?([^/?\s]+)", ap_web)
-                if m2 and m2.group(1).lower() not in _SOCIAL_DOMAINS:
-                    domain = m2.group(1).lower()
-                    website = ap_web
-            logger.info("[Company-B] Apollo by name OK — %d fields, domain=%s", len(apollo_data), domain)
-
-    # Merge: BD takes priority, Apollo fills missing fields
+    # Merge: BD data only (Apollo removed)
     company_data: dict = {}
-    company_data.update(apollo_data)
     company_data.update({k: v for k, v in bd_co.items() if v})
 
     # Re-sync website/domain from merged data
@@ -7107,7 +7176,14 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
     Returns the enriched lead dict on success, None on failure.
     Designed to be called concurrently via asyncio.gather.
     """
-    raw_url = profile.get("input_url") or profile.get("url") or profile.get("linkedin_url")
+    # BrightData error responses nest the URL under {"input": {"url": "..."}} instead of top-level
+    _bd_input = profile.get("input") or {}
+    raw_url = (
+        profile.get("input_url")
+        or profile.get("url")
+        or profile.get("linkedin_url")
+        or (_bd_input.get("url") if isinstance(_bd_input, dict) else None)
+    )
     if not raw_url:
         _pipeline_log.warning("[job=%s] PROFILE_SKIP — no URL in profile keys=%s", (job_id or "")[-8:], list(profile.keys())[:10])
         return None
@@ -7134,6 +7210,9 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
 
         def _is_private_profile(p: dict) -> bool:
             """Detect BrightData private/hidden profile responses — no retry needed."""
+            # BrightData may return is_private as a boolean field
+            if p.get("is_private"):
+                return True
             _PRIVATE_SIGNALS = ("hidden or private", "profile is private", "private profile", "profile not found")
             for _field in ("error", "_error", "_bd_message", "message", "about", "name"):
                 _val = str(p.get(_field) or "").lower()
@@ -7159,7 +7238,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
                 })
             except Exception:
                 pass
-            asyncio.create_task(send_to_lio_failed(url, org_id, sso_id, reason="private_profile"))
+            asyncio.create_task(send_to_lio_failed(url, org_id, sso_id, reason="private_profile", error_message=_err_msg, profile_data=profile))
             return None
 
         # ── Retry if BrightData returned empty/partial/error profile ─────────────
@@ -7180,7 +7259,22 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
                 # Check if retry itself returned a private profile
                 if retried and _is_private_profile(retried):
                     logger.warning("[Pipeline] Retry confirmed private profile for %s — stopping retries", url)
-                    break
+                    _err_msg_retry = retried.get("error") or retried.get("_bd_message") or "Profile is private or hidden"
+                    _lead_id_val = _lead_id(url)
+                    try:
+                        await _upsert_lead({
+                            "id": _lead_id_val,
+                            "linkedin_url": url,
+                            "status": "failed",
+                            "job_id": job_id,
+                            "organization_id": org_id,
+                            "score_explanation": "Profile is private or hidden on LinkedIn — BrightData cannot access it.",
+                            "enriched_at": datetime.now(timezone.utc).isoformat(),
+                        })
+                    except Exception:
+                        pass
+                    asyncio.create_task(send_to_lio_failed(url, org_id, sso_id, reason="private_profile", error_message=_err_msg_retry, profile_data=retried))
+                    return None
             else:
                 _plog(job_id, url, "VALIDATION", "all 3 retries returned empty/invalid profile — skipping", "error")
                 logger.error("[Pipeline] All 3 retries returned empty/invalid profile for %s — skipping", url)
@@ -7223,30 +7317,16 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             except Exception:
                 pass
 
-        # Company waterfall + contact lookup both removed from bulk path.
-        # Company enrichment → POST /api/leads/view/company
-        # Email enrichment  → POST /api/leads/view/email
-        company_extras = {}
-        company_wf_log = []
-        contact = {}
-
-        verified_domain = domain
-        # real_website not used in bulk — website scrape is done via /view/company only
-        profile["_company_extras"] = {}
-
-        # ── Stage 2: ENRICHING — LLM only (website scrape removed from bulk path) ──
-        # Website scrape (11 concurrent fetches + LLM ~30-60s) is NOT called here.
-        # Use POST /view/company to fetch company/website intelligence on demand.
+        # ── Stage 2: ENRICHING — LLM only ────────────────────────────────────────
         async with get_pool().acquire() as _conn:
             await _conn.execute(
                 "UPDATE enriched_leads SET status='enriching', updated_at=NOW() WHERE id=$1",
                 lead_id,
             )
-        _plog(job_id, url, "ENRICHING", f"email={contact.get('email') if isinstance(contact, dict) else '?'!r}")
+        _plog(job_id, url, "ENRICHING", "sending to LLM")
         logger.info("[Pipeline] %s → enriching", url)
 
-        website_intel = {}  # populated via /view/company — not in bulk path
-        enrichment = await build_comprehensive_enrichment(url, profile, contact, website_intel={}, org_id=org_id)
+        enrichment = await build_comprehensive_enrichment(url, profile, {}, website_intel={}, org_id=org_id)
 
         scoring = enrichment.get("lead_scoring", enrichment.get("scoring", {}))
         tier_raw = scoring.get("icp_match_tier") or scoring.get("score_tier", "")
@@ -7264,18 +7344,11 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
         outreach = enrichment.get("outreach", {})
         crm = enrichment.get("crm", {})
         ls = enrichment.get("lead_scoring", scoring)
-        wi = enrichment.get("website_intelligence", website_intel or {})
+        wi = enrichment.get("website_intelligence", {})
 
         # Build waterfall log
         waterfall_log = [
             {"step": 0, "source": "Bright Data", "fields_found": ["profile"], "note": f"LinkedIn scrape: {url}"},
-            *company_wf_log,
-            {
-                "step": 10,
-                "source": contact.get("source") or "none",
-                "fields_found": ["email"],
-                "note": f"email={contact.get('email')}",
-            },
         ]
 
         lead = {
@@ -7287,7 +7360,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             "work_email": None,
             "personal_email": None,
             "direct_phone": pp.get("direct_phone") or ident.get("direct_phone"),
-            "twitter": pp.get("twitter") or ident.get("twitter") or contact.get("twitter"),
+            "twitter": pp.get("twitter") or ident.get("twitter"),
             "city": pp.get("city") or ident.get("city"),
             "country": pp.get("country") or ident.get("country"),
             "timezone": pp.get("timezone") or ident.get("timezone"),
@@ -7313,16 +7386,16 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             "annual_revenue": cp.get("annual_revenue_est") or comp_legacy.get("annual_revenue_est"),
             "tech_stack": _safe_json(cp.get("tech_stack") or comp_legacy.get("tech_stack")),
             "hiring_velocity": cin.get("hiring_velocity") or comp_legacy.get("hiring_velocity"),
-            "avatar_url": _extract_avatar(profile) or contact.get("avatar_url"),
-            "company_logo": cp.get("company_logo") or company_extras.get("company_logo"),
-            "company_email": cp.get("company_email") or company_extras.get("company_email"),
-            "company_description": wi.get("company_description") or company_extras.get("company_description"),
-            "company_linkedin": ci.get("linkedin_url") or company_extras.get("company_linkedin") or contact.get("company_linkedin"),
-            "company_twitter": cp.get("company_twitter") or company_extras.get("company_twitter"),
-            "company_phone": cp.get("company_phone") or company_extras.get("company_phone"),
+            "avatar_url": _extract_avatar(profile),
+            "company_logo": cp.get("company_logo"),
+            "company_email": cp.get("company_email"),
+            "company_description": wi.get("company_description"),
+            "company_linkedin": ci.get("linkedin_url"),
+            "company_twitter": cp.get("company_twitter"),
+            "company_phone": cp.get("company_phone"),
             "waterfall_log": json.dumps(waterfall_log),
             # Stage 3 — Website Intelligence
-            "website_intelligence": json.dumps(website_intel or {}),
+            "website_intelligence": json.dumps({}),
             "product_offerings": _safe_json(wi.get("product_offerings")),
             "value_proposition": wi.get("value_proposition"),
             "target_customers": _safe_json(wi.get("target_customers")),
@@ -7368,7 +7441,7 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
             "full_data": json.dumps({
                 "person_profile": enrichment.get("person_profile", {}),
                 "company_identity": enrichment.get("company_identity", {}),
-                "website_intelligence": enrichment.get("website_intelligence", website_intel or {}),
+                "website_intelligence": enrichment.get("website_intelligence", {}),
                 "company_profile": enrichment.get("company_profile", {}),
                 "company_intelligence": enrichment.get("company_intelligence", {}),
                 "intent_signals": enrichment.get("intent_signals", {}),
@@ -7407,8 +7480,8 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
                 _patch_crm_brief_scores(
                     _patch_crm_brief_images(
                         enrichment.get("crm_brief"),
-                        avatar_url=_extract_avatar(profile) or contact.get("avatar_url") or "",
-                        company_logo=cp.get("company_logo") or company_extras.get("company_logo") or "",
+                        avatar_url=_extract_avatar(profile) or "",
+                        company_logo=cp.get("company_logo") or "",
                     ),
                     icp_fit_score=_safe_int(ls.get("icp_fit_score")),
                     intent_score=_safe_int(ls.get("intent_score")),
