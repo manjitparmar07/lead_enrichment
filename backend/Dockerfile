@@ -51,8 +51,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /install /usr/local
 
 # Install only Chromium (smallest browser footprint)
+# --with-deps can fail on low-RAM servers; system deps already installed above
 ENV PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
-RUN playwright install chromium --with-deps 2>/dev/null || playwright install chromium
+RUN playwright install chromium 2>/dev/null || echo "WARNING: Playwright Chromium install failed — screenshot fallback disabled"
 
 # Copy application source
 COPY . .

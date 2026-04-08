@@ -1,10 +1,30 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 .pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets — never bake into image
 .env
+*.env
+configs/system_keys.json
+
+# Dev artifacts
 *.db
 *.db-journal
+*.log
+.DS_Store
+
+# Git
 .git/
 .gitignore
+.gitattributes
+
+# Docs / non-runtime
+*.md
+tests/
+test_*.py

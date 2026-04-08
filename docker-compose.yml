@@ -30,7 +30,7 @@ services:
   # ── Backend — FastAPI + Gunicorn ────────────────────────────────────────────
   backend:
     build:
-      context: .           # Dockerfile is at repo root
+      context: ./backend   # Dockerfile is inside backend/
       dockerfile: Dockerfile
     container_name: lead-backend
     restart: unless-stopped
