@@ -21,8 +21,6 @@ Two-phase API:
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
 import logging
 from typing import Optional
 
@@ -43,19 +41,7 @@ _SSE_HEADERS = {
 
 
 def _get_org_id(request: Request) -> str:
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return "default"
-    token = auth[7:].strip()
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return "default"
-        payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
-        payload = json.loads(base64.b64decode(payload_b64))
-        return str(payload.get("organization_id", "default"))
-    except Exception:
-        return "default"
+    return "default"
 
 
 # ── Request models ─────────────────────────────────────────────────────────────

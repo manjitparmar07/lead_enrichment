@@ -8,8 +8,6 @@ DELETE /api/workspace/config          — reset to defaults
 
 from __future__ import annotations
 
-import base64
-import json
 import logging
 from typing import Optional
 
@@ -23,17 +21,7 @@ router = APIRouter(prefix="/workspace", tags=["Workspace Config"])
 
 
 def _get_org_id(request: Request) -> str:
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return "default"
-    token = auth[7:].strip()
-    try:
-        parts   = token.split(".")
-        padded  = parts[1] + "=" * (4 - len(parts[1]) % 4)
-        payload = json.loads(base64.b64decode(padded))
-        return str(payload.get("organization_id", "default"))
-    except Exception:
-        return "default"
+    return "default"
 
 
 class WorkspaceConfigIn(BaseModel):

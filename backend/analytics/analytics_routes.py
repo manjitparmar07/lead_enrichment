@@ -13,8 +13,6 @@ GET /api/leads/analytics/jobs     — job-level stats
 
 from __future__ import annotations
 
-import base64
-import json
 import logging
 import os
 from typing import Optional
@@ -32,20 +30,7 @@ router = APIRouter(prefix="/leads/analytics", tags=["Analytics"])
 # ── Org extraction (same pattern as routes file) ──────────────────────────────
 
 def _get_org_id(request: Request) -> str:
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return "default"
-    token = auth[7:].strip()
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return "default"
-        payload_b64 = parts[1]
-        payload_b64 += "=" * (4 - len(payload_b64) % 4)
-        payload = json.loads(base64.b64decode(payload_b64))
-        return str(payload.get("organization_id", "default"))
-    except Exception:
-        return "default"
+    return "default"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

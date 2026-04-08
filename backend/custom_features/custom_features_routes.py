@@ -13,7 +13,6 @@ POST   /api/v1/features/run/{slug}   — execute feature by endpoint slug
 """
 from __future__ import annotations
 
-import base64
 import json
 from typing import Any, Dict, List, Optional
 
@@ -28,19 +27,7 @@ router = APIRouter(prefix="/v1/features", tags=["Custom Features"])
 # ── Org helper ────────────────────────────────────────────────────────────────
 
 def _org(request: Request) -> str:
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return "default"
-    token = auth[7:].strip()
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return "default"
-        pad     = parts[1] + "=" * (4 - len(parts[1]) % 4)
-        payload = json.loads(base64.b64decode(pad))
-        return str(payload.get("organization_id", "default"))
-    except Exception:
-        return "default"
+    return "default"
 
 
 # ── Request models ────────────────────────────────────────────────────────────

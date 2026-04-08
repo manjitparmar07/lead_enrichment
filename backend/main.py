@@ -41,7 +41,6 @@ from Lead_enrichment.bulk_lead_enrichment.lead_enrichment_brightdata_routes impo
     _company_enrich_router,
 )
 from Lead_enrichment.bulk_lead_enrichment.lead_enrichment_brightdata_service import init_leads_db
-from Lead_enrichment.bulk_lead_enrichment import lead_enrichment_worker as worker
 from Lead_enrichment.bulk_lead_enrichment import queue_manager as _queue_manager
 
 
@@ -151,7 +150,7 @@ async def startup():
     await init_serpapi_db()
     await init_custom_features_db()
     await _api_usage._init_table()
-    await worker.start_workers()
+    await _queue_manager.start_queue_system()
     await _import_worker.start_import_workers()
     await _queue_manager.start_ai_workers()
     logger.info("Lead Enrichment API started — http://0.0.0.0:%s", os.getenv("PORT", "8020"))
@@ -159,7 +158,7 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    await worker.stop_workers()
+    await _queue_manager.stop_queue_system()
     await _import_worker.stop_import_workers()
     await _queue_manager.stop_ai_workers()
     await _db.close_pool()

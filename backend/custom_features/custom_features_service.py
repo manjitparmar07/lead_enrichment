@@ -52,11 +52,10 @@ async def init_custom_features_db() -> None:
 
 # ── CRUD ─────────────────────────────────────────────────────────────────────
 
-async def list_features(org_id: str) -> list[dict]:
+async def list_features(org_id: str = "default") -> list[dict]:
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(
-            "SELECT * FROM custom_features WHERE org_id=$1 ORDER BY created_at DESC",
-            org_id,
+            "SELECT * FROM custom_features ORDER BY created_at DESC",
         )
     return [dict(r) for r in rows]
 
@@ -64,8 +63,8 @@ async def list_features(org_id: str) -> list[dict]:
 async def get_feature_by_id(org_id: str, feature_id: int) -> dict | None:
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM custom_features WHERE org_id=$1 AND id=$2",
-            org_id, feature_id,
+            "SELECT * FROM custom_features WHERE id=$1",
+            feature_id,
         )
     return dict(row) if row else None
 
@@ -73,8 +72,8 @@ async def get_feature_by_id(org_id: str, feature_id: int) -> dict | None:
 async def get_feature_by_slug(org_id: str, slug: str) -> dict | None:
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM custom_features WHERE org_id=$1 AND endpoint_slug=$2 AND is_active=TRUE",
-            org_id, slug,
+            "SELECT * FROM custom_features WHERE endpoint_slug=$1 AND is_active=TRUE",
+            slug,
         )
     return dict(row) if row else None
 
@@ -108,7 +107,7 @@ async def create_feature(org_id: str, data: dict) -> dict:
 
 async def update_feature(org_id: str, feature_id: int, data: dict) -> dict | None:
     if not data:
-        return await get_feature_by_id(org_id, feature_id)
+        return await get_feature_by_id("default", feature_id)
 
     allowed_fields = {
         "feature_code", "feature_name", "module", "endpoint_slug", "task_type",
@@ -141,7 +140,7 @@ async def update_feature(org_id: str, feature_id: int, data: dict) -> dict | Non
 
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
-            f"UPDATE custom_features SET {', '.join(set_parts)} WHERE org_id=$1 AND id=$2 RETURNING *",
+            f"UPDATE custom_features SET {', '.join(set_parts)} WHERE id=$2 RETURNING *",
             *values,
         )
     return dict(row) if row else None
@@ -150,8 +149,8 @@ async def update_feature(org_id: str, feature_id: int, data: dict) -> dict | Non
 async def delete_feature(org_id: str, feature_id: int) -> bool:
     async with get_pool().acquire() as conn:
         result = await conn.execute(
-            "DELETE FROM custom_features WHERE org_id=$1 AND id=$2",
-            org_id, feature_id,
+            "DELETE FROM custom_features WHERE id=$1",
+            feature_id,
         )
     return result == "DELETE 1"
 
