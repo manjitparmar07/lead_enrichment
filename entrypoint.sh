@@ -1,0 +1,55 @@
+#!/bin/sh
+set -e
+
+# ── Load .env fallback (when not injected by docker-compose env_file) ─────────
+# docker-compose injects vars before this script runs — this is a no-op then.
+# Needed when running via plain `docker run` or if env_file is missing.
+if [ -f /app/.env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . /app/.env
+    set +a
+fi
+
+# ── Pre-flight checks ─────────────────────────────────────────────────────────
+
+
+# 2. Port conflict check
+PORT="${PORT:-8020}"
+if command -v ss >/dev/null 2>&1; then
+    if ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then
+        echo "WARNING: Port ${PORT} is already in use. Container may fail to bind."
+    fi
+fi
+
+# 3. Disk space warning (warn if < 500 MB free)
+if command -v df >/dev/null 2>&1; then
+    FREE_KB=$(df /app 2>/dev/null | awk 'NR==2 {print $4}')
+    if [ -n "$FREE_KB" ] && [ "$FREE_KB" -lt 512000 ] 2>/dev/null; then
+        echo "WARNING: Low disk space — ${FREE_KB} KB free on /app. Logs or uploads may fail."
+    fi
+fi
+
+# ── Seed configs volume on first run ─────────────────────────────────────────
+# If the mounted /app/configs is empty, copy the defaults baked into the image.
+# cp -rn = no-overwrite, so existing files on the volume are never touched.
+if [ -d /app/configs_seed ] && [ "$(ls -A /app/configs_seed 2>/dev/null)" ]; then
+    cp -rn /app/configs_seed/. /app/configs/
+fi
+
+# ── Ensure system_keys.json exists (gitignored, so not baked into image) ─────
+[ -f /app/configs/system_keys.json ] || echo '{}' > /app/configs/system_keys.json
+
+# ── Redis URL default — use docker-compose service name if not overridden ─────
+export REDIS_URL="${REDIS_URL:-redis://redis:6379}"
+
+# ── Start gunicorn ────────────────────────────────────────────────────────────
+exec gunicorn main:app \
+    --worker-class uvicorn.workers.UvicornWorker \
+    --workers 2 \
+    --bind 0.0.0.0:${PORT:-8020} \
+    --timeout 120 \
+    --keep-alive 5 \
+    --access-logfile - \
+    --error-logfile - \
+    --log-level info

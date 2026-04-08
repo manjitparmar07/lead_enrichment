@@ -1,0 +1,30 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+httpx==0.27.2
+aiohttp>=3.9.0
+pydantic==2.10.3
+python-multipart==0.0.20
+
+# Auth
+PyJWT>=2.8.0
+
+# Lead Enrichment DB
+asyncpg>=0.29.0
+
+# File import (CSV / TSV / XLS / XLSX)
+openpyxl>=3.1.0
+xlrd>=2.0.0
+
+# Fair multi-tenant queue system
+redis>=5.0.0          # async Redis client (per-tenant queues + round-robin scheduler)
+psutil>=5.9.0         # CPU + memory stats for dynamic chunk sizing
+
+# Lead Enrichment — screenshot + OCR pipeline (fallback when no BD API key)
+playwright>=1.43.0
+Pillow>=10.0.0
+pytesseract>=0.3.10
+
+# Website scraping
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
