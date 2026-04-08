@@ -123,7 +123,7 @@ _PROD_ORIGINS = [
     "https://lead-enrichment.worksbuddy.ai",
     "https://leads.worksbuddy.ai",
     "https://lead-enrichment-worksbuddy.lbmdemo.com",
-
+    "https://lead-enrichment-front.up.railway.app",
 ]
 _extra = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 _origins = list(dict.fromkeys(_PROD_ORIGINS + _extra))
