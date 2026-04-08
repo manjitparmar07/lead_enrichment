@@ -89,28 +89,13 @@ def _extract_outreach_from_prompt(prompt: str) -> dict | None:
 
 
 async def _quick_llm(system: str, user: str, max_tokens: int = 2000) -> str:
-    """Lightweight LLM call for view-endpoint AI generation. WB LLM → HuggingFace fallback."""
+    """Lightweight LLM call for view-endpoint AI generation. HuggingFace only."""
     import httpx as _httpx
     errors = []
-    wb_host = svc._wb_llm_host()
-    wb_key  = svc._wb_llm_key()
-    if wb_host and wb_key:
-        try:
-            async with _httpx.AsyncClient(timeout=60) as c:
-                r = await c.post(
-                    f"{wb_host.rstrip('/')}/v1/chat/completions",
-                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {wb_key}"},
-                    json={"model": svc._wb_llm_model(),
-                          "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                          "temperature": 0.35, "max_tokens": max_tokens},
-                )
-                if r.is_success:
-                    return r.json()["choices"][0]["message"]["content"].strip()
-                errors.append(f"WB LLM: HTTP {r.status_code}")
-        except Exception as e:
-            errors.append(f"WB LLM: {e}")
     hf_token = svc._hf_token()
-    if hf_token:
+    if not hf_token:
+        raise RuntimeError("No LLM provider configured: HF_TOKEN is not set.")
+    for attempt in range(2):
         try:
             async with _httpx.AsyncClient(timeout=60) as c:
                 r = await c.post(
@@ -126,10 +111,49 @@ async def _quick_llm(system: str, user: str, max_tokens: int = 2000) -> str:
                     body_txt = r.json().get("error", {}).get("message") or r.text
                 except Exception:
                     body_txt = r.text
-                errors.append(f"HuggingFace: HTTP {r.status_code}: {body_txt}")
+                errors.append(f"HuggingFace attempt {attempt+1}: HTTP {r.status_code}: {body_txt}")
+                if r.status_code not in (429, 503, 502):
+                    break
         except Exception as e:
-            errors.append(f"HuggingFace: {e}")
-    raise RuntimeError(" | ".join(errors) if errors else "No LLM provider configured.")
+            errors.append(f"HuggingFace attempt {attempt+1}: {e}")
+        if attempt == 0:
+            await asyncio.sleep(1)
+    raise RuntimeError(" | ".join(errors))
+
+
+def _template_outreach(lead: dict) -> dict:
+    """
+    Generate a basic template-based outreach when LLM is unavailable and DB has no stored values.
+    Ensures subject, body, and linkedin_note are never returned empty.
+    """
+    name    = lead.get("name") or "there"
+    first   = name.split()[0] if name and name != "there" else name
+    title   = lead.get("title") or "professional"
+    company = lead.get("company") or "your company"
+
+    subject = f"Quick question for {first}"
+
+    body = (
+        f"Your work at {company} caught my attention — "
+        f"the challenges facing {title.lower()}s right now are significant, and "
+        f"the approaches that actually move the needle are few.\n\n"
+        f"We help teams like yours cut through the noise on one specific problem. "
+        f"I'd rather show you a concrete result than pitch broadly.\n\n"
+        f"Would it make sense to spend 15 minutes seeing if there's a fit?"
+    )
+
+    linkedin_note = (
+        f"Hi {first} — your background at {company} stood out. "
+        f"I'd love to connect and share something relevant to your work."
+    )[:300]
+
+    return {
+        "cold_email":     {"subject": subject, "body": body},
+        "linkedin_note":  linkedin_note,
+        "best_channel":   "Email",
+        "best_time":      "Tuesday–Thursday, 9–11 AM local time",
+        "outreach_angle": "Insight",
+    }
 
 
 def _parse_json_field(lead: dict, key: str, default):
@@ -541,8 +565,9 @@ async def outreach_enrichment(body: ViewOutreachRequest):
         lead = _lead_from_ai_information(body.lead_data)
 
     system_prompt = body.system_prompt or _DEFAULT_OUTREACH_SYSTEM
+    lead_id = lead.get("id")
 
-    # Always call LLM to generate fresh outreach
+    # Always generate fresh outreach on every call
     ai_outreach = None
     try:
         lead_ctx = _build_outreach_lead_ctx(lead)
@@ -567,8 +592,8 @@ async def outreach_enrichment(body: ViewOutreachRequest):
     except Exception as _e:
         logger.warning("[OutreachView] AI generation failed: %s", _e)
 
-    # Save generated outreach back to DB if lead has an ID
-    if ai_outreach and lead.get("id"):
+    # Save generated outreach to DB
+    if ai_outreach and lead_id:
         ai_email = ai_outreach.get("cold_email") or {}
         try:
             from db import get_pool
@@ -578,40 +603,68 @@ async def outreach_enrichment(body: ViewOutreachRequest):
                     ai_email.get("subject", ""),
                     ai_email.get("body", ""),
                     ai_outreach.get("linkedin_note", ""),
-                    lead["id"],
+                    lead_id,
                 )
+            await _lead_cache_delete(lead_id)
         except Exception as _e:
-            logger.warning("[OutreachView] DB update failed for lead=%s: %s", lead.get("id"), _e)
+            logger.warning("[OutreachView] DB update failed for lead=%s: %s", lead_id, _e)
 
-    # Build response from generated outreach
+    # ── Resolve subject / body / linkedin_note ───────────────────────────────
+    # Priority: LLM output → stored DB values → template fallback
+    # Every field is guaranteed non-empty before building the response.
+
+    _tmpl = None  # lazy-loaded template
+
+    def _tmpl_fallback() -> dict:
+        nonlocal _tmpl
+        if _tmpl is None:
+            _tmpl = _template_outreach(lead)
+        return _tmpl
+
     if ai_outreach:
         ai_email = ai_outreach.get("cold_email") or {}
-        ai_body = ai_email.get("body", "")
-        cold_email_block = {
-            "subject":    ai_email.get("subject", ""),
-            "greeting":   "",
-            "opening":    "",
-            "body":       ai_body,
-            "cta":        "",
-            "sign_off":   "",
-            "full_email": ai_body,
-        }
-        linkedin_note_val = ai_outreach.get("linkedin_note", "")
+        _subject      = ai_email.get("subject", "").strip()
+        _body         = ai_email.get("body", "").strip()
+        _linkedin_note = ai_outreach.get("linkedin_note", "").strip()
     else:
-        # LLM failed — fall back to stored DB values
-        full = _get_full_data(lead)
+        _subject = _body = _linkedin_note = ""
+
+    # Fill gaps from DB if LLM left any field empty
+    if not _subject or not _body or not _linkedin_note:
+        full         = _get_full_data(lead)
         outreach_data = full.get("outreach") or {}
-        _stored_body = lead.get("cold_email") or outreach_data.get("cold_email") or ""
-        cold_email_block = {
-            "subject":    lead.get("email_subject") or outreach_data.get("email_subject") or "",
-            "greeting":   "",
-            "opening":    "",
-            "body":       _stored_body,
-            "cta":        "",
-            "sign_off":   "",
-            "full_email": _stored_body,
-        }
-        linkedin_note_val = lead.get("linkedin_note") or outreach_data.get("linkedin_note") or ""
+        if not _subject:
+            _subject = (lead.get("email_subject") or outreach_data.get("email_subject") or "").strip()
+        if not _body:
+            _body = (lead.get("cold_email") or outreach_data.get("cold_email") or "").strip()
+        if not _linkedin_note:
+            _linkedin_note = (lead.get("linkedin_note") or outreach_data.get("linkedin_note") or "").strip()
+
+    # Final guarantee — if still empty after DB, use template
+    if not _subject:
+        logger.warning("[OutreachView] subject empty after LLM+DB for lead=%s — using template", lead_id)
+        _subject = _tmpl_fallback()["cold_email"]["subject"]
+    if not _body:
+        logger.warning("[OutreachView] body empty after LLM+DB for lead=%s — using template", lead_id)
+        _body = _tmpl_fallback()["cold_email"]["body"]
+    if not _linkedin_note:
+        logger.warning("[OutreachView] linkedin_note empty after LLM+DB for lead=%s — using template", lead_id)
+        _linkedin_note = _tmpl_fallback()["linkedin_note"]
+
+    cold_email_block = {
+        "subject":    _subject,
+        "greeting":   "",
+        "opening":    "",
+        "body":       _body,
+        "cta":        "",
+        "sign_off":   "",
+        "full_email": _body,
+    }
+    linkedin_note_val = _linkedin_note
+
+    # Use template meta fields if ai_outreach has no channel/time/angle
+    if not ai_outreach:
+        ai_outreach = _tmpl_fallback()
 
     full = _get_full_data(lead)
     outreach_data = full.get("outreach") or {}

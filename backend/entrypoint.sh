@@ -1,6 +1,16 @@
 #!/bin/sh
 set -e
 
+# ── Load .env fallback (when not injected by docker-compose env_file) ─────────
+# docker-compose injects vars before this script runs — this is a no-op then.
+# Needed when running via plain `docker run` or if env_file is missing.
+if [ -f /app/.env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . /app/.env
+    set +a
+fi
+
 # ── Pre-flight checks ─────────────────────────────────────────────────────────
 
 # 1. Critical env vars — fail fast with clear message
