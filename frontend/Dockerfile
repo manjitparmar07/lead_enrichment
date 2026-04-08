@@ -22,6 +22,10 @@ RUN npm run build
 # ── Stage 2: Serve ───────────────────────────────────────────────────────────
 FROM nginx:1.27-alpine
 
+# Default port — envsubst needs this set or nginx "listen ${PORT}" will fail
+ENV PORT=80
+ENV BACKEND_HOST=http://localhost:8020
+
 # Static SPA — no proxy needed, React calls backend via VITE_BACKEND_URL
 COPY nginx.conf /etc/nginx/templates/default.conf.template
 
