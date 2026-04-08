@@ -1780,11 +1780,18 @@ function JobsTab({ jobs, onRefresh, onSelectJob }) {
 // LeadEnrichView — 4 enrichment containers (LinkedIn, Email, Outreach, Company)
 // ─────────────────────────────────────────────────────────────────────────────
 const ENRICH_TABS = [
-  { id: 'linkedin', label: 'LinkedIn Enrich', icon: '🔗', color: '#6366f1' },
-  { id: 'email',    label: 'Email Enrich',    icon: '✉️', color: '#10b981' },
-  { id: 'outreach', label: 'Outreach Enrich', icon: '📤', color: '#f59e0b' },
-  { id: 'company',  label: 'Company Enrich',  icon: '🏢', color: '#3b82f6' },
+  { id: 'linkedin',           label: 'LinkedIn Enrich',    icon: '🔗', color: '#6366f1' },
+  { id: 'email',              label: 'Email Enrich',       icon: '✉️', color: '#10b981' },
+  { id: 'outreach',           label: 'Outreach Enrich',    icon: '📤', color: '#f59e0b' },
+  { id: 'company',            label: 'Company Enrich',     icon: '🏢', color: '#3b82f6' },
+  { id: 'brightdata_profile', label: 'BD Profile (Raw)',   icon: '👤', color: '#8b5cf6', rawData: true },
+  { id: 'brightdata_company', label: 'BD Company (Raw)',   icon: '🏗️', color: '#06b6d4', rawData: true },
+  { id: 'apollo_raw',         label: 'Apollo Raw',         icon: '🚀', color: '#f97316', rawData: true },
+  { id: 'website_scrap',      label: 'Website Scrap',      icon: '🌐', color: '#84cc16', rawData: true },
 ]
+
+// IDs of tabs that load from the single /raw-data endpoint
+const RAW_DATA_TABS = new Set(['brightdata_profile', 'brightdata_company', 'apollo_raw', 'website_scrap'])
 
 function EnrichJsonView({ data }) {
   if (!data) return null
@@ -1908,6 +1915,20 @@ function LeadEnrichView({ lead }) {
   const leadenrich_id = lead?.id
 
   const _fetchViewTab = async (tabId) => {
+    // Raw-data tabs all load from a single endpoint
+    if (RAW_DATA_TABS.has(tabId)) {
+      const r = await fetch(`${BACKEND}/leads/${leadenrich_id}/raw-data`, { headers: jsonHdr() })
+      const data = await r.json()
+      if (!r.ok) throw new Error(data?.detail || `HTTP ${r.status}`)
+      // Each raw tab shows only its own field
+      const fieldMap = {
+        brightdata_profile: 'brightdata_profile',
+        brightdata_company: 'brightdata_company',
+        apollo_raw:         'apollo_raw',
+        website_scrap:      'website_scrap',
+      }
+      return data[fieldMap[tabId]] ?? null
+    }
     // linkedin uses GET + query param; email/outreach/company use POST + JSON body
     const isGet = tabId === 'linkedin'
     const url = isGet
@@ -2043,7 +2064,10 @@ function LeadEnrichView({ lead }) {
                 accentColor="#10b981"
               />
             )}
-            {!isLoading && !err && data && tab.id !== 'linkedin' && tab.id !== 'outreach' && tab.id !== 'company' && tab.id !== 'email' && (
+            {!isLoading && !err && data && RAW_DATA_TABS.has(tab.id) && (
+              <EnrichJsonView data={data} />
+            )}
+            {!isLoading && !err && data && !RAW_DATA_TABS.has(tab.id) && tab.id !== 'linkedin' && tab.id !== 'outreach' && tab.id !== 'company' && tab.id !== 'email' && (
               <EnrichJsonView data={data} />
             )}
             {!isLoading && !err && !data && (
