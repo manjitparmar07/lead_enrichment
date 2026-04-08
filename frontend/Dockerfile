@@ -1,37 +1,23 @@
-# ── Stage 1: Build ───────────────────────────────────────────────────────────
+### Stage 1 — Build React app
 FROM node:20-alpine AS builder
 
 WORKDIR /app
-
-# Install dependencies first (layer cache)
-COPY package.json package-lock.json ./
-RUN npm ci --frozen-lockfile
-
-# Copy source and build
+COPY package*.json ./
+RUN npm install --silent
 COPY . .
-
-# VITE_BACKEND_URL is empty so nginx handles the /api proxy at runtime.
-# Override at build time if you need a direct absolute URL instead:
-#   docker build --build-arg VITE_BACKEND_URL=https://api.example.com
-ARG VITE_BACKEND_URL=""
-ENV VITE_BACKEND_URL=$VITE_BACKEND_URL
-
 RUN npm run build
 
+### Stage 2 — Serve with Nginx
+FROM nginx:alpine
 
-# ── Stage 2: Serve ───────────────────────────────────────────────────────────
-FROM nginx:1.27-alpine
+# Remove default nginx config
+RUN rm /etc/nginx/conf.d/default.conf
 
-# Default port — envsubst needs this set or nginx "listen ${PORT}" will fail
-ENV PORT=80
-ENV BACKEND_HOST=http://localhost:8020
-
-# Static SPA — no proxy needed, React calls backend via VITE_BACKEND_URL
-COPY nginx.conf /etc/nginx/templates/default.conf.template
-
-# Copy built React bundle from builder
+# Copy built assets
 COPY --from=builder /app/dist /usr/share/nginx/html
 
-EXPOSE ${PORT:-80}
+# Nginx config for SPA + API proxy
+COPY nginx-docker.conf /etc/nginx/conf.d/default.conf
 
+EXPOSE 80
 CMD ["nginx", "-g", "daemon off;"]
