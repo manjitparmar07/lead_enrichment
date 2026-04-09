@@ -362,21 +362,54 @@ async def email_enrichment(body: ViewEmailRequest):
                         len(guessed_emails), lead.get("id"),
                         [g["email"] for g in guessed_emails])
 
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE enriched_leads SET email_source='not_found', updated_at=NOW() WHERE id=$1",
-                lead["id"],
+            # Save best verified guess to DB — pick first verified one,
+            # fallback to first guess if none verified
+            best_guess = next(
+                (g for g in guessed_emails if g["verified"]),
+                guessed_emails[0] if guessed_emails else None,
             )
+            if best_guess:
+                work_email  = best_guess["email"]
+                verified    = best_guess["verified"]
+                bounce_risk = best_guess["bounce_risk"]
+                source      = "guessed"
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE enriched_leads
+                           SET work_email=$1, email_source='guessed',
+                               email_confidence='low', enrichment_source='pattern',
+                               email_verified=$2, bounce_risk=$3,
+                               updated_at=NOW()
+                           WHERE id=$4""",
+                        work_email,
+                        1 if verified else 0,
+                        bounce_risk,
+                        lead["id"],
+                    )
+                logger.info("[EmailView] Saved best guess email=%s verified=%s for lead %s",
+                            work_email, verified, lead.get("id"))
+            else:
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE enriched_leads SET email_source='not_found', updated_at=NOW() WHERE id=$1",
+                        lead["id"],
+                    )
+        else:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE enriched_leads SET email_source='not_found', updated_at=NOW() WHERE id=$1",
+                    lead["id"],
+                )
 
     _message = (
-        f"Email found: {work_email} | Verified: {'Yes' if verified else 'No'} | Bounce risk: {bounce_risk or 'unknown'}"
+        f"Email found: {work_email} | Source: {source} | Verified: {'Yes' if verified else 'No'} | Bounce risk: {bounce_risk or 'unknown'}"
         + (f" | Phone: {phone}" if phone else "")
         if work_email
         else (
-            f"Apollo returned no email. Generated {len(guessed_emails)} guessed email(s) based on name + domain."
-            if guessed_emails
-            else f"No email found for {lead.get('name', 'this lead')} at {lead.get('company', 'their company')} via Apollo."
+            f"No email found for {lead.get('name', 'this lead')} at {lead.get('company', 'their company')}."
         )
     )
 
