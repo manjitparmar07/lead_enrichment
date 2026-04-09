@@ -425,7 +425,7 @@ async def email_enrichment(body: ViewEmailRequest):
         "confidence":        confidence,
         "verified":          verified,
         "bounce_risk":       bounce_risk,
-        "enrichment_source": "apollo" if work_email else None,
+        "enrichment_source": source if work_email else None,
         "phone":             phone,
         "all_emails":        [work_email] if work_email else [],
         "activity_emails":   [],
