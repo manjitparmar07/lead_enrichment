@@ -23,7 +23,7 @@ import json
 import logging
 import os
 import re
-from typing import List
+from typing import List, Union
 from urllib.parse import urlparse
 
 import httpx
@@ -81,8 +81,7 @@ class DirectLeadInput(BaseModel):
 
 
 class BulkEmailRequest(BaseModel):
-    lead_ids: List[str] = []            # existing DB leads
-    leads: List[DirectLeadInput] = []   # manual/LIO entries with no lead_id
+    lead_ids: List[Union[str, DirectLeadInput]] = []  # string = DB lead_id, object = direct fields
     force_refresh: bool = False
 
 
@@ -494,32 +493,30 @@ async def email_enrichment(body: ViewEmailRequest):
 
 async def _resolve_bulk_leads(body: BulkEmailRequest, pool) -> list[dict]:
     """
+    lead_ids items can be strings (DB lead_id) or DirectLeadInput objects (direct fields).
     Returns a flat list of lead dicts ready for _find_email_for_lead.
-    - body.lead_ids  → fetch from DB (not found = error stub)
-    - body.leads     → _build_synthetic_lead (no DB lookup, no-op DB update)
     """
+    string_ids   = [item for item in body.lead_ids if isinstance(item, str)]
+    direct_items = [item for item in body.lead_ids if isinstance(item, DirectLeadInput)]
+
     all_leads: list[dict] = []
 
-    # ── DB leads ──────────────────────────────────────────────────────────────
-    if body.lead_ids:
+    # ── String IDs → fetch from DB ────────────────────────────────────────────
+    if string_ids:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT * FROM enriched_leads WHERE id = ANY($1::text[])",
-                body.lead_ids,
+                string_ids,
             )
         leads_by_id = {row["id"]: dict(row) for row in rows}
-        for lid in body.lead_ids:
+        for lid in string_ids:
             if lid in leads_by_id:
                 all_leads.append(leads_by_id[lid])
             else:
-                # not in DB — return error stub immediately (no Apollo call needed)
-                all_leads.append({
-                    "id": lid, "_not_found": True,
-                    "name": None, "company": None,
-                })
+                all_leads.append({"id": lid, "_not_found": True, "name": None, "company": None})
 
-    # ── Direct-field leads ────────────────────────────────────────────────────
-    for entry in body.leads:
+    # ── Direct-field objects → synthetic dict ─────────────────────────────────
+    for entry in direct_items:
         all_leads.append(_build_synthetic_lead(entry))
 
     return all_leads
@@ -549,7 +546,7 @@ Accepts **lead_ids** (DB leads), **direct field objects** (no lead_id), or both 
 """,
 )
 async def bulk_email_enrichment(body: BulkEmailRequest):
-    total = len(body.lead_ids) + len(body.leads)
+    total = len(body.lead_ids)
     if total == 0:
         return {"total": 0, "found": 0, "cached": 0, "skipped": 0, "results": []}
     if total > 500:
@@ -619,7 +616,7 @@ Each SSE event: `data: <JSON>\\n\\n`. Final event has `"done": true` with summar
 """,
 )
 async def bulk_email_stream(body: BulkEmailRequest):
-    total = len(body.lead_ids) + len(body.leads)
+    total = len(body.lead_ids)
     if total == 0:
         async def _empty():
             yield f"data: {json.dumps({'done': True, 'total': 0, 'found': 0, 'cached': 0, 'skipped': 0})}\n\n"
