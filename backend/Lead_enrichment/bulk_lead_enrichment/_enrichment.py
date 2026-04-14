@@ -2045,6 +2045,16 @@ async def regenerate_crm_brief_for_lead(lead_id: str, org_id: str = "") -> Optio
             _tc["founded"]      = str(lead.get("founded_year") or "")
             _tc["stage"]        = lead.get("funding_stage") or ""
 
+        # ── Patch profile_image + company_logo with real BD data ─────────────
+        # LLM cannot know real image URLs — always overwrite from BD profile.
+        # regenerate_crm_brief_for_lead skipped this patch previously;
+        # now mirrors the same patch applied in the initial enrichment pipeline.
+        # raw_profile may not retain the 'avatar' key after enrichment processing,
+        # so fall back to the avatar_url column which is always populated from BD.
+        _avatar = _extract_avatar(profile) or lead.get("avatar_url") or ""
+        _logo   = lead.get("company_logo") or ""
+        _patch_crm_brief_images(_crm, avatar_url=_avatar, company_logo=_logo)
+
         crm_brief_db = json.dumps(_crm, default=str)
     except Exception as _je:
         # Do NOT store malformed JSON — raises so the caller knows regen failed
