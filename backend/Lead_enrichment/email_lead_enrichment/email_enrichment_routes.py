@@ -69,8 +69,20 @@ class ViewEmailRequest(BaseModel):
     force_refresh: bool = False
 
 
+class DirectLeadInput(BaseModel):
+    """One entry in a bulk request that has no lead_id — same as the direct fields on ViewEmailRequest."""
+    first_name: str
+    last_name: str = ""
+    company_website: str = ""
+    domain: str = ""
+    linkedin_url: str = ""
+    company: str = ""
+    ref: str = ""   # optional caller-assigned ID echoed back in the result so you can match rows
+
+
 class BulkEmailRequest(BaseModel):
-    lead_ids: List[str]
+    lead_ids: List[str] = []            # existing DB leads
+    leads: List[DirectLeadInput] = []   # manual/LIO entries with no lead_id
     force_refresh: bool = False
 
 
@@ -198,6 +210,37 @@ def _extract_lead_identity(lead: dict) -> tuple[str, str, str, str]:
 
     linkedin_url = lead.get("linkedin_url") or raw_bd.get("url") or ""
     return first, last, domain, linkedin_url
+
+
+# ── Synthetic lead builder (direct fields → lead dict) ────────────────────────
+
+def _build_synthetic_lead(entry: DirectLeadInput) -> dict:
+    """
+    Convert a DirectLeadInput (no DB row) into the same dict shape that
+    _find_email_for_lead / _extract_lead_identity expect.
+    The DB UPDATE inside the flow silently affects 0 rows — safe no-op.
+    """
+    first = _normalize_name(re.sub(r'\s+[A-Z]\.$', '', entry.first_name.strip()).strip())
+    last  = _normalize_name(re.sub(r'\s+[A-Z]\.$', '', entry.last_name.strip()).strip())
+    domain = entry.domain.strip().lower() if entry.domain else _extract_domain(entry.company_website)
+    ref_id = entry.ref or f"{first}_{last}_{domain}".strip("_")
+    return {
+        "id":               ref_id,
+        "name":             f"{first} {last}".strip(),
+        "company":          entry.company or domain,
+        "company_website":  entry.company_website or domain,
+        "linkedin_url":     entry.linkedin_url.strip(),
+        "work_email":       None,
+        "email_source":     None,
+        "email_confidence": None,
+        "email_verified":   None,
+        "bounce_risk":      None,
+        "enrichment_source": None,
+        "direct_phone":     None,
+        "raw_brightdata":   json.dumps({"first_name": first, "last_name": last}),
+        "crm_brief":        None,
+        "enrichment_data":  None,
+    }
 
 
 # ── Core per-lead email logic (shared by single + bulk) ───────────────────────
@@ -428,40 +471,58 @@ async def email_enrichment(body: ViewEmailRequest):
         return await _find_email_for_lead(dict(row), pool, force_refresh=body.force_refresh)
 
     # ── Path B: no lead_id — build synthetic lead dict from request fields ──
-    first = body.first_name.strip()
-    last  = body.last_name.strip()
-    first = _normalize_name(re.sub(r'\s+[A-Z]\.$', '', first).strip())
-    last  = _normalize_name(re.sub(r'\s+[A-Z]\.$', '', last).strip())
-
-    domain = body.domain.strip().lower() if body.domain else _extract_domain(body.company_website)
-
-    if not first or (not domain and not body.linkedin_url.strip()):
+    if not body.first_name.strip() or (
+        not body.domain.strip() and not body.company_website.strip() and not body.linkedin_url.strip()
+    ):
         raise HTTPException(
             status_code=400,
             detail="Provide leadenrich_id OR (first_name + one of: company_website, domain, linkedin_url)",
         )
 
-    # Construct a dict that matches what _find_email_for_lead / _extract_lead_identity expect.
-    # The DB UPDATE inside the flow will silently affect 0 rows — that's fine.
-    synthetic_lead = {
-        "id":               "direct",
-        "name":             f"{first} {last}".strip(),
-        "company":          body.company or domain,
-        "company_website":  body.company_website or domain,
-        "linkedin_url":     body.linkedin_url.strip(),
-        "work_email":       None,
-        "email_source":     None,
-        "email_confidence": None,
-        "email_verified":   None,
-        "bounce_risk":      None,
-        "enrichment_source": None,
-        "direct_phone":     None,
-        # raw_brightdata carries first/last so _extract_lead_identity reads them correctly
-        "raw_brightdata":   json.dumps({"first_name": first, "last_name": last}),
-        "crm_brief":        None,
-        "enrichment_data":  None,
-    }
+    synthetic_lead = _build_synthetic_lead(DirectLeadInput(
+        first_name=body.first_name,
+        last_name=body.last_name,
+        company_website=body.company_website,
+        domain=body.domain,
+        linkedin_url=body.linkedin_url,
+        company=body.company,
+    ))
     return await _find_email_for_lead(synthetic_lead, pool, force_refresh=True)
+
+
+# ── Shared: build the flat list of lead dicts for bulk operations ──────────────
+
+async def _resolve_bulk_leads(body: BulkEmailRequest, pool) -> list[dict]:
+    """
+    Returns a flat list of lead dicts ready for _find_email_for_lead.
+    - body.lead_ids  → fetch from DB (not found = error stub)
+    - body.leads     → _build_synthetic_lead (no DB lookup, no-op DB update)
+    """
+    all_leads: list[dict] = []
+
+    # ── DB leads ──────────────────────────────────────────────────────────────
+    if body.lead_ids:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM enriched_leads WHERE id = ANY($1::text[])",
+                body.lead_ids,
+            )
+        leads_by_id = {row["id"]: dict(row) for row in rows}
+        for lid in body.lead_ids:
+            if lid in leads_by_id:
+                all_leads.append(leads_by_id[lid])
+            else:
+                # not in DB — return error stub immediately (no Apollo call needed)
+                all_leads.append({
+                    "id": lid, "_not_found": True,
+                    "name": None, "company": None,
+                })
+
+    # ── Direct-field leads ────────────────────────────────────────────────────
+    for entry in body.leads:
+        all_leads.append(_build_synthetic_lead(entry))
+
+    return all_leads
 
 
 # ── Bulk endpoint ──────────────────────────────────────────────────────────────
@@ -470,67 +531,54 @@ async def email_enrichment(body: ViewEmailRequest):
     "/email/bulk",
     summary="Find emails for multiple leads in parallel",
     description="""
-Find emails for a list of already-enriched lead IDs using the same flow as the single endpoint:
-Apollo → ValidEmail.net, falling back to pattern guesses → ValidEmail.net.
-
-- Leads with an existing email are returned immediately unless `force_refresh=true`.
-- Up to 10 leads run concurrently (rate-limit safe).
-- Synchronous response — no webhook or polling needed.
+Accepts **lead_ids** (DB leads), **direct field objects** (no lead_id), or both in one request.
 
 ```json
 {
-  "lead_ids": ["id1", "id2", "id3"],
+  "lead_ids": ["id1", "id2"],
+  "leads": [
+    { "first_name": "John", "last_name": "Doe", "domain": "acme.com", "ref": "row-1" },
+    { "first_name": "Jane", "last_name": "Smith", "linkedin_url": "https://linkedin.com/in/jane" }
+  ],
   "force_refresh": false
 }
 ```
+
+- Up to 10 leads run concurrently (rate-limit safe).
+- Synchronous response — no webhook or polling needed.
 """,
 )
 async def bulk_email_enrichment(body: BulkEmailRequest):
-    if not body.lead_ids:
+    total = len(body.lead_ids) + len(body.leads)
+    if total == 0:
         return {"total": 0, "found": 0, "cached": 0, "skipped": 0, "results": []}
-
-    if len(body.lead_ids) > 500:
-        raise HTTPException(status_code=400, detail="Maximum 500 lead_ids per request.")
+    if total > 500:
+        raise HTTPException(status_code=400, detail="Maximum 500 items per request.")
 
     pool = await get_pool()
-
-    # Batch fetch all leads in one query
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM enriched_leads WHERE id = ANY($1::text[])",
-            body.lead_ids,
-        )
-
-    leads_by_id = {row["id"]: dict(row) for row in rows}
+    all_leads = await _resolve_bulk_leads(body, pool)
 
     results: list[dict] = []
 
-    # Not found in DB
-    for lid in body.lead_ids:
-        if lid not in leads_by_id:
-            results.append({
-                "lead_id": lid, "name": None, "company": None,
+    async def _enrich_one(lead: dict) -> dict:
+        if lead.get("_not_found"):
+            return {
+                "lead_id": lead["id"], "name": None, "company": None,
                 "work_email": None, "email": None,
-                "source": "not_found", "message": f"Lead {lid} not found in database.",
+                "source": "not_found", "message": f"Lead {lead['id']} not found in database.",
                 "confidence": None, "verified": False, "bounce_risk": None,
                 "enrichment_source": None, "phone": None,
                 "all_emails": [], "activity_emails": [], "activity_phones": [],
                 "ai_generated": None, "guessed_emails": [],
-            })
-
-    # Run the same flow as single, in parallel under semaphore
-    async def _enrich_one(lead: dict) -> dict:
+            }
         async with _BULK_EMAIL_SEM:
             return await _find_email_for_lead(lead, pool, force_refresh=body.force_refresh)
 
-    lead_results = await asyncio.gather(
-        *[_enrich_one(leads_by_id[lid]) for lid in body.lead_ids if lid in leads_by_id],
-        return_exceptions=True,
-    )
+    lead_results = await asyncio.gather(*[_enrich_one(l) for l in all_leads], return_exceptions=True)
 
     for r in lead_results:
         if isinstance(r, Exception):
-            logger.warning("[BulkEmail] Lead error: %s", r)
+            logger.warning("[BulkEmail] error: %s", r)
             results.append({
                 "lead_id": None, "work_email": None, "email": None,
                 "source": "error", "message": str(r),
@@ -543,13 +591,7 @@ async def bulk_email_enrichment(body: BulkEmailRequest):
     found   = sum(1 for r in results if r.get("work_email") and not r.get("message", "").startswith("Email already found"))
     skipped = sum(1 for r in results if not r.get("work_email"))
 
-    return {
-        "total":   len(body.lead_ids),
-        "found":   found,
-        "cached":  cached,
-        "skipped": skipped,
-        "results": results,
-    }
+    return {"total": total, "found": found, "cached": cached, "skipped": skipped, "results": results}
 
 
 # ── Bulk stream endpoint ───────────────────────────────────────────────────────
@@ -558,58 +600,47 @@ async def bulk_email_enrichment(body: BulkEmailRequest):
     "/email/bulk/stream",
     summary="Stream email enrichment results one by one as each lead finishes",
     description="""
-Same flow as `/email/bulk` but streams each result via Server-Sent Events (SSE)
-the moment it completes — no waiting for all leads to finish.
+Same as `/email/bulk` but streams via SSE — each result arrives the moment it finishes.
 
-Each event is `data: <JSON>\\n\\n`. The final event has `"done": true` with summary counts.
+Accepts **lead_ids**, **direct field objects**, or both:
 
 ```json
-{ "lead_ids": ["id1", "id2", "id3"], "force_refresh": false }
+{
+  "lead_ids": ["id1", "id2"],
+  "leads": [
+    { "first_name": "John", "last_name": "Doe", "domain": "acme.com", "ref": "row-1" },
+    { "first_name": "Jane", "last_name": "Smith", "linkedin_url": "https://linkedin.com/in/jane" }
+  ],
+  "force_refresh": false
+}
 ```
 
-**Client example (JS):**
-```js
-const res = await fetch('/api/leads/email/bulk/stream', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ lead_ids: ['id1', 'id2'] })
-});
-const reader = res.body.getReader();
-// read lines and JSON.parse each `data: ...` line
-```
+Each SSE event: `data: <JSON>\\n\\n`. Final event has `"done": true` with summary counts.
 """,
 )
 async def bulk_email_stream(body: BulkEmailRequest):
-    if not body.lead_ids:
+    total = len(body.lead_ids) + len(body.leads)
+    if total == 0:
         async def _empty():
             yield f"data: {json.dumps({'done': True, 'total': 0, 'found': 0, 'cached': 0, 'skipped': 0})}\n\n"
         return StreamingResponse(_empty(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    if len(body.lead_ids) > 500:
-        raise HTTPException(status_code=400, detail="Maximum 500 lead_ids per request.")
+    if total > 500:
+        raise HTTPException(status_code=400, detail="Maximum 500 items per request.")
 
     pool = await get_pool()
+    all_leads = await _resolve_bulk_leads(body, pool)
 
-    # Batch fetch all leads in one query
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM enriched_leads WHERE id = ANY($1::text[])",
-            body.lead_ids,
-        )
-    leads_by_id = {row["id"]: dict(row) for row in rows}
-
-    # Queue collects results as each lead finishes
     queue: asyncio.Queue = asyncio.Queue()
-    total_tasks = len(body.lead_ids)
+    total_tasks = len(all_leads)
 
-    async def _enrich_and_enqueue(lead_id: str) -> None:
-        lead = leads_by_id.get(lead_id)
-        if not lead:
+    async def _enrich_and_enqueue(lead: dict) -> None:
+        if lead.get("_not_found"):
             await queue.put({
-                "lead_id": lead_id, "name": None, "company": None,
+                "lead_id": lead["id"], "name": None, "company": None,
                 "work_email": None, "email": None,
-                "source": "not_found", "message": f"Lead {lead_id} not found in database.",
+                "source": "not_found", "message": f"Lead {lead['id']} not found in database.",
                 "confidence": None, "verified": False, "bounce_risk": None,
                 "enrichment_source": None, "phone": None,
                 "all_emails": [], "activity_emails": [], "activity_phones": [],
@@ -620,9 +651,9 @@ async def bulk_email_stream(body: BulkEmailRequest):
             async with _BULK_EMAIL_SEM:
                 result = await _find_email_for_lead(lead, pool, force_refresh=body.force_refresh)
         except Exception as e:
-            logger.warning("[BulkEmailStream] Error for lead %s: %s", lead_id, e)
+            logger.warning("[BulkEmailStream] Error for lead %s: %s", lead.get("id"), e)
             result = {
-                "lead_id": lead_id, "work_email": None, "email": None,
+                "lead_id": lead.get("id"), "work_email": None, "email": None,
                 "source": "error", "message": str(e),
                 "confidence": None, "verified": False, "bounce_risk": None,
             }
@@ -630,14 +661,13 @@ async def bulk_email_stream(body: BulkEmailRequest):
 
     async def _generate():
         # Fire all tasks — they push into the queue as they finish
-        tasks = [asyncio.create_task(_enrich_and_enqueue(lid)) for lid in body.lead_ids]
+        tasks = [asyncio.create_task(_enrich_and_enqueue(lead)) for lead in all_leads]
 
         found = cached = skipped = 0
 
         for _ in range(total_tasks):
             result = await queue.get()
 
-            # Update running counts
             if result.get("work_email"):
                 if result.get("message", "").startswith("Email already found"):
                     cached += 1
@@ -646,10 +676,8 @@ async def bulk_email_stream(body: BulkEmailRequest):
             else:
                 skipped += 1
 
-            # Yield this result immediately
             yield f"data: {json.dumps(result, default=str)}\n\n"
 
-        # Wait for all tasks to clean up, then send the done event
         await asyncio.gather(*tasks, return_exceptions=True)
         yield f"data: {json.dumps({'done': True, 'total': total_tasks, 'found': found, 'cached': cached, 'skipped': skipped})}\n\n"
 
