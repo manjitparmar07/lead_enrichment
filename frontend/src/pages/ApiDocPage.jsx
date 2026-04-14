@@ -159,14 +159,13 @@ export default function ApiDocPage() {
 
     email: [
       {
-        id: 'email-enrich', method: 'POST', path: '/api/leads/view/email', title: 'Email Enrichment',
-        desc: 'Returns the email enrichment result — best verified work email, source provider (apollo/hunter), confidence score, verification status, bounce risk, and all discovered emails. Pass leadenrich_id from bulk job results. If no email is stored a live Apollo → Hunter lookup runs automatically. Optional: pass system_prompt to get an AI-generated personalised email template in ai_generated.email_template.',
+        id: 'email-enrich', method: 'POST', path: '/api/leads/view/email', title: 'Email Enrichment (Single)',
+        desc: 'Find and verify a work email for a single lead. Pass leadenrich_id from bulk job results. Flow: Apollo.io person match → ValidEmail.net verification → pattern guesses (first.last@, flast@, first@) → ValidEmail.net. If email is already stored it is returned immediately (no API call).',
         curl:
 `curl -X POST ${BASE}/api/leads/view/email \\
   -H "Content-Type: application/json" \\
   -d '{
-    "leadenrich_id": "abc123def456",
-    "system_prompt": "You are a B2B sales AI for Acme Inc..."
+    "leadenrich_id": "abc123def456"
   }'`,
         response:
 `{
@@ -176,21 +175,119 @@ export default function ApiDocPage() {
 
   "work_email": "john.doe@acme.com",
   "email": "john.doe@acme.com",
-  "source": "apollo",
-  "confidence": 92,
+  "source": "apollo",          // "apollo" | "guessed" | "not_found"
+  "confidence": "high",        // "high" | "low" | null
   "verified": true,
-  "bounce_risk": "low",
-  "enrichment_source": "apollo_person_match",
+  "bounce_risk": "low",        // "low" | "medium" | "high"
+  "enrichment_source": "apollo",
 
   "phone": "+1-415-555-0100",
 
-  "all_emails": ["john.doe@acme.com", "jdoe@acme.com"],
-  "activity_emails": ["john@personalsite.com"],
+  "all_emails": ["john.doe@acme.com"],
+  "guessed_emails": [],        // populated when Apollo misses, holds all 3 pattern guesses
+  "activity_emails": [],
   "activity_phones": [],
+  "ai_generated": null
+}`,
+      },
+      {
+        id: 'email-bulk', method: 'POST', path: '/api/leads/email/bulk', title: 'Bulk Email Enrichment',
+        desc: 'Find emails for multiple leads in one request. Pass a list of leadenrich_ids. Runs the same Apollo → ValidEmail.net → pattern guess flow as the single endpoint, with up to 10 leads processed in parallel. Leads that already have an email are returned immediately (no API call) unless force_refresh is true. Returns a single JSON response once all leads are done. Max 500 lead_ids per request.',
+        curl:
+`curl -X POST ${BASE}/api/leads/email/bulk \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "lead_ids": [
+      "abc123def456",
+      "xyz789ghi012",
+      "lmn345opq678"
+    ],
+    "force_refresh": false
+  }'`,
+        response:
+`{
+  "total": 3,
+  "found": 2,
+  "cached": 1,
+  "skipped": 0,
+  "results": [
+    {
+      "lead_id": "abc123def456",
+      "name": "John Doe",
+      "company": "Acme Corp",
+      "work_email": "john.doe@acme.com",
+      "email": "john.doe@acme.com",
+      "source": "apollo",
+      "confidence": "high",
+      "verified": true,
+      "bounce_risk": "low",
+      "phone": "+1-415-555-0100",
+      "message": "Email found: john.doe@acme.com | Source: apollo | Verified: Yes | Bounce risk: low"
+    },
+    {
+      "lead_id": "xyz789ghi012",
+      "name": "Sara Jones",
+      "company": "Globex",
+      "work_email": "sara.jones@globex.com",
+      "source": "guessed",
+      "confidence": null,
+      "verified": false,
+      "bounce_risk": "high",
+      "message": "Email already found: sara.jones@globex.com"  // cached
+    },
+    {
+      "lead_id": "lmn345opq678",
+      "name": "Mike Tan",
+      "company": "Initech",
+      "work_email": null,
+      "source": "not_found",
+      "message": "No email found for Mike Tan at Initech."
+    }
+  ]
+}`,
+      },
+      {
+        id: 'email-bulk-stream', method: 'POST', path: '/api/leads/email/bulk/stream', title: 'Bulk Email Stream (SSE)',
+        desc: 'Same as Bulk Email Enrichment but streams each result as a Server-Sent Event the moment it finishes — no waiting for all leads to complete. Results arrive in completion order (fastest first), not input order. The final event has done: true with summary counts. Max 500 lead_ids per request.',
+        curl:
+`# -N disables buffering so each event prints as it arrives
+curl -N -X POST ${BASE}/api/leads/email/bulk/stream \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "lead_ids": ["abc123def456", "xyz789ghi012", "lmn345opq678"],
+    "force_refresh": false
+  }'`,
+        response:
+`// Each line is a separate SSE event — arrives as each lead finishes:
 
-  // Only present when system_prompt is provided:
-  "ai_generated": {
-    "email_template": "{\"subject\": \"Quick idea for John at Acme\", \"body\": \"Hi John, ...\"}"
+data: {"lead_id":"xyz789ghi012","name":"Sara Jones","work_email":"sara.jones@globex.com","source":"apollo","verified":true,"bounce_risk":"low","message":"Email found: sara.jones@globex.com | Source: apollo | Verified: Yes | Bounce risk: low"}
+
+data: {"lead_id":"lmn345opq678","name":"Mike Tan","work_email":null,"source":"not_found","message":"No email found for Mike Tan at Initech."}
+
+data: {"lead_id":"abc123def456","name":"John Doe","work_email":"john.doe@acme.com","source":"guessed","verified":false,"bounce_risk":"high","message":"Email found: john.doe@acme.com | Source: guessed | Verified: No | Bounce risk: high"}
+
+data: {"done":true,"total":3,"found":2,"cached":0,"skipped":1}
+
+// ── JavaScript client example ─────────────────────────────────────
+const res = await fetch('/api/leads/email/bulk/stream', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ lead_ids: ['abc123', 'xyz789'] }),
+})
+const reader = res.body.getReader()
+const decoder = new TextDecoder()
+let buffer = ''
+while (true) {
+  const { done, value } = await reader.read()
+  if (done) break
+  buffer += decoder.decode(value, { stream: true })
+  const lines = buffer.split('\\n')
+  buffer = lines.pop()
+  for (const line of lines) {
+    if (!line.startsWith('data: ')) continue
+    const data = JSON.parse(line.slice(6))
+    if (data.done) console.log('All done:', data)
+    else console.log('Lead result:', data.lead_id, data.work_email)
   }
 }`,
       },
