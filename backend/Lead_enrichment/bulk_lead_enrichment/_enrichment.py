@@ -2009,17 +2009,37 @@ async def regenerate_crm_brief_for_lead(lead_id: str, org_id: str = "") -> Optio
 
     try:
         _crm = json.loads(brief)
-        # Always override who_they_are.company with BrightData current_company.name
-        # — LLM sometimes picks a company from the experience array despite instructions.
+
+        # ── Authoritative sources ─────────────────────────────────────────────
         _bd_company = (
             profile.get("current_company_name")
             or (profile.get("current_company") or {}).get("name")
-            or ""
+            or lead.get("company") or ""
         )
-        if not _bd_company:
-            _bd_company = lead.get("company") or ""
-        if _bd_company and isinstance(_crm.get("who_they_are"), dict):
-            _crm["who_they_are"]["company"] = _bd_company
+        _bd_title = (
+            profile.get("position") or profile.get("headline")
+            or lead.get("title") or ""
+        )
+
+        # ── who_they_are — force company + title from BrightData ─────────────
+        # LLM reads experience array and picks wrong company/title.
+        # current_company.name is the ONLY authoritative source.
+        if isinstance(_crm.get("who_they_are"), dict):
+            if _bd_company:
+                _crm["who_they_are"]["company"] = _bd_company
+            if _bd_title:
+                _crm["who_they_are"]["title"] = _bd_title
+
+        # ── their_company — override with real DB data from waterfall ─────────
+        # If no data found by waterfall, store empty — never use fake/hallucinated values.
+        if isinstance(_crm.get("their_company"), dict):
+            _tc = _crm["their_company"]
+            _tc["website"]      = lead.get("company_website") or ""
+            _tc["industry"]     = lead.get("industry") or ""
+            _tc["company_size"] = str(lead.get("employee_count") or "")
+            _tc["founded"]      = str(lead.get("founded_year") or "")
+            _tc["stage"]        = lead.get("funding_stage") or ""
+
         crm_brief_db = json.dumps(_crm, default=str)
     except Exception:
         crm_brief_db = brief

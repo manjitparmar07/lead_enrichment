@@ -1645,15 +1645,35 @@ async def build_comprehensive_enrichment(
                 # Try to parse as JSON — store as dict if valid, else raw string
                 try:
                     _crm = json.loads(brief)
-                    # Always override who_they_are.company with BrightData current_company.name
-                    # — LLM sometimes picks a company from the experience array despite instructions.
+
+                    # ── Authoritative sources ─────────────────────────────────
                     _bd_company = (
                         profile.get("current_company_name")
                         or (profile.get("current_company") or {}).get("name")
                         or ""
                     )
-                    if _bd_company and isinstance(_crm.get("who_they_are"), dict):
-                        _crm["who_they_are"]["company"] = _bd_company
+                    _bd_title = profile.get("position") or profile.get("headline") or ""
+                    _co_extras = profile.get("_company_extras") or {}
+
+                    # ── who_they_are — force company + title from BrightData ──
+                    # LLM reads experience array and picks wrong company/title.
+                    # current_company.name is the ONLY authoritative source.
+                    if isinstance(_crm.get("who_they_are"), dict):
+                        if _bd_company:
+                            _crm["who_they_are"]["company"] = _bd_company
+                        if _bd_title:
+                            _crm["who_they_are"]["title"] = _bd_title
+
+                    # ── their_company — override with real waterfall data ─────
+                    # If waterfall found no data, store empty — never fake values.
+                    if isinstance(_crm.get("their_company"), dict):
+                        _tc = _crm["their_company"]
+                        _tc["website"]      = _co_extras.get("company_website") or ""
+                        _tc["industry"]     = _co_extras.get("industry") or ""
+                        _tc["company_size"] = str(_co_extras.get("employee_count") or "")
+                        _tc["founded"]      = str(_co_extras.get("founded_year") or "")
+                        _tc["stage"]        = _co_extras.get("funding_stage") or ""
+
                     data["crm_brief"] = _crm
                 except Exception:
                     data["crm_brief"] = brief
