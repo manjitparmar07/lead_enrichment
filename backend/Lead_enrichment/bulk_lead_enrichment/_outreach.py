@@ -1600,7 +1600,7 @@ async def build_comprehensive_enrichment(
             brief = await _call_llm([
                 {"role": "system", "content": effective_crm_prompt},
                 {"role": "user",   "content": crm_brief_user},
-            ], max_tokens=4500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override,
+            ], max_tokens=6000, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override,
                hf_first=True)
             if not brief:
                 logger.warning("[Enrichment] CRM brief — HuggingFace returned None (hf=%s)", hf_ok)
@@ -1616,7 +1616,7 @@ async def build_comprehensive_enrichment(
                 _start = brief.find("{")
                 if _start != -1:
                     _depth = 0
-                    _end = _start
+                    _end = -1
                     for _i, _ch in enumerate(brief[_start:], _start):
                         if _ch == "{": _depth += 1
                         elif _ch == "}":
@@ -1624,9 +1624,16 @@ async def build_comprehensive_enrichment(
                             if _depth == 0:
                                 _end = _i
                                 break
-                    brief = brief[_start:_end + 1]
-                # Try to parse as JSON — store as dict if valid, else raw string
+                    if _end == -1:
+                        # JSON was truncated — LLM hit max_tokens mid-response
+                        logger.warning("[Enrichment] CRM brief truncated (max_tokens hit) — discarding partial JSON")
+                        brief = None
+                    else:
+                        brief = brief[_start:_end + 1]
+                # Try to parse as JSON — only store if valid
                 try:
+                    if not brief:
+                        raise ValueError("empty or truncated brief")
                     _crm = json.loads(brief)
 
                     # ── Authoritative sources ─────────────────────────────────
@@ -1658,9 +1665,11 @@ async def build_comprehensive_enrichment(
                         _tc["stage"]        = _co_extras.get("funding_stage") or ""
 
                     data["crm_brief"] = _crm
-                except Exception:
-                    data["crm_brief"] = brief
-                logger.info("[Enrichment] CRM brief generated (%d chars)", len(brief))
+                except Exception as _je:
+                    # Do NOT store malformed/truncated JSON — leave crm_brief absent
+                    # so the fallback rule-based assembly is used instead.
+                    logger.warning("[Enrichment] CRM brief JSON parse failed (%s) — skipping storage", _je)
+                logger.info("[Enrichment] CRM brief generated (%d chars)", len(brief) if brief else 0)
         except Exception as _be:
             logger.warning("[Enrichment] CRM brief failed: %s", _be)
 

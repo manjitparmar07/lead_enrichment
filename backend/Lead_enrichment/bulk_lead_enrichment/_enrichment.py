@@ -1982,7 +1982,7 @@ async def regenerate_crm_brief_for_lead(lead_id: str, org_id: str = "") -> Optio
     brief = await _call_llm([
         {"role": "system", "content": crm_brief_prompt},
         {"role": "user",   "content": f"Analyze this LinkedIn prospect data and return the JSON exactly as specified:\n\n{optimized_str}"},
-    ], max_tokens=4500, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override,
+    ], max_tokens=6000, temperature=0.3, model_override=model_override, wb_llm_model_override=model_override,
        hf_first=True)
 
     if not brief:
@@ -1994,10 +1994,10 @@ async def regenerate_crm_brief_for_lead(lead_id: str, org_id: str = "") -> Optio
     # Strip any [inferred] markers the model may have added
     brief = brief.replace("[inferred]", "").replace("[Inferred]", "")
 
-    # Extract first complete JSON object
+    # Extract first complete JSON object using brace counting
     _start = brief.find("{")
     if _start != -1:
-        _depth, _end = 0, _start
+        _depth, _end = 0, -1
         for _i, _ch in enumerate(brief[_start:], _start):
             if _ch == "{": _depth += 1
             elif _ch == "}":
@@ -2005,7 +2005,12 @@ async def regenerate_crm_brief_for_lead(lead_id: str, org_id: str = "") -> Optio
                 if _depth == 0:
                     _end = _i
                     break
+        if _end == -1:
+            # JSON was truncated — LLM hit max_tokens mid-response
+            raise RuntimeError(f"CRM brief truncated (max_tokens hit) — partial JSON discarded. len={len(brief)}")
         brief = brief[_start:_end + 1]
+    else:
+        raise RuntimeError("No JSON object found in LLM response")
 
     try:
         _crm = json.loads(brief)
@@ -2041,8 +2046,9 @@ async def regenerate_crm_brief_for_lead(lead_id: str, org_id: str = "") -> Optio
             _tc["stage"]        = lead.get("funding_stage") or ""
 
         crm_brief_db = json.dumps(_crm, default=str)
-    except Exception:
-        crm_brief_db = brief
+    except Exception as _je:
+        # Do NOT store malformed JSON — raises so the caller knows regen failed
+        raise RuntimeError(f"CRM brief JSON parse failed: {_je} | preview={brief[:100]!r}")
 
     async with get_pool().acquire() as conn:
         await conn.execute(
