@@ -17,6 +17,20 @@ export default function ResultsTab({ leads, total, loading, filters, onFiltersCh
   const [jsonModal, setJsonModal] = useState(null)
   const [jsonLoading, setJsonLoading] = useState(null)
 
+  // ── Lead selection ───────────────────────────────────────────────────────────
+  const [selectedIds, setSelectedIds] = useState(new Set())
+  const allSelected = leads.length > 0 && leads.every(l => selectedIds.has(l.id))
+  const someSelected = leads.some(l => selectedIds.has(l.id))
+
+  const toggleLead = (id) => setSelectedIds(prev => {
+    const next = new Set(prev)
+    next.has(id) ? next.delete(id) : next.add(id)
+    return next
+  })
+  const toggleAll = () => setSelectedIds(
+    allSelected ? new Set() : new Set(leads.map(l => l.id))
+  )
+
   // ── Bulk Email Stream state ──────────────────────────────────────────────────
   const [streamOpen,    setStreamOpen]    = useState(false)
   const [streamRunning, setStreamRunning] = useState(false)
@@ -25,9 +39,11 @@ export default function ResultsTab({ leads, total, loading, filters, onFiltersCh
   const [forceRefresh,  setForceRefresh]  = useState(false)
   const abortRef = useRef(null)
 
+  const selectedLeads = leads.filter(l => selectedIds.has(l.id))
+
   const startBulkEmailStream = async () => {
-    if (!leads.length) return toast.error('No leads on this page to enrich.')
-    const leadIds = leads.map(l => l.id)
+    if (!selectedLeads.length) return toast.error('Select at least one lead to enrich.')
+    const leadIds = selectedLeads.map(l => l.id)
     setStreamOpen(true)
     setStreamRunning(true)
     setStreamResults([])
@@ -63,6 +79,7 @@ export default function ResultsTab({ leads, total, loading, filters, onFiltersCh
               setStreamSummary(data)
               setStreamRunning(false)
               toast.success(`Done — ${data.found} email${data.found !== 1 ? 's' : ''} found`)
+              onRefresh()
             } else {
               setStreamResults(prev => [data, ...prev])
             }
@@ -78,6 +95,7 @@ export default function ResultsTab({ leads, total, loading, filters, onFiltersCh
   const stopStream = () => {
     abortRef.current?.abort()
     setStreamRunning(false)
+    onRefresh()
   }
 
   const openJson = async (lead) => {
@@ -187,19 +205,33 @@ export default function ResultsTab({ leads, total, loading, filters, onFiltersCh
             background: 'rgba(167,139,250,0.06)',
           }}>
             <Mail size={13} style={{ color: '#a78bfa' }} />
+            {/* Select-all checkbox */}
+            <label style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-3)', cursor: 'pointer' }}
+              title="Select / deselect all leads on this page">
+              <input
+                type="checkbox"
+                checked={allSelected}
+                ref={el => { if (el) el.indeterminate = someSelected && !allSelected }}
+                onChange={toggleAll}
+              />
+              All
+            </label>
             <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-1)', flex: 1 }}>
-              Bulk Email Stream — {leads.length} lead{leads.length !== 1 ? 's' : ''} on this page
+              {selectedLeads.length > 0
+                ? <>{selectedLeads.length} lead{selectedLeads.length !== 1 ? 's' : ''} selected</>
+                : <span style={{ color: 'var(--text-3)', fontWeight: 400 }}>Select leads below to enrich</span>
+              }
             </span>
             <label style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-3)', cursor: 'pointer' }}>
               <input type="checkbox" checked={forceRefresh} onChange={e => setForceRefresh(e.target.checked)} />
               Force refresh
             </label>
             {!streamRunning
-              ? <button onClick={startBulkEmailStream} disabled={leads.length === 0} style={{
+              ? <button onClick={startBulkEmailStream} disabled={selectedLeads.length === 0} style={{
                   padding: '4px 14px', borderRadius: 6, fontSize: 11, fontWeight: 600,
-                  background: leads.length === 0 ? 'var(--bg-elevated)' : '#7c3aed',
-                  color: leads.length === 0 ? 'var(--text-3)' : '#fff',
-                  border: 'none', cursor: leads.length === 0 ? 'not-allowed' : 'pointer',
+                  background: selectedLeads.length === 0 ? 'var(--bg-elevated)' : '#7c3aed',
+                  color: selectedLeads.length === 0 ? 'var(--text-3)' : '#fff',
+                  border: 'none', cursor: selectedLeads.length === 0 ? 'not-allowed' : 'pointer',
                 }}>Start</button>
               : <button onClick={stopStream} style={{
                   padding: '4px 14px', borderRadius: 6, fontSize: 11, fontWeight: 600,
@@ -220,7 +252,7 @@ export default function ResultsTab({ leads, total, loading, filters, onFiltersCh
             }}>
               {streamRunning && <Loader size={11} style={{ color: '#a78bfa', animation: 'spin 1s linear infinite' }} />}
               {streamRunning
-                ? <span style={{ color: 'var(--text-3)' }}>Enriching… {streamResults.length} / {leads.length} done</span>
+                ? <span style={{ color: 'var(--text-3)' }}>Enriching… {streamResults.length} / {selectedLeads.length} done</span>
                 : <span style={{ color: '#10b981', fontWeight: 600 }}>Complete</span>
               }
               <span style={{ color: '#10b981' }}>
@@ -239,7 +271,7 @@ export default function ResultsTab({ leads, total, loading, filters, onFiltersCh
               <div style={{ flex: 1, height: 4, borderRadius: 4, background: 'var(--bg-elevated)', overflow: 'hidden' }}>
                 <div style={{
                   height: '100%', borderRadius: 4, background: '#7c3aed',
-                  width: `${leads.length ? (streamResults.length / leads.length) * 100 : 0}%`,
+                  width: `${selectedLeads.length ? (streamResults.length / selectedLeads.length) * 100 : 0}%`,
                   transition: 'width 0.3s',
                 }} />
               </div>
@@ -299,7 +331,10 @@ export default function ResultsTab({ leads, total, loading, filters, onFiltersCh
           {/* Empty state before start */}
           {!streamRunning && streamResults.length === 0 && !streamSummary && (
             <div style={{ padding: '20px', textAlign: 'center', color: 'var(--text-3)', fontSize: 12 }}>
-              Click <strong>Start</strong> to find emails for {leads.length} lead{leads.length !== 1 ? 's' : ''} on this page.
+              {selectedLeads.length === 0
+                ? <>Check the box next to leads you want to enrich, then click <strong>Start</strong>.</>
+                : <>Click <strong>Start</strong> to find emails for {selectedLeads.length} selected lead{selectedLeads.length !== 1 ? 's' : ''}.</>
+              }
             </div>
           )}
         </div>
@@ -338,31 +373,49 @@ export default function ResultsTab({ leads, total, loading, filters, onFiltersCh
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {leads.map(lead => (
           <div key={lead.id} style={{
-            borderRadius: 10, border: `1px solid ${expanded===lead.id ? 'rgba(99,102,241,0.3)':'var(--border-1)'}`,
-            background: 'var(--bg-card)', overflow: 'hidden', transition: 'border-color 0.15s',
+            borderRadius: 10,
+            border: `1px solid ${
+              streamOpen && selectedIds.has(lead.id) ? 'rgba(167,139,250,0.5)' :
+              expanded === lead.id ? 'rgba(99,102,241,0.3)' : 'var(--border-1)'
+            }`,
+            background: streamOpen && selectedIds.has(lead.id) ? 'rgba(167,139,250,0.04)' : 'var(--bg-card)',
+            overflow: 'hidden', transition: 'border-color 0.15s, background 0.15s',
           }}>
             {/* Row header */}
-            <div onClick={() => setExpanded(id => id===lead.id ? null : lead.id)}
-              style={{ padding: '11px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 10 }}>
-              <Avatar name={lead.name} tier={lead.score_tier} src={lead.avatar_url} />
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 2 }}>
-                  <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-1)' }}>{lead.name || 'Unknown'}</span>
-                  <TierBadge tier={lead.score_tier} />
-                  {parseTags(lead.tags).slice(0,2).map(t => <TagBadge key={t} text={t} />)}
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  {lead.company_logo && <CompanyLogo src={lead.company_logo} name={lead.company} size={16} />}
-                  <div style={{ fontSize: 11, color: 'var(--text-3)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {[lead.title, lead.company, fmtCity(lead.city) || fmtCountry(lead.country)].filter(Boolean).join(' · ')}
+            <div style={{ padding: '11px 14px', display: 'flex', alignItems: 'center', gap: 10 }}>
+              {/* Selection checkbox */}
+              {streamOpen && (
+                <input
+                  type="checkbox"
+                  checked={selectedIds.has(lead.id)}
+                  onChange={() => toggleLead(lead.id)}
+                  style={{ flexShrink: 0, cursor: 'pointer', accentColor: '#7c3aed' }}
+                />
+              )}
+              {/* Clickable identity area */}
+              <div onClick={() => setExpanded(id => id===lead.id ? null : lead.id)}
+                style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1, cursor: 'pointer', minWidth: 0 }}>
+                <Avatar name={lead.name} tier={lead.score_tier} src={lead.avatar_url} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 2 }}>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-1)' }}>{lead.name || 'Unknown'}</span>
+                    <TierBadge tier={lead.score_tier} />
+                    {parseTags(lead.tags).slice(0,2).map(t => <TagBadge key={t} text={t} />)}
                   </div>
-                </div>
-                {lead.enriched_at && (
-                  <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
-                    Scraped {new Date(lead.enriched_at).toLocaleString()}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    {lead.company_logo && <CompanyLogo src={lead.company_logo} name={lead.company} size={16} />}
+                    <div style={{ fontSize: 11, color: 'var(--text-3)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {[lead.title, lead.company, fmtCity(lead.city) || fmtCountry(lead.country)].filter(Boolean).join(' · ')}
+                    </div>
                   </div>
-                )}
+                  {lead.enriched_at && (
+                    <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
+                      Scraped {new Date(lead.enriched_at).toLocaleString()}
+                    </div>
+                  )}
+                </div>
               </div>
+              {/* Action buttons */}
               <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0 }}>
                 {lead.work_email && <span style={{ fontSize: 10, color: '#10b981', display: 'flex', gap: 3, alignItems: 'center' }}><Mail size={10} /> Email</span>}
                 {lead.direct_phone && <span style={{ fontSize: 10, color: '#3b82f6', display: 'flex', gap: 3, alignItems: 'center' }}><Phone size={10} /> Phone</span>}
@@ -377,7 +430,9 @@ export default function ResultsTab({ leads, total, loading, filters, onFiltersCh
                   style={{ background:'none', border:'none', cursor:'pointer', color:'var(--text-3)', padding: 3 }}>
                   <Trash2 size={12} />
                 </button>
-                {expanded===lead.id ? <ChevronUp size={13} style={{ color:'var(--text-3)' }} /> : <ChevronDown size={13} style={{ color:'var(--text-3)' }} />}
+                <div onClick={() => setExpanded(id => id===lead.id ? null : lead.id)} style={{ cursor: 'pointer' }}>
+                  {expanded===lead.id ? <ChevronUp size={13} style={{ color:'var(--text-3)' }} /> : <ChevronDown size={13} style={{ color:'var(--text-3)' }} />}
+                </div>
               </div>
             </div>
             {expanded === lead.id && (
