@@ -221,7 +221,9 @@ def _build_synthetic_lead(entry: DirectLeadInput) -> dict:
     """
     first = _normalize_name(re.sub(r'\s+[A-Z]\.$', '', entry.first_name.strip()).strip())
     last  = _normalize_name(re.sub(r'\s+[A-Z]\.$', '', entry.last_name.strip()).strip())
-    domain = entry.domain.strip().lower() if entry.domain else _extract_domain(entry.company_website)
+    # Always run _extract_domain — handles both plain domains ("lbmsolution.com")
+    # and full URLs ("https://lbmsolution.com") correctly
+    domain = _extract_domain(entry.domain or entry.company_website)
     ref_id = entry.ref or f"{first}_{last}_{domain}".strip("_")
     return {
         "id":               ref_id,
