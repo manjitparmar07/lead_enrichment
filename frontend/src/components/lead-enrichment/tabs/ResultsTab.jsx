@@ -1,7 +1,7 @@
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import {
   UserSearch, Mail, Phone, ChevronDown, ChevronUp,
-  Download, RefreshCw, X, Code2, Trash2,
+  Download, RefreshCw, X, Code2, Trash2, CheckCircle, AlertCircle, Loader,
 } from 'lucide-react'
 import { toast } from 'react-hot-toast'
 import { BACKEND, jsonHdr } from '../../../utils/api'
@@ -16,6 +16,69 @@ export default function ResultsTab({ leads, total, loading, filters, onFiltersCh
   const [expanded, setExpanded] = useState(null)
   const [jsonModal, setJsonModal] = useState(null)
   const [jsonLoading, setJsonLoading] = useState(null)
+
+  // ── Bulk Email Stream state ──────────────────────────────────────────────────
+  const [streamOpen,    setStreamOpen]    = useState(false)
+  const [streamRunning, setStreamRunning] = useState(false)
+  const [streamResults, setStreamResults] = useState([])
+  const [streamSummary, setStreamSummary] = useState(null)
+  const [forceRefresh,  setForceRefresh]  = useState(false)
+  const abortRef = useRef(null)
+
+  const startBulkEmailStream = async () => {
+    if (!leads.length) return toast.error('No leads on this page to enrich.')
+    const leadIds = leads.map(l => l.id)
+    setStreamOpen(true)
+    setStreamRunning(true)
+    setStreamResults([])
+    setStreamSummary(null)
+
+    const controller = new AbortController()
+    abortRef.current = controller
+
+    try {
+      const res = await fetch(`${BACKEND}/leads/email/bulk/stream`, {
+        method: 'POST',
+        headers: jsonHdr(),
+        body: JSON.stringify({ lead_ids: leadIds, force_refresh: forceRefresh }),
+        signal: controller.signal,
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop()
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          try {
+            const data = JSON.parse(line.slice(6))
+            if (data.done) {
+              setStreamSummary(data)
+              setStreamRunning(false)
+              toast.success(`Done — ${data.found} email${data.found !== 1 ? 's' : ''} found`)
+            } else {
+              setStreamResults(prev => [data, ...prev])
+            }
+          } catch { /* skip malformed line */ }
+        }
+      }
+    } catch (e) {
+      if (e.name !== 'AbortError') toast.error(`Stream error: ${e.message}`)
+      setStreamRunning(false)
+    }
+  }
+
+  const stopStream = () => {
+    abortRef.current?.abort()
+    setStreamRunning(false)
+  }
 
   const openJson = async (lead) => {
     setJsonLoading(lead.id)
@@ -101,8 +164,146 @@ export default function ResultsTab({ leads, total, loading, filters, onFiltersCh
           <GhostBtn onClick={handleExport} style={{ color: '#10b981', borderColor: 'rgba(16,185,129,0.3)' }}>
             <Download size={11} /> Export CSV
           </GhostBtn>
+          <GhostBtn
+            onClick={() => { setStreamOpen(o => !o); setStreamResults([]); setStreamSummary(null) }}
+            style={{ color: '#a78bfa', borderColor: 'rgba(167,139,250,0.3)' }}
+          >
+            <Mail size={11} /> Bulk Email Stream
+          </GhostBtn>
         </div>
       </div>
+
+      {/* ── Bulk Email Stream Panel ──────────────────────────────────────── */}
+      {streamOpen && (
+        <div style={{
+          marginBottom: 16, borderRadius: 10,
+          border: '1px solid rgba(167,139,250,0.25)',
+          background: 'var(--bg-card)', overflow: 'hidden',
+        }}>
+          {/* Header */}
+          <div style={{
+            padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 10,
+            borderBottom: '1px solid var(--border-1)',
+            background: 'rgba(167,139,250,0.06)',
+          }}>
+            <Mail size={13} style={{ color: '#a78bfa' }} />
+            <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-1)', flex: 1 }}>
+              Bulk Email Stream — {leads.length} lead{leads.length !== 1 ? 's' : ''} on this page
+            </span>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-3)', cursor: 'pointer' }}>
+              <input type="checkbox" checked={forceRefresh} onChange={e => setForceRefresh(e.target.checked)} />
+              Force refresh
+            </label>
+            {!streamRunning
+              ? <button onClick={startBulkEmailStream} disabled={leads.length === 0} style={{
+                  padding: '4px 14px', borderRadius: 6, fontSize: 11, fontWeight: 600,
+                  background: leads.length === 0 ? 'var(--bg-elevated)' : '#7c3aed',
+                  color: leads.length === 0 ? 'var(--text-3)' : '#fff',
+                  border: 'none', cursor: leads.length === 0 ? 'not-allowed' : 'pointer',
+                }}>Start</button>
+              : <button onClick={stopStream} style={{
+                  padding: '4px 14px', borderRadius: 6, fontSize: 11, fontWeight: 600,
+                  background: '#dc2626', color: '#fff', border: 'none', cursor: 'pointer',
+                }}>Stop</button>
+            }
+            <button onClick={() => { stopStream(); setStreamOpen(false) }} style={{
+              background: 'none', border: 'none', cursor: 'pointer',
+              color: 'var(--text-3)', padding: 2,
+            }}><X size={13} /></button>
+          </div>
+
+          {/* Summary bar */}
+          {(streamRunning || streamSummary) && (
+            <div style={{
+              padding: '7px 14px', display: 'flex', gap: 16, alignItems: 'center',
+              borderBottom: '1px solid var(--border-1)', fontSize: 11,
+            }}>
+              {streamRunning && <Loader size={11} style={{ color: '#a78bfa', animation: 'spin 1s linear infinite' }} />}
+              {streamRunning
+                ? <span style={{ color: 'var(--text-3)' }}>Enriching… {streamResults.length} / {leads.length} done</span>
+                : <span style={{ color: '#10b981', fontWeight: 600 }}>Complete</span>
+              }
+              <span style={{ color: '#10b981' }}>
+                <CheckCircle size={10} style={{ marginRight: 3 }} />
+                {streamSummary?.found ?? streamResults.filter(r => r.work_email && !r.message?.startsWith('Email already')).length} found
+              </span>
+              <span style={{ color: '#6366f1' }}>
+                {streamSummary?.cached ?? streamResults.filter(r => r.message?.startsWith('Email already')).length} cached
+              </span>
+              <span style={{ color: 'var(--text-3)' }}>
+                <AlertCircle size={10} style={{ marginRight: 3 }} />
+                {streamSummary?.skipped ?? streamResults.filter(r => !r.work_email).length} not found
+              </span>
+
+              {/* progress bar */}
+              <div style={{ flex: 1, height: 4, borderRadius: 4, background: 'var(--bg-elevated)', overflow: 'hidden' }}>
+                <div style={{
+                  height: '100%', borderRadius: 4, background: '#7c3aed',
+                  width: `${leads.length ? (streamResults.length / leads.length) * 100 : 0}%`,
+                  transition: 'width 0.3s',
+                }} />
+              </div>
+            </div>
+          )}
+
+          {/* Results list */}
+          {streamResults.length > 0 && (
+            <div style={{ maxHeight: 300, overflowY: 'auto' }}>
+              {streamResults.map((r, i) => (
+                <div key={r.lead_id ?? i} style={{
+                  padding: '7px 14px', display: 'flex', alignItems: 'center', gap: 10,
+                  borderBottom: '1px solid var(--border-1)', fontSize: 11,
+                }}>
+                  {/* Status icon */}
+                  {r.work_email
+                    ? <CheckCircle size={12} style={{ color: '#10b981', flexShrink: 0 }} />
+                    : <AlertCircle size={12} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
+                  }
+                  {/* Name + company */}
+                  <span style={{ color: 'var(--text-1)', fontWeight: 600, minWidth: 120 }}>
+                    {r.name ?? r.lead_id}
+                  </span>
+                  <span style={{ color: 'var(--text-3)', minWidth: 100 }}>{r.company ?? '—'}</span>
+                  {/* Email */}
+                  {r.work_email
+                    ? <span style={{ color: '#10b981', fontFamily: 'monospace', flex: 1 }}>{r.work_email}</span>
+                    : <span style={{ color: 'var(--text-3)', flex: 1 }}>No email found</span>
+                  }
+                  {/* Source badge */}
+                  {r.source && r.source !== 'not_found' && (
+                    <span style={{
+                      padding: '2px 6px', borderRadius: 4, fontSize: 10, fontWeight: 600,
+                      background: r.source === 'apollo' ? 'rgba(99,102,241,0.12)' : 'rgba(16,185,129,0.1)',
+                      color: r.source === 'apollo' ? '#6366f1' : '#10b981',
+                    }}>{r.source}</span>
+                  )}
+                  {/* Verified */}
+                  {r.work_email && (
+                    <span style={{
+                      padding: '2px 6px', borderRadius: 4, fontSize: 10, fontWeight: 600,
+                      background: r.verified ? 'rgba(16,185,129,0.1)' : 'rgba(245,158,11,0.1)',
+                      color: r.verified ? '#10b981' : '#f59e0b',
+                    }}>{r.verified ? '✓ verified' : '~ unverified'}</span>
+                  )}
+                  {/* Bounce risk */}
+                  {r.bounce_risk && (
+                    <span style={{
+                      fontSize: 10, color: r.bounce_risk === 'low' ? '#10b981' : r.bounce_risk === 'medium' ? '#f59e0b' : '#ef4444',
+                    }}>{r.bounce_risk} risk</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Empty state before start */}
+          {!streamRunning && streamResults.length === 0 && !streamSummary && (
+            <div style={{ padding: '20px', textAlign: 'center', color: 'var(--text-3)', fontSize: 12 }}>
+              Click <strong>Start</strong> to find emails for {leads.length} lead{leads.length !== 1 ? 's' : ''} on this page.
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Tier stats */}
       {total > 0 && (
