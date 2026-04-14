@@ -10,9 +10,10 @@ Both endpoints share the same flow via _find_email_for_lead():
      → save best guess → return all guesses
 
 Endpoints:
-  POST /api/leads/view/email          — single lead_id
+  POST /api/leads/view/email          — single lead_id (lead must exist in DB)
   POST /api/leads/email/bulk          — list of lead_ids (up to 500), waits for all, returns together
   POST /api/leads/email/bulk/stream   — same as bulk but streams each result as SSE the moment it finishes
+  POST /api/leads/email/find          — no lead_id needed; pass name + company/domain directly (manual/LIO entries)
 """
 
 from __future__ import annotations
@@ -54,12 +55,23 @@ VALIDEMAIL_URL   = "https://api.ValidEmail.net/"
 # ── Request models ─────────────────────────────────────────────────────────────
 
 class ViewEmailRequest(BaseModel):
-    leadenrich_id: str
+    """
+    Unified: pass leadenrich_id to look up from DB,
+    OR pass first_name + domain/linkedin_url directly (manual/LIO entries).
+    """
+    leadenrich_id: str = ""       # lead in enriched_leads table
+    first_name: str = ""          # used when no leadenrich_id
+    last_name: str = ""
+    company_website: str = ""     # e.g. "acme.com" or "https://www.acme.com"
+    domain: str = ""              # overrides company_website extraction
+    linkedin_url: str = ""
+    company: str = ""
+    force_refresh: bool = False
 
 
 class BulkEmailRequest(BaseModel):
     lead_ids: List[str]
-    force_refresh: bool = False  # re-enrich even if email already exists
+    force_refresh: bool = False
 
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
@@ -375,16 +387,81 @@ async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False)
     }
 
 
-# ── Single endpoint ────────────────────────────────────────────────────────────
+# ── Single endpoint — unified: lead_id OR direct fields ───────────────────────
 
-@router.post("/view/email", summary="Find and verify email for a single lead")
+@router.post(
+    "/view/email",
+    summary="Find and verify email — by lead_id or by name + domain directly",
+    description="""
+Two ways to call this endpoint — same flow, same response shape:
+
+**With a lead_id** (lead exists in the enrichment DB):
+```json
+{ "leadenrich_id": "abc123def456" }
+```
+
+**Without a lead_id** (manual LIO entry, cold prospect, imported contact):
+```json
+{
+  "first_name": "John",
+  "last_name":  "Doe",
+  "company_website": "acme.com",
+  "linkedin_url": "https://linkedin.com/in/johndoe"
+}
+```
+
+Flow: Apollo.io → ValidEmail.net → pattern guesses → ValidEmail.net.
+When fields are passed directly the DB update is a silent no-op (no row to update).
+""",
+)
 async def email_enrichment(body: ViewEmailRequest):
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM enriched_leads WHERE id = $1", body.leadenrich_id)
-    if not row:
-        raise HTTPException(status_code=404, detail=f"Lead {body.leadenrich_id} not found")
-    return await _find_email_for_lead(dict(row), pool)
+
+    if body.leadenrich_id:
+        # ── Path A: lead exists in DB — fetch and enrich ──────────────────
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM enriched_leads WHERE id = $1", body.leadenrich_id
+            )
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Lead {body.leadenrich_id} not found")
+        return await _find_email_for_lead(dict(row), pool, force_refresh=body.force_refresh)
+
+    # ── Path B: no lead_id — build synthetic lead dict from request fields ──
+    first = body.first_name.strip()
+    last  = body.last_name.strip()
+    first = _normalize_name(re.sub(r'\s+[A-Z]\.$', '', first).strip())
+    last  = _normalize_name(re.sub(r'\s+[A-Z]\.$', '', last).strip())
+
+    domain = body.domain.strip().lower() if body.domain else _extract_domain(body.company_website)
+
+    if not first or (not domain and not body.linkedin_url.strip()):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide leadenrich_id OR (first_name + one of: company_website, domain, linkedin_url)",
+        )
+
+    # Construct a dict that matches what _find_email_for_lead / _extract_lead_identity expect.
+    # The DB UPDATE inside the flow will silently affect 0 rows — that's fine.
+    synthetic_lead = {
+        "id":               "direct",
+        "name":             f"{first} {last}".strip(),
+        "company":          body.company or domain,
+        "company_website":  body.company_website or domain,
+        "linkedin_url":     body.linkedin_url.strip(),
+        "work_email":       None,
+        "email_source":     None,
+        "email_confidence": None,
+        "email_verified":   None,
+        "bounce_risk":      None,
+        "enrichment_source": None,
+        "direct_phone":     None,
+        # raw_brightdata carries first/last so _extract_lead_identity reads them correctly
+        "raw_brightdata":   json.dumps({"first_name": first, "last_name": last}),
+        "crm_brief":        None,
+        "enrichment_data":  None,
+    }
+    return await _find_email_for_lead(synthetic_lead, pool, force_refresh=True)
 
 
 # ── Bulk endpoint ──────────────────────────────────────────────────────────────
