@@ -324,11 +324,9 @@ async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False)
         if first and domain:
             guesses = _generate_guessed_emails(first, last, domain)
             verifications = await asyncio.gather(*[_verify_email(e) for e in guesses])
-            # Only return verified guesses — invalid ones are not useful
             guessed_emails = [
                 {"email": e, "verified": v["verified"], "bounce_risk": v["bounce_risk"], "source": "guessed"}
                 for e, v in zip(guesses, verifications)
-                if v["verified"]
             ]
         return {
             "lead_id":           lead_id,
@@ -336,8 +334,8 @@ async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False)
             "name":              lead.get("name"),
             "company":           lead.get("company"),
             "work_email":        None, "email": None,
-            "source":            "not_found",
-            "message":           f"Not found — {lead.get('name', 'this lead')} at {lead.get('company', 'their company')}.",
+            "source":            "missing_params",
+            "message":           "Cannot search email — missing first name and company domain or LinkedIn URL.",
             "confidence":        None, "verified": False, "bounce_risk": None,
             "enrichment_source": None, "phone": None,
             "all_emails":        [], "activity_emails": [], "activity_phones": [],
@@ -393,19 +391,15 @@ async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False)
         if first and domain:
             guesses = _generate_guessed_emails(first, last, domain)
             verifications = await asyncio.gather(*[_verify_email(e) for e in guesses])
-            all_guesses = [
+            guessed_emails = [
                 {"email": e, "verified": v["verified"], "bounce_risk": v["bounce_risk"], "source": "guessed"}
                 for e, v in zip(guesses, verifications)
             ]
-            # Only keep verified guesses for the response — don't surface invalid ones
-            guessed_emails = [g for g in all_guesses if g["verified"]]
-            logger.info("[EmailView] Guesses for lead %s — valid: %s invalid: %s",
-                        lead_id,
-                        [g["email"] for g in guessed_emails],
-                        [g["email"] for g in all_guesses if not g["verified"]])
+            logger.info("[EmailView] Guessed emails for lead %s: %s",
+                        lead_id, [g["email"] for g in guessed_emails])
 
-            # Only accept a verified guess — unverified guesses are treated as not_found
-            best = next((g for g in all_guesses if g["verified"]), None)
+            best = next((g for g in guessed_emails if g["verified"]),
+                        guessed_emails[0] if guessed_emails else None)
             if best:
                 work_email  = best["email"]
                 verified    = best["verified"]
@@ -421,19 +415,17 @@ async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False)
                            WHERE id=$4""",
                         work_email, 1 if verified else 0, bounce_risk, lead_id,
                     )
-                logger.info("[EmailView] Saved verified guess email=%s for lead %s", work_email, lead_id)
+                logger.info("[EmailView] Saved best guess email=%s for lead %s", work_email, lead_id)
             else:
-                # No verified guess found — mark as not_found, don't save junk email
                 async with pool.acquire() as conn:
                     await conn.execute(
-                        "UPDATE enriched_leads SET work_email=NULL, email_source='not_found', updated_at=NOW() WHERE id=$1",
+                        "UPDATE enriched_leads SET email_source='not_found', updated_at=NOW() WHERE id=$1",
                         lead_id,
                     )
-                logger.info("[EmailView] No verified guess for lead %s — marked not_found", lead_id)
         else:
             async with pool.acquire() as conn:
                 await conn.execute(
-                    "UPDATE enriched_leads SET work_email=NULL, email_source='not_found', updated_at=NOW() WHERE id=$1",
+                    "UPDATE enriched_leads SET email_source='not_found', updated_at=NOW() WHERE id=$1",
                     lead_id,
                 )
 
@@ -441,7 +433,7 @@ async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False)
         f"Email found: {work_email} | Source: {source} | Verified: {'Yes' if verified else 'No'}"
         f" | Bounce risk: {bounce_risk or 'unknown'}" + (f" | Phone: {phone}" if phone else "")
         if work_email
-        else f"Not found — {lead.get('name', 'this lead')} at {lead.get('company', 'their company')}."
+        else f"No email found for {lead.get('name', 'this lead')} at {lead.get('company', 'their company')}."
     )
 
     return {
