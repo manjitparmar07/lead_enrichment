@@ -58,7 +58,7 @@ async def get_company(
 
 # ── Get company for a specific lead ──────────────────────────────────────────
 
-@router.post("/leads/{lead_id}/company")
+@router.get("/leads/{lead_id}/company")
 async def get_lead_company(
     lead_id: str,
     current_user: dict = Depends(get_current_user),
