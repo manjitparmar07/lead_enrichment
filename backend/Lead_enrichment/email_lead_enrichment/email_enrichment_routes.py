@@ -255,28 +255,55 @@ async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False)
     first, last, domain, linkedin_url = _extract_lead_identity(lead)
 
     # ── 1. Cache hit ──────────────────────────────────────────────────────────
-    if lead.get("work_email") and not force_refresh:
+    # Only trust the cache if the stored email is actually good quality:
+    #   - verified by ValidEmail.net, OR
+    #   - came from Apollo (authoritative source), OR
+    #   - bounce risk is low or medium
+    # A guessed + unverified + high-bounce email is NOT a valid cache hit —
+    # fall through and re-run Apollo so we can find a better address.
+    _cached_email    = lead.get("work_email")
+    _cached_verified = bool(lead.get("email_verified"))
+    _cached_source   = lead.get("email_source") or ""
+    _cached_bounce   = lead.get("bounce_risk") or "high"
+
+    _is_quality_cache = (
+        _cached_email and not force_refresh and (
+            _cached_verified                          # ValidEmail confirmed it
+            or _cached_source == "apollo"             # Apollo is authoritative
+            or _cached_bounce in ("low", "medium")    # acceptable bounce risk
+        )
+    )
+
+    if _is_quality_cache:
         return {
             "lead_id":           lead_id,
             "linkedin_url":      linkedin_url,
             "name":              lead.get("name"),
             "company":           lead.get("company"),
-            "work_email":        lead["work_email"],
-            "email":             lead["work_email"],
-            "source":            lead.get("email_source"),
-            "message":           f"Email already found: {lead['work_email']}"
+            "work_email":        _cached_email,
+            "email":             _cached_email,
+            "source":            _cached_source,
+            "message":           f"Email already found: {_cached_email}"
                                  + (f" | Phone: {lead.get('direct_phone')}" if lead.get("direct_phone") else ""),
             "confidence":        lead.get("email_confidence"),
-            "verified":          bool(lead.get("email_verified")),
-            "bounce_risk":       lead.get("bounce_risk"),
+            "verified":          _cached_verified,
+            "bounce_risk":       _cached_bounce,
             "enrichment_source": lead.get("enrichment_source"),
             "phone":             lead.get("direct_phone") or lead.get("phone"),
-            "all_emails":        [lead["work_email"]],
+            "all_emails":        [_cached_email],
             "activity_emails":   [],
             "activity_phones":   [],
             "ai_generated":      None,
             "guessed_emails":    [],
         }
+
+    # Poor-quality cached email (unverified guess / high bounce) — clear it and re-enrich
+    if _cached_email and not force_refresh and not _is_quality_cache:
+        logger.info(
+            "[EmailView] Skipping low-quality cache for lead %s "
+            "(source=%s verified=%s bounce=%s) — re-running enrichment",
+            lead_id, _cached_source, _cached_verified, _cached_bounce,
+        )
 
     work_email:    str | None    = None
     phone:         str | None    = None
