@@ -1523,31 +1523,69 @@ async def build_comprehensive_enrichment(
     now    = datetime.now(timezone.utc).isoformat()
 
     # ── LLM title inference — only when no title could be extracted ───────────
+    # Uses ONLY authored posts (interaction="shared this") + about + company.
+    # Never uses liked/commented activity — that's other people's content.
     if profile.get("_needs_title_inference"):
         name    = profile.get("name") or ""
-        company = profile.get("current_company_name") or ""
+        company = profile.get("current_company_name") or (profile.get("current_company") or {}).get("name") or ""
         about   = (profile.get("about") or "")[:400]
-        exp     = profile.get("experience") or []
-        exp_ctx = ""
-        if exp and isinstance(exp, list) and isinstance(exp[0], dict):
-            e0 = exp[0]
-            exp_ctx = f"{e0.get('title','')} at {e0.get('company','')}".strip(" at")
+
+        # Pull authored posts from activity (shared this only)
+        _activity_all = profile.get("activity") or []
+        _authored_texts = [
+            (a.get("title") or "").strip()[:300]
+            for a in _activity_all
+            if "shared this" in (a.get("interaction") or "").lower()
+            and (a.get("title") or "").strip()
+        ][:5]
+        # Also check dedicated posts field
+        _posts_raw = profile.get("posts") or profile.get("recent_posts") or []
+        _post_texts = [
+            (p.get("text") or p.get("title") or "").strip()[:300]
+            for p in _posts_raw[:5]
+            if (p.get("text") or p.get("title") or "").strip()
+        ]
+        authored_posts_ctx = "\n---\n".join(_authored_texts or _post_texts)
+
         try:
+            _user_content = (
+                f"Person: {name}\n"
+                f"Current company: {company}\n"
+                f"Bio: {about}\n"
+            )
+            if authored_posts_ctx:
+                _user_content += (
+                    f"\nPosts AUTHORED by this person (their own words only — do NOT use):\n"
+                    f"{authored_posts_ctx}\n"
+                )
+            _user_content += "\nWhat is this person's professional job title? Reply with the title ONLY — 2-6 words, no punctuation."
+
             inferred = await _call_llm(
                 [
-                    {"role": "system", "content": "You extract professional job titles. Reply with ONLY the job title — 2-6 words, no punctuation, no first-person language."},
-                    {"role": "user", "content": (
-                        f"Person: {name}\nCompany: {company}\nRecent role: {exp_ctx}\nAbout: {about}\n\n"
-                        "What is this person's professional job title? Reply with the title only."
-                    )},
+                    {
+                        "role": "system",
+                        "content": (
+                            "You infer professional job titles from LinkedIn signals. "
+                            "Rules:\n"
+                            "- Reply with ONLY the job title — 2 to 6 words, no punctuation, no first-person language.\n"
+                            "- Use ONLY the person's own authored posts and bio — NEVER use posts they liked or commented on.\n"
+                            "- The title must reflect their role at the current company provided.\n"
+                            "- If you cannot confidently infer a title, reply with exactly: unknown"
+                        ),
+                    },
+                    {"role": "user", "content": _user_content},
                 ],
                 max_tokens=20,
                 temperature=0.1,
             )
-            if inferred and len(inferred.strip()) > 2:
-                profile = dict(profile)  # don't mutate caller's dict
-                profile["position"] = inferred.strip().strip('"').strip("'")
-                logger.info("[TitleInfer] Generated title for %s: %s", name, profile["position"])
+            if inferred:
+                _inf = inferred.strip().strip('"').strip("'")
+                if _inf and _inf.lower() != "unknown" and len(_inf) > 2:
+                    profile = dict(profile)  # don't mutate caller's dict
+                    profile["position"] = _inf
+                    logger.info("[TitleInfer] Generated title for %s: %s", name, _inf)
+                else:
+                    logger.info("[TitleInfer] Could not confidently infer title for %s", name)
         except Exception as _tie:
             logger.debug("[TitleInfer] Failed: %s", _tie)
 
@@ -1674,6 +1712,74 @@ async def build_comprehensive_enrichment(
             logger.warning("[Enrichment] CRM brief failed: %s", _be)
 
     return data
+
+
+def _split_authored_interactions(posts_raw, activity_raw) -> dict:
+    """
+    BrightData returns a single 'activity' array that mixes:
+      - Posts the person AUTHORED  (interaction = "Name shared this")
+      - Posts the person LIKED     (interaction = "Name liked this")
+      - Posts the person COMMENTED (interaction = "Name commented on a post Xh")
+
+    Returning liked/commented content as 'authored_posts' causes the LLM to
+    attribute other people's companies, titles, and promotions to the lead.
+
+    This function separates them:
+      authored_posts  → only "shared this" items (the person's own content)
+      interactions    → liked + commented items (buying intent signals)
+
+    If the profile has a dedicated 'posts' field, use that for authored_posts
+    and treat all activity as interactions.
+    """
+    activity = activity_raw or []
+
+    # If BD returned a dedicated posts array, use it — no splitting needed
+    if posts_raw:
+        authored = [
+            {
+                "text":      (p.get("text") or p.get("content") or p.get("title") or "").strip()[:600],
+                "likes":     p.get("num_likes") or p.get("likes", 0),
+                "comments":  p.get("num_comments") or p.get("comments", 0),
+                "posted_at": p.get("posted_at") or p.get("date", ""),
+            }
+            for p in posts_raw[:30]
+            if (p.get("text") or p.get("content") or p.get("title") or "").strip()
+        ]
+        interactions = [
+            {
+                "interaction": a.get("interaction") or "liked",
+                "title":       (a.get("title") or "").strip()[:400],
+                "link":        a.get("link", ""),
+            }
+            for a in activity[:50]
+            if (a.get("title") or "").strip()
+        ]
+        return {"authored_posts": authored, "interactions": interactions}
+
+    # Split activity by interaction type
+    authored = []
+    interactions = []
+    for a in activity[:50]:
+        interaction = (a.get("interaction") or "").lower()
+        title = (a.get("title") or "").strip()
+        if not title:
+            continue
+        if "shared this" in interaction or "posted" in interaction:
+            authored.append({
+                "text":      title[:600],
+                "likes":     0,
+                "comments":  0,
+                "posted_at": "",
+            })
+        else:
+            # liked / commented — buying intent, but NOT the person's own words
+            interactions.append({
+                "interaction": a.get("interaction") or "liked",
+                "title":       title[:400],
+                "link":        a.get("link", ""),
+            })
+
+    return {"authored_posts": authored, "interactions": interactions}
 
 
 def _build_llm_profile(profile: dict) -> dict:
@@ -1855,9 +1961,15 @@ def _build_llm_profile(profile: dict) -> dict:
         "volunteer":       _clean_volunteer(profile.get("volunteer_experience") or profile.get("volunteer") or []),
         "recommendations": _clean_recs(profile.get("recommendations")),
         # ── Authored posts → expertise, identity, authority (HIGHEST SIGNAL) ─
-        "authored_posts":  _clean_posts(profile.get("posts") or profile.get("recent_posts") or []),
-        # ── Interactions → buying intent (liked / commented / reposted) ──────
-        "interactions":    _clean_activity(profile.get("activity")),
+        # BrightData activity mixes authored posts + liked/commented posts.
+        # Split by interaction field: "shared this" = authored, rest = interactions.
+        # This prevents the LLM from reading someone else's liked post and
+        # attributing their title/company to the lead (e.g. "Liked: promoted to
+        # dual leadership role at D&B" → LLM thinks lead works at D&B).
+        **_split_authored_interactions(
+            profile.get("posts") or profile.get("recent_posts"),
+            profile.get("activity"),
+        ),
     }
 
 
