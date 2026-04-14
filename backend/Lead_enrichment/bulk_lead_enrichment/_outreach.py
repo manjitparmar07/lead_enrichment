@@ -590,11 +590,7 @@ async def send_to_lio(lead: dict, sso_id: str = "", force: bool = False) -> None
     posts_data        = [_post_obj(p) for p in bd_posts[:3]]
     interactions_data = [_interaction_obj(a) for a in bd_activity[:3]]
 
-    # Pad to minimum 3 items with placeholders if BD data is sparse
-    blank_post = {"topic": f"Professional content at {lead.get('company','')}", "tone": "professional", "key_message": "Industry insights", "engagement": "N/A", "intent_signal": "awareness"}
-    blank_int  = {"interaction_type": "LinkedIn engagement", "topic": f"{lead.get('industry') or lead.get('company','')} content", "insight": "Active on LinkedIn", "intent_signal": "awareness"}
-    while len(posts_data) < 3:        posts_data.append(blank_post)
-    while len(interactions_data) < 3: interactions_data.append(blank_int)
+    # Only include real BrightData posts/interactions — no fake padding
 
     if _crm_brief:
         enrichment_data = _crm_brief
@@ -611,9 +607,9 @@ async def send_to_lio(lead: dict, sso_id: str = "", force: bool = False) -> None
                 "company_logo":   lead.get("company_logo") or "",
                 "followers":      str(lead.get("followers") or 0),
                 "connections":    str(lead.get("connections") or 0),
-                "persona":        seniority or "Professional",
-                "seniority":      seniority or "Individual Contributor",
-                "trajectory":     lead.get("years_in_role") or (f"At {lead.get('company')} since joining" if lead.get("company") else ""),
+                "persona":        seniority or "",
+                "seniority":      seniority or "",
+                "trajectory":     lead.get("years_in_role") or "",
                 "decision_maker": "Yes" if is_decision_maker else "No",
             },
             "their_company": {
@@ -638,47 +634,45 @@ async def send_to_lio(lead: dict, sso_id: str = "", force: bool = False) -> None
             "what_they_care_about": {
                 "primary_interests":   (skills or prod_offer)[:5],
                 "secondary_interests": tgt_custs[:5],
-                "passion_signals":     (tags + [lead.get("company") or "", lead.get("industry") or "", seniority or "", lead.get("product_category") or ""])[:5],
+                "passion_signals":     [t for t in tags if t][:5],
             },
             "online_behaviour": {
-                "activity_level":   "active" if (lead.get("followers") or 0) > 500 else "moderate",
-                "content_style":    "professional thought leader" if bd_posts else "lurker/consumer",
-                "recurring_themes": (skills + tags + [lead.get("industry") or "", lead.get("product_category") or "", lead.get("company") or ""])[:5],
+                "activity_level":   "active" if (lead.get("followers") or 0) > 500 else "",
+                "content_style":    "",
+                "recurring_themes": [t for t in (skills + tags) if t][:5],
                 "primary_platform": "LinkedIn",
             },
             "communication": {
-                "tone":            "professional",
-                "writing_style":   "direct" if seniority and is_decision_maker else "collaborative",
-                "emotional_mode":  "analytical",
-                "archetype":       seniority or "Professional",
-                "mirror_strategy": f"Lead with data and ROI — speak to {lead.get('company','their company')}'s scale and efficiency goals",
+                "tone":            "",
+                "writing_style":   "",
+                "emotional_mode":  "",
+                "archetype":       seniority or "",
+                "mirror_strategy": "",
             },
             "what_drives_them": {
-                "core_values":      (skills or ["Professional growth", "Team success", "Impact", "Efficiency", "Innovation"])[:5],
-                "motivators":       [s for s in trigger_events if s][:5] or ["Career growth", "Team performance", "Business impact", "Efficiency", "Innovation"],
-                "pain_points":      [lead.get("score_explanation") or f"Scaling {lead.get('department') or 'operations'} at {lead.get('company') or 'company'}"] + (tags[:4]),
-                "career_ambitions": [f"Growing influence at {lead.get('company')}", "Building scalable processes", "Expanding team capabilities", "Driving measurable results", "Industry recognition"],
+                "core_values":      skills[:5] if skills else [],
+                "motivators":       [s for s in trigger_events if s][:5],
+                "pain_points":      ([lead["score_explanation"]] if lead.get("score_explanation") else []) + tags[:4],
+                "career_ambitions": [],
             },
             "buying_signals": {
                 "intent_level":   lead.get("score_tier") or "",
-                "trigger_events": (trigger_events or ["Active LinkedIn profile", f"Role at {lead.get('company')}", "Company growth signals", "Industry engagement", "Email found"])[:5],
+                "trigger_events": [s for s in trigger_events if s][:5],
                 "tools_used":     (tech_stack or prod_offer)[:5],
-                "decision_style": "consensus" if not is_decision_maker else "autonomous",
+                "decision_style": "",
                 "intent_tags":    tags[:5],
             },
-            "smart_tags": (tags + [lead.get("company") or "", lead.get("industry") or "", seniority or "", lead.get("score_tier") or "", lead.get("product_category") or ""])[:5],
+            "smart_tags": [t for t in tags if t][:8],
             "outreach_blueprint": {
-                "best_channel":        lead.get("best_channel") or "Email",
+                "best_channel":        lead.get("best_channel") or "",
                 "approach_strategy":   lead.get("outreach_angle") or "",
                 "opening_hooks":       [h for h in [
                     lead.get("email_subject"),
                     lead.get("linkedin_note"),
                     lead.get("outreach_angle"),
-                    f"Quick question about scaling {lead.get('department') or 'your team'} at {lead.get('company')}",
-                    f"How {lead.get('company')} could benefit from {lead.get('product_category') or 'our solution'}",
                 ] if h][:5],
                 "recommended_content": lead.get("cold_email") or "",
-                "avoid_topics":        ["Generic outreach", "Price-first messaging", "Competitor comparisons", "Irrelevant use cases", "Mass-blast templates"],
+                "avoid_topics":        [],
                 "one_line_strategy":   lead.get("outreach_angle") or lead.get("score_explanation") or "",
             },
             "crm_scores": {
@@ -692,21 +686,13 @@ async def send_to_lio(lead: dict, sso_id: str = "", force: bool = False) -> None
                 "buying_signal":   lead.get("warm_signal") or (trigger_events[0] if trigger_events else ""),
                 "outreach_tone":   lead.get("sequence_type") or "",
                 "hook_theme":      lead.get("outreach_angle") or "",
-                "avoidance":       "Generic pitch, price-first, unsolicited attachments",
-                "tags":            (tags + [lead.get("company") or "", lead.get("industry") or "", seniority or "", lead.get("score_tier") or "", lead.get("product_category") or ""])[:5],
-                "analyst_summary": (
-                    lead.get("score_explanation")
-                    or (
-                        f"{lead.get('name', '')} is a {lead.get('title') or seniority or ''} at {lead.get('company') or ''}. "
-                        f"{lead.get('warm_signal') or ''}. "
-                        f"{lead.get('outreach_angle') or ''}"
-                    ).strip(". ") + "."
-                    if lead.get("name") else ""
-                ),
+                "avoidance":       "",
+                "tags":            [t for t in tags if t][:5],
+                "analyst_summary": lead.get("score_explanation") or "",
             },
             "recent_activity": {
-                "posts":        posts_data,
-                "interactions": interactions_data,
+                "posts":        posts_data,        # only real BD posts, no padding
+                "interactions": interactions_data,  # only real BD activity, no padding
             },
             "company_intelligence": {
                 "description":       lead.get("company_description") or wi.get("company_description") or "",
@@ -833,13 +819,11 @@ Your task is to analyze LinkedIn raw data (profile + posts + interactions + comp
 
 STRICT RULES:
 - Return ONLY valid JSON — no markdown, no code fences, no extra text before or after.
-- NEVER leave any field empty ("", [], 0 are all forbidden as final values — always fill with real data or a specific inference).
-- If exact data is missing → generate a confident, specific inference based on available signals.
-- Do NOT copy text verbatim — always synthesize into insight.
-- Keep outputs concise, specific, and high-signal.
-- Avoid generic B2B filler phrases (e.g. "results-driven", "passionate about").
-- All arrays MUST contain 4 to 5 real, distinct items — never fewer.
-- All strings MUST be non-empty, meaningful, and specific.
+- Use ONLY data explicitly present in the input. Do NOT invent, infer, or fabricate any values.
+- If data is missing for a field → use "" for strings, [] for arrays, 0 for numbers. Never pad with invented items.
+- Arrays may have 0 items when the input provides no evidence — do NOT fill to reach a minimum count.
+- Synthesize insights from actual signals only — do not copy verbatim, but only when the signal genuinely exists in the data.
+- Avoid generic B2B filler phrases (e.g. "results-driven", "passionate about", "career growth", "business impact", "innovative").
 
 IDENTITY RULES (NO HALLUCINATION):
 - who_they_are.company MUST be taken EXACTLY from company_context.name in the input. Do NOT use any company from the experience array. Do NOT infer or invent a company name. If company_context.name is present, use it verbatim.
@@ -850,7 +834,6 @@ ANALYSIS LOGIC:
 - authored_posts → define expertise, identity, and authority.
 - interactions (likes/comments/reposts) → indicate buying intent and interest areas.
 - company_context → derive business challenges, growth stage, and priorities.
-- If experience data is missing → reconstruct from activity patterns and company context.
 - Pain points MUST be specific and derived from the data — not generic.
 - Buying signals MUST come from observed behaviour, not assumptions.
 - Trigger events = recent role changes, company news, posts about challenges.
