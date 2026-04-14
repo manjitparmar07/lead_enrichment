@@ -1,6 +1,6 @@
 // api.js — shared backend utilities
 
-export const BACKEND = `${import.meta.env.VITE_BACKEND_URL || 'https://api-lead-enrichment-worksbuddy.lbmdemo.com'}/api`
+export const BACKEND = `${import.meta.env.VITE_BACKEND_URL || 'https://leadenrichment-production-5b78.up.railway.app'}/api`
 
 export const getToken = () => localStorage.getItem('wb_ai_token') || ''
 export const jsonHdr  = () => ({ 'Content-Type': 'application/json' })
