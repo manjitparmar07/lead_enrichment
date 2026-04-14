@@ -90,6 +90,10 @@ router.include_router(_webhooks_router)
 router.include_router(_leads_router)
 router.include_router(_lio_router)
 
+# /api/leads (no trailing slash) — parent router has prefix="/leads" so path="" works here
+from Lead_enrichment.bulk_lead_enrichment._routes_leads import list_leads as _list_leads
+router.add_api_route("", endpoint=_list_leads, methods=["GET"], include_in_schema=False)
+
 # ── View sub-routers — re-exported for main.py which mounts them separately ──
 # main.py does:
 #   from Lead_enrichment.bulk_lead_enrichment.lead_enrichment_brightdata_routes import (

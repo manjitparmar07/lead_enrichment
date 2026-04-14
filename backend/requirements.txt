@@ -23,3 +23,8 @@ psutil>=5.9.0         # CPU + memory stats for dynamic chunk sizing
 playwright>=1.43.0
 Pillow>=10.0.0
 pytesseract>=0.3.10
+
+# Website scraping
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+

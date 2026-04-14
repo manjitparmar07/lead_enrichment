@@ -991,7 +991,6 @@ function buildCurl(BASE, feature) {
     .split('\n').map((l, i) => i === 0 ? l : '  ' + l).join('\n')
   return `curl -X POST ${BASE}/api/v1/features/run/${feature.endpoint_slug} \\
   -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer <YOUR_TOKEN>" \\
   -d '${body}'`
 }
 
@@ -1057,7 +1056,7 @@ function CustomFeaturesDoc({ BASE, features, loading, copy, copied, onRefresh })
             {features.length} Custom Feature{features.length !== 1 ? 's' : ''}
           </div>
           <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
-            Auth: <code style={{ color: '#a7f3d0', fontSize: 10 }}>Authorization: Bearer &lt;token&gt;</code> header required
+            No authentication required — pass inputs directly in the request body.
           </div>
         </div>
         <button onClick={onRefresh} style={{

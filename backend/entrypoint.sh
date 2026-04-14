@@ -13,15 +13,6 @@ fi
 
 # ── Pre-flight checks ─────────────────────────────────────────────────────────
 
-# 1. Critical env vars — fail fast with clear message
-if [ -z "$DATABASE_URL" ]; then
-    echo "ERROR: DATABASE_URL is not set. Mount backend/.env or set it in docker-compose environment."
-    exit 1
-fi
-if [ -z "$JWT_SECRET" ]; then
-    echo "ERROR: JWT_SECRET is not set. Auth will not work."
-    exit 1
-fi
 
 # 2. Port conflict check
 PORT="${PORT:-8020}"

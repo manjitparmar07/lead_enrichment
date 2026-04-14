@@ -69,6 +69,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="WorksBuddy Lead Enrichment API",
     version="1.0.0",
+
     description=(
         "## Enrichment View APIs\n\n"
         "Each enriched lead exposes 4 focused views by `lead_id`:\n\n"
@@ -121,6 +122,8 @@ app.include_router(custom_features_router,    prefix="/api")
 _PROD_ORIGINS = [
     "https://lead-enrichment.worksbuddy.ai",
     "https://leads.worksbuddy.ai",
+    "https://lead-enrichment-worksbuddy.lbmdemo.com",
+    "https://lead-enrichment-front.up.railway.app",
 ]
 _extra = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 _origins = list(dict.fromkeys(_PROD_ORIGINS + _extra))

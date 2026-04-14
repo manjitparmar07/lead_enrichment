@@ -1,21 +1,35 @@
 """
-email_enrichment_routes.py — Single Lead Email Enrichment
-----------------------------------------------------------
-Endpoint:
-  POST /api/leads/view/email  — Find email for a single lead via Apollo,
-                                then verify it via ValidEmail.net
+email_enrichment_routes.py — Single & Bulk Lead Email Enrichment
+-----------------------------------------------------------------
+Both endpoints share the same flow via _find_email_for_lead():
+
+  1. If email already in DB → return cached
+  2. Extract first_name, last_name, domain from lead record
+  3. Call Apollo.io → if found, verify via ValidEmail.net → save + return
+  4. If Apollo misses → generate 3 pattern guesses → verify each via ValidEmail.net
+     → save best guess → return all guesses
+
+Endpoints:
+  POST /api/leads/view/email          — single lead_id
+  POST /api/leads/email/bulk          — list of lead_ids (up to 500), waits for all, returns together
+  POST /api/leads/email/bulk/stream   — same as bulk but streams each result as SSE the moment it finishes
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
+from typing import List
+from urllib.parse import urlparse
 
 import httpx
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
 try:
     from analytics import api_usage_service as _usage
 except ImportError:
@@ -30,31 +44,25 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/leads", tags=["Email Enrichment"])
 
+# Concurrency cap for bulk — avoids hammering Apollo/ValidEmail at once
+_BULK_EMAIL_SEM = asyncio.Semaphore(10)
+
 VALIDEMAIL_TOKEN = os.getenv("VALIDEMAIL_TOKEN", "")
 VALIDEMAIL_URL   = "https://api.ValidEmail.net/"
 
 
-# ── Request model ─────────────────────────────────────────────────────────────
+# ── Request models ─────────────────────────────────────────────────────────────
 
 class ViewEmailRequest(BaseModel):
     leadenrich_id: str
 
 
-# ── Helper: resolve lead from DB ──────────────────────────────────────────────
-
-async def _resolve_lead(lead_id: str) -> dict:
-    from fastapi import HTTPException
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM enriched_leads WHERE id = $1", lead_id
-        )
-    if not row:
-        raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
-    return dict(row)
+class BulkEmailRequest(BaseModel):
+    lead_ids: List[str]
+    force_refresh: bool = False  # re-enrich even if email already exists
 
 
-# ── Name normalizer ───────────────────────────────────────────────────────────
+# ── Shared helpers ─────────────────────────────────────────────────────────────
 
 def _normalize_name(s: str) -> str:
     _char_map = {
@@ -66,44 +74,38 @@ def _normalize_name(s: str) -> str:
     return ''.join(_char_map.get(c.lower(), c) for c in s)
 
 
-# ── ValidEmail.net verification ───────────────────────────────────────────────
+def _extract_domain(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        netloc = urlparse(url if url.startswith("http") else f"https://{url}").netloc
+        return netloc.replace("www.", "").split(":")[0].lower()
+    except Exception:
+        return ""
+
 
 async def _verify_email(email: str) -> dict:
     """
-    Verify email via ValidEmail.net API.
+    Verify email via ValidEmail.net.
     Returns: { verified: bool, bounce_risk: str | None }
-
-    API response keys:
-      valid       — true/false
-      result      — "valid" | "invalid" | "catch-all" | "unknown"
-      disposable  — true/false
-      reason      — why it passed/failed
     """
     token = VALIDEMAIL_TOKEN or os.getenv("VALIDEMAIL_TOKEN", "")
     if not token or not email:
         return {"verified": False, "bounce_risk": None}
-
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(VALIDEMAIL_URL, params={"email": email, "token": token})
-
         if resp.status_code != 200:
             logger.warning("[ValidEmail] HTTP %s for %s", resp.status_code, email)
             return {"verified": False, "bounce_risk": None}
-
         data = resp.json()
-
-        # Credits exhausted or error message
         if "Message" in data or "message" in data:
-            msg = data.get("Message") or data.get("message", "")
-            logger.warning("[ValidEmail] API message for %s: %s", email, msg)
+            logger.warning("[ValidEmail] API message for %s: %s", email,
+                           data.get("Message") or data.get("message"))
             return {"verified": False, "bounce_risk": None}
-
         valid      = bool(data.get("valid", False))
         result     = (data.get("result") or "").lower()
         disposable = bool(data.get("disposable", False))
-
-        # bounce_risk: high if invalid/disposable, medium if catch-all, low if valid
         if not valid or result == "invalid":
             bounce_risk = "high"
         elif result == "catch-all":
@@ -112,61 +114,33 @@ async def _verify_email(email: str) -> dict:
             bounce_risk = "high"
         else:
             bounce_risk = "low"
-
         logger.info("[ValidEmail] %s → valid=%s result=%s bounce_risk=%s",
                     email, valid, result, bounce_risk)
-
         await _usage.track("validemail", "verify")
         return {"verified": valid, "bounce_risk": bounce_risk}
-
     except Exception as e:
         logger.warning("[ValidEmail] Error verifying %s: %s", email, e)
         return {"verified": False, "bounce_risk": None}
 
 
-# ── Guessed email generator (used when Apollo finds nothing) ──────────────────
-
 def _generate_guessed_emails(first: str, last: str, domain: str) -> list[str]:
-    """
-    Generate up to 3 common corporate email patterns.
-    Uses only the final word of a multi-word last name (e.g. "Nathalia Fernandes" → "fernandes").
-    """
+    """3 common corporate email patterns."""
     if not first or not domain:
         return []
-
-    # Use only first word of first name, last word of last name
     f  = first.strip().split()[0].lower()
-    _last_parts = last.strip().split() if last else []
-    l  = _last_parts[-1].lower() if _last_parts else ""
+    l  = (last.strip().split()[-1].lower()) if last.strip() else ""
     fi = f[0] if f else ""
-
-    candidates: list[str] = []
-
     if l:
-        candidates.append(f"{f}.{l}@{domain}")    # yessica.fernandes@deel.com
-        candidates.append(f"{fi}{l}@{domain}")     # yfernandes@deel.com
-        candidates.append(f"{f}{l}@{domain}")      # yessicafernandes@deel.com
-    else:
-        candidates.append(f"{f}@{domain}")         # yessica@deel.com
-
-    return candidates[:3]
+        return [f"{f}.{l}@{domain}", f"{fi}{l}@{domain}", f"{f}{l}@{domain}"]
+    return [f"{f}@{domain}"]
 
 
-# ── Endpoint ──────────────────────────────────────────────────────────────────
-
-@router.post("/view/email", summary="Find and verify email for a single lead via Apollo + ValidEmail")
-async def email_enrichment(body: ViewEmailRequest):
+def _extract_lead_identity(lead: dict) -> tuple[str, str, str, str]:
     """
-    Flow:
-    1. Fetch lead from DB
-    2. If email already saved → return it with verification status
-    3. Call Apollo to find email
-    4. If Apollo returns email → verify via ValidEmail.net → save + return
-    5. If Apollo returns nothing → generate 3 guessed emails → verify each → return all 3
+    Extract (first, last, domain, linkedin_url) from a lead record.
+    Checks raw_brightdata → name column for name,
+    and company_website → raw_brightdata → crm_brief → enrichment_data for domain.
     """
-    lead = await _resolve_lead(body.leadenrich_id)
-
-    # ── Parse BD raw data ─────────────────────────────────────────────────────
     raw_bd = lead.get("raw_brightdata") or {}
     if isinstance(raw_bd, str):
         try:
@@ -174,106 +148,105 @@ async def email_enrichment(body: ViewEmailRequest):
         except Exception:
             raw_bd = {}
 
-    # Extract name
+    # Name
     first = (raw_bd.get("first_name") or "").strip()
-    last  = (raw_bd.get("last_name") or "").strip()
+    last  = (raw_bd.get("last_name")  or "").strip()
     if not first:
         first, last = svc._parse_name(raw_bd.get("name") or lead.get("name") or "")
+    first = _normalize_name(re.sub(r'\s+[A-Z]\.$', '', first).strip())
+    last  = _normalize_name(re.sub(r'\s+[A-Z]\.$', '', last).strip())
 
-    # Strip trailing initials (e.g. "Djernæs N." → "Djernæs")
-    first = re.sub(r'\s+[A-Z]\.$', '', first).strip()
-    last  = re.sub(r'\s+[A-Z]\.$', '', last).strip()
-
-    first_apollo = _normalize_name(first)
-    last_apollo  = _normalize_name(last)
-
-    # Extract domain — check multiple sources in priority order
-    domain = ""
-    from urllib.parse import urlparse
-
-    def _extract_domain(url: str) -> str:
-        if not url:
-            return ""
-        try:
-            netloc = urlparse(url if url.startswith("http") else f"https://{url}").netloc
-            return netloc.replace("www.", "").split(":")[0].lower()
-        except Exception:
-            return ""
-
-    # 1. company_website column
+    # Domain — priority: company_website col → raw BD → crm_brief → enrichment_data
     domain = _extract_domain(lead.get("company_website") or "")
 
-    # 2. raw_brightdata company website
     if not domain:
-        _bd_company = raw_bd.get("company") or {}
-        if isinstance(_bd_company, dict):
-            domain = _extract_domain(_bd_company.get("website") or "")
+        bd_co = raw_bd.get("company") or {}
+        if isinstance(bd_co, dict):
+            domain = _extract_domain(bd_co.get("website") or "")
         if not domain:
             domain = _extract_domain(raw_bd.get("company_website") or "")
 
-    # 3. crm_brief JSON — their_company.website
     if not domain:
         try:
-            _crm = lead.get("crm_brief") or ""
-            if isinstance(_crm, str) and _crm:
-                _crm = json.loads(_crm)
-            _site = (_crm or {}).get("their_company", {}).get("website", "")
-            domain = _extract_domain(_site)
+            crm = lead.get("crm_brief") or ""
+            if isinstance(crm, str) and crm:
+                crm = json.loads(crm)
+            domain = _extract_domain((crm or {}).get("their_company", {}).get("website", ""))
         except Exception:
             pass
 
-    # 4. enrichment_data JSON
     if not domain:
         try:
-            _enrich = lead.get("enrichment_data") or ""
-            if isinstance(_enrich, str) and _enrich:
-                _enrich = json.loads(_enrich)
-            _site = (_enrich or {}).get("company", {}).get("website", "")
-            domain = _extract_domain(_site)
+            enr = lead.get("enrichment_data") or ""
+            if isinstance(enr, str) and enr:
+                enr = json.loads(enr)
+            domain = _extract_domain((enr or {}).get("company", {}).get("website", ""))
         except Exception:
             pass
 
     linkedin_url = lead.get("linkedin_url") or raw_bd.get("url") or ""
+    return first, last, domain, linkedin_url
 
-    # ── Already has email — return immediately ────────────────────────────────
-    if lead.get("work_email"):
+
+# ── Core per-lead email logic (shared by single + bulk) ───────────────────────
+
+async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False) -> dict:
+    """
+    Flow (identical for single and bulk):
+      1. Cache hit  → return immediately if work_email already set
+      2. Apollo.io  → if found, verify via ValidEmail.net → save → return
+      3. Pattern guesses → verify each via ValidEmail.net → save best → return all
+    """
+    lead_id = lead["id"]
+    first, last, domain, linkedin_url = _extract_lead_identity(lead)
+
+    # ── 1. Cache hit ──────────────────────────────────────────────────────────
+    if lead.get("work_email") and not force_refresh:
         return {
-            "lead_id":           lead.get("id"),
+            "lead_id":           lead_id,
             "linkedin_url":      linkedin_url,
             "name":              lead.get("name"),
             "company":           lead.get("company"),
-            "work_email":        lead.get("work_email"),
-            "email":             lead.get("work_email"),
+            "work_email":        lead["work_email"],
+            "email":             lead["work_email"],
             "source":            lead.get("email_source"),
-            "message":           f"Email already found: {lead.get('work_email')}" + (f" | Phone: {lead.get('direct_phone')}" if lead.get("direct_phone") else ""),
+            "message":           f"Email already found: {lead['work_email']}"
+                                 + (f" | Phone: {lead.get('direct_phone')}" if lead.get("direct_phone") else ""),
             "confidence":        lead.get("email_confidence"),
             "verified":          bool(lead.get("email_verified")),
             "bounce_risk":       lead.get("bounce_risk"),
             "enrichment_source": lead.get("enrichment_source"),
             "phone":             lead.get("direct_phone") or lead.get("phone"),
-            "all_emails":        [lead.get("work_email")],
+            "all_emails":        [lead["work_email"]],
             "activity_emails":   [],
             "activity_phones":   [],
             "ai_generated":      None,
             "guessed_emails":    [],
         }
 
-    # ── Missing required params ───────────────────────────────────────────────
-    if not first_apollo or (not domain and not linkedin_url):
-        logger.warning("[EmailView] Cannot call Apollo — missing first=%r domain=%r linkedin=%r for lead %s",
-                       first, domain, linkedin_url, lead.get("id"))
-        # Still try guessing if we have name + domain
-        guessed = []
-        if first_apollo and domain:
-            guesses = _generate_guessed_emails(first_apollo, last_apollo, domain)
-            import asyncio
+    work_email:    str | None    = None
+    phone:         str | None    = None
+    source:        str           = "apollo"
+    confidence:    str | None    = None
+    apollo_raw:    dict          = {}
+    verified:      bool          = False
+    bounce_risk:   str | None    = None
+    guessed_emails: list[dict]   = []
+
+    # ── Guard: need at least first name + (domain or linkedin) ───────────────
+    if not first or (not domain and not linkedin_url):
+        logger.warning("[EmailView] Missing params for lead %s — first=%r domain=%r",
+                       lead_id, first, domain)
+        # Still try pattern guesses if we at least have name + domain
+        if first and domain:
+            guesses = _generate_guessed_emails(first, last, domain)
             verifications = await asyncio.gather(*[_verify_email(e) for e in guesses])
-            guessed = [
+            guessed_emails = [
                 {"email": e, "verified": v["verified"], "bounce_risk": v["bounce_risk"], "source": "guessed"}
                 for e, v in zip(guesses, verifications)
             ]
         return {
-            "lead_id":           lead.get("id"),
+            "lead_id":           lead_id,
             "linkedin_url":      linkedin_url,
             "name":              lead.get("name"),
             "company":           lead.get("company"),
@@ -284,30 +257,19 @@ async def email_enrichment(body: ViewEmailRequest):
             "enrichment_source": None, "phone": None,
             "all_emails":        [], "activity_emails": [], "activity_phones": [],
             "ai_generated":      None,
-            "guessed_emails":    guessed,
+            "guessed_emails":    guessed_emails,
         }
 
-    # ── Apollo call ───────────────────────────────────────────────────────────
+    # ── 2. Apollo ─────────────────────────────────────────────────────────────
     try:
-        apollo_result = await svc._try_apollo(first_apollo, last_apollo, domain, linkedin_url=linkedin_url)
-    except Exception as _e:
-        logger.warning("[EmailView] Apollo call failed for %s: %s", lead.get("id"), _e)
+        apollo_result = await svc._try_apollo(first, last, domain, linkedin_url=linkedin_url)
+    except Exception as e:
+        logger.warning("[EmailView] Apollo error for lead %s: %s", lead_id, e)
         apollo_result = None
 
-    # Credit exhausted — fall through to guessed email generation
     if apollo_result and apollo_result.get("_credit_exhausted"):
-        logger.warning("[EmailView] Apollo credits exhausted for lead %s — generating guessed emails", lead.get("id"))
-        apollo_result = None  # treat as not found so guesses are generated below
-
-    # ── Apollo found email ────────────────────────────────────────────────────
-    work_email  = None
-    phone       = None
-    source      = "apollo"
-    confidence  = None
-    apollo_raw  = {}
-    verified    = False
-    bounce_risk = None
-    guessed_emails: list[dict] = []
+        logger.warning("[EmailView] Apollo credits exhausted for lead %s", lead_id)
+        apollo_result = None
 
     if apollo_result and apollo_result.get("email"):
         work_email = apollo_result["email"]
@@ -315,13 +277,11 @@ async def email_enrichment(body: ViewEmailRequest):
         confidence = apollo_result.get("confidence")
         apollo_raw = apollo_result.get("_apollo_raw") or {}
 
-        # Verify via ValidEmail
+        # Verify via ValidEmail.net
         verification = await _verify_email(work_email)
         verified     = verification["verified"]
         bounce_risk  = verification["bounce_risk"]
 
-        # Save to DB
-        pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.execute(
                 """UPDATE enriched_leads
@@ -336,52 +296,65 @@ async def email_enrichment(body: ViewEmailRequest):
                 json.dumps(apollo_raw, default=str) if apollo_raw else None,
                 1 if verified else 0,
                 bounce_risk,
-                lead["id"],
+                lead_id,
             )
-        logger.info("[EmailView] Apollo found email=%s verified=%s bounce_risk=%s for lead %s",
-                    work_email, verified, bounce_risk, lead.get("id"))
+        logger.info("[EmailView] Apollo found email=%s verified=%s for lead %s",
+                    work_email, verified, lead_id)
 
     else:
-        # ── Apollo found nothing — generate 3 guessed emails and verify each ─
-        logger.info("[EmailView] Apollo found no email for lead %s — generating guesses", lead.get("id"))
+        # ── 3. Pattern guesses + ValidEmail.net ───────────────────────────────
+        logger.info("[EmailView] Apollo found nothing for lead %s — generating guesses", lead_id)
 
-        if first_apollo and domain:
-            import asyncio
-            guesses = _generate_guessed_emails(first_apollo, last_apollo, domain)
+        if first and domain:
+            guesses = _generate_guessed_emails(first, last, domain)
             verifications = await asyncio.gather(*[_verify_email(e) for e in guesses])
             guessed_emails = [
-                {
-                    "email":       e,
-                    "verified":    v["verified"],
-                    "bounce_risk": v["bounce_risk"],
-                    "source":      "guessed",
-                }
+                {"email": e, "verified": v["verified"], "bounce_risk": v["bounce_risk"], "source": "guessed"}
                 for e, v in zip(guesses, verifications)
             ]
-            logger.info("[EmailView] Guessed %d emails for lead %s: %s",
-                        len(guessed_emails), lead.get("id"),
-                        [g["email"] for g in guessed_emails])
+            logger.info("[EmailView] Guessed emails for lead %s: %s",
+                        lead_id, [g["email"] for g in guessed_emails])
 
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE enriched_leads SET email_source='not_found', updated_at=NOW() WHERE id=$1",
-                lead["id"],
-            )
+            best = next((g for g in guessed_emails if g["verified"]),
+                        guessed_emails[0] if guessed_emails else None)
+            if best:
+                work_email  = best["email"]
+                verified    = best["verified"]
+                bounce_risk = best["bounce_risk"]
+                source      = "guessed"
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE enriched_leads
+                           SET work_email=$1, email_source='guessed',
+                               email_confidence='low', enrichment_source='pattern',
+                               email_verified=$2, bounce_risk=$3,
+                               updated_at=NOW()
+                           WHERE id=$4""",
+                        work_email, 1 if verified else 0, bounce_risk, lead_id,
+                    )
+                logger.info("[EmailView] Saved best guess email=%s for lead %s", work_email, lead_id)
+            else:
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE enriched_leads SET email_source='not_found', updated_at=NOW() WHERE id=$1",
+                        lead_id,
+                    )
+        else:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE enriched_leads SET email_source='not_found', updated_at=NOW() WHERE id=$1",
+                    lead_id,
+                )
 
     _message = (
-        f"Email found: {work_email} | Verified: {'Yes' if verified else 'No'} | Bounce risk: {bounce_risk or 'unknown'}"
-        + (f" | Phone: {phone}" if phone else "")
+        f"Email found: {work_email} | Source: {source} | Verified: {'Yes' if verified else 'No'}"
+        f" | Bounce risk: {bounce_risk or 'unknown'}" + (f" | Phone: {phone}" if phone else "")
         if work_email
-        else (
-            f"Apollo returned no email. Generated {len(guessed_emails)} guessed email(s) based on name + domain."
-            if guessed_emails
-            else f"No email found for {lead.get('name', 'this lead')} at {lead.get('company', 'their company')} via Apollo."
-        )
+        else f"No email found for {lead.get('name', 'this lead')} at {lead.get('company', 'their company')}."
     )
 
     return {
-        "lead_id":           lead.get("id"),
+        "lead_id":           lead_id,
         "linkedin_url":      linkedin_url,
         "name":              lead.get("name"),
         "company":           lead.get("company"),
@@ -392,7 +365,7 @@ async def email_enrichment(body: ViewEmailRequest):
         "confidence":        confidence,
         "verified":          verified,
         "bounce_risk":       bounce_risk,
-        "enrichment_source": "apollo" if work_email else None,
+        "enrichment_source": source if work_email else None,
         "phone":             phone,
         "all_emails":        [work_email] if work_email else [],
         "activity_emails":   [],
@@ -400,3 +373,211 @@ async def email_enrichment(body: ViewEmailRequest):
         "ai_generated":      None,
         "guessed_emails":    guessed_emails,
     }
+
+
+# ── Single endpoint ────────────────────────────────────────────────────────────
+
+@router.post("/view/email", summary="Find and verify email for a single lead")
+async def email_enrichment(body: ViewEmailRequest):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM enriched_leads WHERE id = $1", body.leadenrich_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Lead {body.leadenrich_id} not found")
+    return await _find_email_for_lead(dict(row), pool)
+
+
+# ── Bulk endpoint ──────────────────────────────────────────────────────────────
+
+@router.post(
+    "/email/bulk",
+    summary="Find emails for multiple leads in parallel",
+    description="""
+Find emails for a list of already-enriched lead IDs using the same flow as the single endpoint:
+Apollo → ValidEmail.net, falling back to pattern guesses → ValidEmail.net.
+
+- Leads with an existing email are returned immediately unless `force_refresh=true`.
+- Up to 10 leads run concurrently (rate-limit safe).
+- Synchronous response — no webhook or polling needed.
+
+```json
+{
+  "lead_ids": ["id1", "id2", "id3"],
+  "force_refresh": false
+}
+```
+""",
+)
+async def bulk_email_enrichment(body: BulkEmailRequest):
+    if not body.lead_ids:
+        return {"total": 0, "found": 0, "cached": 0, "skipped": 0, "results": []}
+
+    if len(body.lead_ids) > 500:
+        raise HTTPException(status_code=400, detail="Maximum 500 lead_ids per request.")
+
+    pool = await get_pool()
+
+    # Batch fetch all leads in one query
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM enriched_leads WHERE id = ANY($1::text[])",
+            body.lead_ids,
+        )
+
+    leads_by_id = {row["id"]: dict(row) for row in rows}
+
+    results: list[dict] = []
+
+    # Not found in DB
+    for lid in body.lead_ids:
+        if lid not in leads_by_id:
+            results.append({
+                "lead_id": lid, "name": None, "company": None,
+                "work_email": None, "email": None,
+                "source": "not_found", "message": f"Lead {lid} not found in database.",
+                "confidence": None, "verified": False, "bounce_risk": None,
+                "enrichment_source": None, "phone": None,
+                "all_emails": [], "activity_emails": [], "activity_phones": [],
+                "ai_generated": None, "guessed_emails": [],
+            })
+
+    # Run the same flow as single, in parallel under semaphore
+    async def _enrich_one(lead: dict) -> dict:
+        async with _BULK_EMAIL_SEM:
+            return await _find_email_for_lead(lead, pool, force_refresh=body.force_refresh)
+
+    lead_results = await asyncio.gather(
+        *[_enrich_one(leads_by_id[lid]) for lid in body.lead_ids if lid in leads_by_id],
+        return_exceptions=True,
+    )
+
+    for r in lead_results:
+        if isinstance(r, Exception):
+            logger.warning("[BulkEmail] Lead error: %s", r)
+            results.append({
+                "lead_id": None, "work_email": None, "email": None,
+                "source": "error", "message": str(r),
+                "confidence": None, "verified": False, "bounce_risk": None,
+            })
+        else:
+            results.append(r)
+
+    cached  = sum(1 for r in results if r.get("work_email") and r.get("message", "").startswith("Email already found"))
+    found   = sum(1 for r in results if r.get("work_email") and not r.get("message", "").startswith("Email already found"))
+    skipped = sum(1 for r in results if not r.get("work_email"))
+
+    return {
+        "total":   len(body.lead_ids),
+        "found":   found,
+        "cached":  cached,
+        "skipped": skipped,
+        "results": results,
+    }
+
+
+# ── Bulk stream endpoint ───────────────────────────────────────────────────────
+
+@router.post(
+    "/email/bulk/stream",
+    summary="Stream email enrichment results one by one as each lead finishes",
+    description="""
+Same flow as `/email/bulk` but streams each result via Server-Sent Events (SSE)
+the moment it completes — no waiting for all leads to finish.
+
+Each event is `data: <JSON>\\n\\n`. The final event has `"done": true` with summary counts.
+
+```json
+{ "lead_ids": ["id1", "id2", "id3"], "force_refresh": false }
+```
+
+**Client example (JS):**
+```js
+const res = await fetch('/api/leads/email/bulk/stream', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ lead_ids: ['id1', 'id2'] })
+});
+const reader = res.body.getReader();
+// read lines and JSON.parse each `data: ...` line
+```
+""",
+)
+async def bulk_email_stream(body: BulkEmailRequest):
+    if not body.lead_ids:
+        async def _empty():
+            yield f"data: {json.dumps({'done': True, 'total': 0, 'found': 0, 'cached': 0, 'skipped': 0})}\n\n"
+        return StreamingResponse(_empty(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    if len(body.lead_ids) > 500:
+        raise HTTPException(status_code=400, detail="Maximum 500 lead_ids per request.")
+
+    pool = await get_pool()
+
+    # Batch fetch all leads in one query
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM enriched_leads WHERE id = ANY($1::text[])",
+            body.lead_ids,
+        )
+    leads_by_id = {row["id"]: dict(row) for row in rows}
+
+    # Queue collects results as each lead finishes
+    queue: asyncio.Queue = asyncio.Queue()
+    total_tasks = len(body.lead_ids)
+
+    async def _enrich_and_enqueue(lead_id: str) -> None:
+        lead = leads_by_id.get(lead_id)
+        if not lead:
+            await queue.put({
+                "lead_id": lead_id, "name": None, "company": None,
+                "work_email": None, "email": None,
+                "source": "not_found", "message": f"Lead {lead_id} not found in database.",
+                "confidence": None, "verified": False, "bounce_risk": None,
+                "enrichment_source": None, "phone": None,
+                "all_emails": [], "activity_emails": [], "activity_phones": [],
+                "ai_generated": None, "guessed_emails": [],
+            })
+            return
+        try:
+            async with _BULK_EMAIL_SEM:
+                result = await _find_email_for_lead(lead, pool, force_refresh=body.force_refresh)
+        except Exception as e:
+            logger.warning("[BulkEmailStream] Error for lead %s: %s", lead_id, e)
+            result = {
+                "lead_id": lead_id, "work_email": None, "email": None,
+                "source": "error", "message": str(e),
+                "confidence": None, "verified": False, "bounce_risk": None,
+            }
+        await queue.put(result)
+
+    async def _generate():
+        # Fire all tasks — they push into the queue as they finish
+        tasks = [asyncio.create_task(_enrich_and_enqueue(lid)) for lid in body.lead_ids]
+
+        found = cached = skipped = 0
+
+        for _ in range(total_tasks):
+            result = await queue.get()
+
+            # Update running counts
+            if result.get("work_email"):
+                if result.get("message", "").startswith("Email already found"):
+                    cached += 1
+                else:
+                    found += 1
+            else:
+                skipped += 1
+
+            # Yield this result immediately
+            yield f"data: {json.dumps(result, default=str)}\n\n"
+
+        # Wait for all tasks to clean up, then send the done event
+        await asyncio.gather(*tasks, return_exceptions=True)
+        yield f"data: {json.dumps({'done': True, 'total': total_tasks, 'found': found, 'cached': cached, 'skipped': skipped})}\n\n"
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

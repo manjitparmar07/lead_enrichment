@@ -304,6 +304,31 @@ async def send_to_lio(lead: dict, sso_id: str = "", force: bool = False) -> None
                 who["profile_image"] = lead.get("avatar_url") or ""
             if not who.get("company_logo"):
                 who["company_logo"] = lead.get("company_logo") or ""
+            # Always override company/title — LLM infers from experience array and picks wrong company.
+            # DB values come from BrightData current_company (authoritative).
+            _db_company = lead.get("company") or ""
+            if _db_company:
+                who["company"] = _db_company
+            _db_title = lead.get("title") or ""
+            if _db_title and not who.get("title"):
+                who["title"] = _db_title
+
+        # Patch their_company from DB — LLM populates this based on the wrong company when it
+        # infers the wrong current employer from the experience array.
+        _tc = _crm_brief.get("their_company")
+        if isinstance(_tc, dict):
+            if lead.get("industry"):
+                _tc["industry"] = lead["industry"]
+            if lead.get("employee_count"):
+                _tc["company_size"] = str(lead["employee_count"])
+            if lead.get("founded_year"):
+                _tc["founded"] = str(lead["founded_year"])
+            if lead.get("company_website"):
+                _tc["website"] = lead["company_website"]
+            if lead.get("funding_stage"):
+                _tc["stage"] = lead["funding_stage"]
+            if lead.get("business_model"):
+                _tc["type"] = lead["business_model"]
 
         # Ensure crm_scores are integers — LLM sometimes returns strings like "High", "80%"
         scores = _crm_brief.get("crm_scores")
@@ -815,6 +840,11 @@ STRICT RULES:
 - Avoid generic B2B filler phrases (e.g. "results-driven", "passionate about").
 - All arrays MUST contain 4 to 5 real, distinct items — never fewer.
 - All strings MUST be non-empty, meaningful, and specific.
+
+IDENTITY RULES (NO HALLUCINATION):
+- who_they_are.company MUST be taken EXACTLY from company_context.name in the input. Do NOT use any company from the experience array. Do NOT infer or invent a company name. If company_context.name is present, use it verbatim.
+- who_they_are.title MUST be taken from the headline/title field in the input. Only infer from experience[0].title if headline is completely absent.
+- their_company fields (industry, website, stage, etc.) MUST be derived from company_context in the input. Do NOT substitute with any other company from experience history.
 
 ANALYSIS LOGIC:
 - authored_posts → define expertise, identity, and authority.
@@ -1463,7 +1493,7 @@ def _merge_lio_into_enrichment(enrichment: dict, lio: dict) -> dict:
         if lio_score.get("next_best_action"):
             scoring["next_best_action"] = lio_score["next_best_action"]
 
-    # ── Pitch Intelligence (Stage 4) ──────────────────────────────────────────
+    # ── Pitch Intelligence (Stage 4) ────────────────────────────���─────────────
     if lio.get("pitch_intelligence"):
         enrichment.setdefault("lead_scoring", {})["pitch_intelligence"] = lio["pitch_intelligence"]
 
@@ -1747,6 +1777,15 @@ def _build_llm_profile(profile: dict) -> dict:
     #   interactions        → buying intent (liked/commented/reposted)
     #   company_context     → challenges, stage, priorities
     _current_co = profile.get("current_company") or {}
+    # Authoritative company name: prefer current_company_name (set by enrichment pipeline
+    # from BrightData company_identity) over the nested current_company dict name.
+    # This prevents the LLM from picking a company from the experience array when
+    # the current_company dict is empty but the company name IS known.
+    _authoritative_company_name = (
+        profile.get("current_company_name")
+        or _current_co.get("name")
+        or ""
+    )
     return {
         # ── Identity ────────────────────────────────────────────────────────────
         "name":            profile.get("name", ""),
@@ -1759,8 +1798,11 @@ def _build_llm_profile(profile: dict) -> dict:
         "followers":       profile.get("followers", 0),
         "connections":     profile.get("connections", 0),
         # ── Company context → derive challenges, stage, priorities ───────────
+        # name is always set to the authoritative company name so the LLM never
+        # falls back to inferring it from the experience array.
         "company_context": {
             **_clean_company(_current_co),
+            "name": _authoritative_company_name,   # always override — authoritative
             "logo": _current_co.get("logo") or _current_co.get("logo_url", ""),
         },
         # ── Career history ───────────────────────────────────────────────────
