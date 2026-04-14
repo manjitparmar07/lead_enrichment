@@ -1644,7 +1644,17 @@ async def build_comprehensive_enrichment(
                     brief = brief[_start:_end + 1]
                 # Try to parse as JSON — store as dict if valid, else raw string
                 try:
-                    data["crm_brief"] = json.loads(brief)
+                    _crm = json.loads(brief)
+                    # Always override who_they_are.company with BrightData current_company.name
+                    # — LLM sometimes picks a company from the experience array despite instructions.
+                    _bd_company = (
+                        profile.get("current_company_name")
+                        or (profile.get("current_company") or {}).get("name")
+                        or ""
+                    )
+                    if _bd_company and isinstance(_crm.get("who_they_are"), dict):
+                        _crm["who_they_are"]["company"] = _bd_company
+                    data["crm_brief"] = _crm
                 except Exception:
                     data["crm_brief"] = brief
                 logger.info("[Enrichment] CRM brief generated (%d chars)", len(brief))
@@ -1806,7 +1816,12 @@ def _build_llm_profile(profile: dict) -> dict:
             "logo": _current_co.get("logo") or _current_co.get("logo_url", ""),
         },
         # ── Career history ───────────────────────────────────────────────────
-        "experience":      _clean_exp(profile.get("experience")),
+        # company field stripped from each experience entry — LLM must use
+        # company_context.name (from BrightData current_company) exclusively.
+        "experience":      [
+            {k: v for k, v in e.items() if k != "company"}
+            for e in _clean_exp(profile.get("experience"))
+        ],
         "education":       _clean_edu(profile.get("education") or []),
         "skills":          [
             (s.get("name") if isinstance(s, dict) else s)

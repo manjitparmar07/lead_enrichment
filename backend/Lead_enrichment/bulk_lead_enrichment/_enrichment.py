@@ -2008,7 +2008,19 @@ async def regenerate_crm_brief_for_lead(lead_id: str, org_id: str = "") -> Optio
         brief = brief[_start:_end + 1]
 
     try:
-        crm_brief_db = json.dumps(json.loads(brief), default=str)
+        _crm = json.loads(brief)
+        # Always override who_they_are.company with BrightData current_company.name
+        # — LLM sometimes picks a company from the experience array despite instructions.
+        _bd_company = (
+            profile.get("current_company_name")
+            or (profile.get("current_company") or {}).get("name")
+            or ""
+        )
+        if not _bd_company:
+            _bd_company = lead.get("company") or ""
+        if _bd_company and isinstance(_crm.get("who_they_are"), dict):
+            _crm["who_they_are"]["company"] = _bd_company
+        crm_brief_db = json.dumps(_crm, default=str)
     except Exception:
         crm_brief_db = brief
 
