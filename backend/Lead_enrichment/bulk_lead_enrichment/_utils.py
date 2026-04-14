@@ -405,9 +405,11 @@ def _patch_crm_brief_images(
         return crm_brief
     who = crm_brief.get("who_they_are")
     if isinstance(who, dict):
-        if not who.get("profile_image") and avatar_url:
+        # Always overwrite — LLM generates fake LinkedIn CDN tokens if given empty URL.
+        # BD avatar_url is authoritative; never trust the LLM-generated value.
+        if avatar_url:
             who["profile_image"] = avatar_url
-        if not who.get("company_logo") and company_logo:
+        if company_logo:
             who["company_logo"] = company_logo
     return crm_brief
 

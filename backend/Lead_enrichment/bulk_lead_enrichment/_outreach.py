@@ -21,7 +21,7 @@ from ._utils import (
 from ._clients import _get_lio_client, LIO_RECEIVE_URL
 from ._llm import _call_llm, _parse_json_from_llm
 from ._contact import _extract_domain
-from ._website import scrape_website_intelligence
+from ._website import scrape_website_intelligence, _extract_avatar
 
 logger = logging.getLogger(__name__)
 
@@ -1680,17 +1680,21 @@ async def build_comprehensive_enrichment(
                         or (profile.get("current_company") or {}).get("name")
                         or ""
                     )
-                    _bd_title = profile.get("position") or profile.get("headline") or ""
+                    _bd_title  = profile.get("position") or profile.get("headline") or ""
+                    _bd_avatar = _extract_avatar(profile) or ""
                     _co_extras = profile.get("_company_extras") or {}
 
-                    # ── who_they_are — force company + title from BrightData ──
-                    # LLM reads experience array and picks wrong company/title.
-                    # current_company.name is the ONLY authoritative source.
+                    # ── who_they_are — force BD values; LLM cannot know real URLs ─
+                    # company/title: LLM reads experience and picks wrong employer.
+                    # profile_image: LLM invents fake LinkedIn CDN tokens.
+                    # Always overwrite from BrightData — never trust LLM for these.
                     if isinstance(_crm.get("who_they_are"), dict):
                         if _bd_company:
                             _crm["who_they_are"]["company"] = _bd_company
                         if _bd_title:
                             _crm["who_they_are"]["title"] = _bd_title
+                        if _bd_avatar:
+                            _crm["who_they_are"]["profile_image"] = _bd_avatar
 
                     # ── their_company — override with real waterfall data ─────
                     # If waterfall found no data, store empty — never fake values.
@@ -1921,7 +1925,7 @@ def _build_llm_profile(profile: dict) -> dict:
         "location":        profile.get("location") or profile.get("city", ""),
         "country":         profile.get("country_code") or profile.get("country", ""),
         "linkedin_url":    profile.get("url") or profile.get("input_url", ""),
-        "profile_image":   profile.get("avatar_url") or profile.get("profile_pic_url", ""),
+        "profile_image":   _extract_avatar(profile) or "",
         "about":           profile.get("about") or "",
         "followers":       profile.get("followers", 0),
         "connections":     profile.get("connections", 0),
