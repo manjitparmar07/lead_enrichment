@@ -64,7 +64,11 @@ def _k(name: str, default: str = "") -> str:
 def _bd_api_key()         -> str:  return _k("BRIGHT_DATA_API_KEY")
 def _bd_profile_dataset() -> str:  return _k("BD_PROFILE_DATASET_ID", "gd_l1viktl72bvl7bjuj0")
 def _bd_company_dataset() -> str:  return _k("BD_COMPANY_DATASET_ID", "gd_l1vikfnt1wgvvqz95w")
-def _apollo_api_key()     -> str:  return _k("APOLLO_API_KEY")
+def _apollo_api_key()        -> str:  return _k("APOLLO_API_KEY")
+def _apollo_master_api_key() -> str:  return _k("APOLLO_API_KEY_MASTER")
+def _apollo_webhook_base()   -> str:
+    """Return the public base URL for Apollo callbacks — falls back to APP_URL."""
+    return (_k("APOLLO_WEBHOOK_BASE_URL") or _k("APP_URL")).rstrip("/")
 def _dropcontact_key()    -> str:  return _k("DROPCONTACT_API_KEY")
 def _pdl_api_key()        -> str:  return _k("PDL_API_KEY")
 def _zerobounce_key()     -> str:  return _k("ZEROBOUNCE_API_KEY")

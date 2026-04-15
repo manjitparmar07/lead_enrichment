@@ -32,6 +32,8 @@ from search.serpapi_service import init_serpapi_db
 from custom_features.custom_features_routes import router as custom_features_router
 from custom_features.custom_features_service import init_custom_features_db
 
+from brightdata_filter.filter_routes import router as bd_filter_router
+
 # ── Lead Enrichment modules ───────────────────────────────────────────────────
 from Lead_enrichment.bulk_lead_enrichment.lead_enrichment_brightdata_routes import (
     router as lead_enrichment_router,
@@ -115,6 +117,7 @@ app.include_router(storage_router)
 # email_enrichment_router removed — use POST /api/leads/view/email instead
 app.include_router(serpapi_router,            prefix="/api")
 app.include_router(custom_features_router,    prefix="/api")
+app.include_router(bd_filter_router,          prefix="/api")
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 # Production requests go through nginx which owns CORS headers.

@@ -15,6 +15,7 @@ const SystemPromptGeneratorPage = lazy(() => import('./pages/SystemPromptGenerat
 const LinkedInFinderPage        = lazy(() => import('./pages/LinkedInFinderPage'))
 const CustomFeaturesPage        = lazy(() => import('./pages/CustomFeaturesPage'))
 const ApiUsagePage              = lazy(() => import('./pages/ApiUsagePage'))
+const BrightDataFilterPage      = lazy(() => import('./pages/BrightDataFilterPage'))
 
 // ── Suspense fallback ──────────────────────────────────────────────────────
 
@@ -136,6 +137,10 @@ const NAV_ITEMS = [
     to: '/api-usage', label: 'API Usage',
     icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/><line x1="2" y1="20" x2="22" y2="20"/></svg>,
   },
+  {
+    to: '/bd-filter', label: 'BrightData Filter',
+    icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>,
+  },
 ]
 
 // ── App shell ──────────────────────────────────────────────────────────────
@@ -250,6 +255,7 @@ function AppShell({ user, onLogout }) {
             <Route path="/linkedin-finder"    element={<LinkedInFinderPage />} />
             <Route path="/custom-features"  element={<CustomFeaturesPage />} />
             <Route path="/api-usage"        element={<ApiUsagePage />} />
+            <Route path="/bd-filter"        element={<BrightDataFilterPage />} />
             <Route path="*"                 element={<Navigate to="/leads" replace />} />
           </Routes>
         </Suspense>

@@ -60,6 +60,9 @@ export default function ApiDocPage() {
     { id: 'sysprompt', label: 'System Prompt',    icon: '🗂️' },
     { id: 'divider4', divider: true, label: 'Custom' },
     { id: 'custom',   label: 'Custom Features',   icon: '⚡' },
+    { id: 'divider5', divider: true, label: 'People Search' },
+    { id: 'bdfilter', label: 'BrightData Filter',  icon: '🔵' },
+    { id: 'apollo',   label: 'Apollo Search',      icon: '🟣' },
   ]
 
   const aiNote = 'No auth required. Pass the raw BrightData profile object in the body.'
@@ -703,6 +706,347 @@ while (true) {
 `{
   "success": true,
   "deleted_id": "d1e2f3a4-5678-..."
+}`,
+      },
+    ],
+
+    // ── BrightData Filter ─────────────────────────────────────────────────────
+
+    bdfilter: [
+      {
+        id: 'bd-search', method: 'POST', path: '/api/bd-filter/search', title: 'BrightData People Search',
+        desc: 'Trigger a BrightData LinkedIn People dataset filter (620M+ profiles). Returns immediately with a snapshot_id — the poll→download→save pipeline runs in the background. Poll GET /api/bd-filter/status/{snapshot_id} to track progress. Auth: JWT token in body.',
+        curl:
+`# Simple filter — returns immediately
+curl -X POST ${BASE}/api/bd-filter/search \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "token": "${TOKEN}",
+    "filters": {
+      "name": "position",
+      "operator": "includes",
+      "value": "CTO"
+    },
+    "limit": 20,
+    "timeout": 1800
+  }'
+
+# Compound AND/OR filter
+curl -X POST ${BASE}/api/bd-filter/search \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "token": "${TOKEN}",
+    "filters": {
+      "operator": "and",
+      "filters": [
+        {
+          "operator": "or",
+          "filters": [
+            { "name": "position", "operator": "includes", "value": "CTO" },
+            { "name": "position", "operator": "includes", "value": "Chief Technology Officer" }
+          ]
+        },
+        { "name": "city",     "operator": "includes", "value": "London" },
+        { "name": "followers", "operator": ">",        "value": "1000"  }
+      ]
+    },
+    "limit": 50,
+    "timeout": 1800
+  }'`,
+        response:
+`// Immediate response — snapshot triggered, job running in background
+{
+  "snapshot_id": "snap_abc123xyz",
+  "dataset_id":  "gd_l1viktl72bvl7bjuj0",
+  "status":      "processing"
+}
+
+// Poll GET /api/bd-filter/status/{snapshot_id} until status == "done"`,
+      },
+      {
+        id: 'bd-status', method: 'GET', path: '/api/bd-filter/status/{snapshot_id}', title: 'BrightData Snapshot Status',
+        desc: 'Poll the status of a BrightData snapshot job. Call every 5–10 seconds after triggering a search. status progresses: processing → building → downloading → saving → done (or failed). Results are in the response when status == "done".',
+        curl:
+`curl "${BASE}/api/bd-filter/status/snap_abc123xyz"`,
+        response:
+`// While building:
+{
+  "snapshot_id": "snap_abc123xyz",
+  "status":      "building",
+  "bd_status":   "running",
+  "triggered_at": "2026-04-15T10:00:00+00:00"
+}
+
+// When complete:
+{
+  "snapshot_id":    "snap_abc123xyz",
+  "dataset_id":     "gd_l1viktl72bvl7bjuj0",
+  "status":         "done",
+  "total_returned": 20,
+  "saved":          20,
+  "skipped":        0,
+  "failed":         0,
+  "completed_at":   "2026-04-15T10:08:42+00:00",
+  "results": [
+    {
+      "id":           "a1b2c3d4e5f6",
+      "linkedin_url": "https://www.linkedin.com/in/johndoe",
+      "name":         "John Doe",
+      "title":        "CTO",
+      "company":      "Acme Corp",
+      "city":         "London",
+      "country":      "GB",
+      "status":       "bd_filter"
+    }
+  ]
+}
+
+// status values:
+// processing  — snapshot triggered, waiting for BrightData
+// building    — BrightData building snapshot (bd_status = scheduled|running)
+// downloading — snapshot ready, fetching records
+// saving      — records being upserted to DB
+// done        — complete, results populated
+// failed      — error field contains reason`,
+      },
+      {
+        id: 'bd-credits', method: 'GET', path: '/api/bd-filter/credits', title: 'API Credits & Usage',
+        desc: 'Fetch live account balance from BrightData and per-endpoint rate limit usage from Apollo. No auth required. BrightData balance requires an account-level API key (datasets key returns key status instead). Apollo returns day/hour/minute limits and consumed counts for every endpoint.',
+        curl:
+`curl "${BASE}/api/bd-filter/credits"`,
+        response:
+`{
+  "brightdata": {
+    // If account-level key: balance in USD
+    "balance":         12.50,
+    "pending_balance":  0.00,
+
+    // If datasets key (no account scope):
+    "note":    "Balance requires an account-level API key. Datasets key is active.",
+    "status":  "active",
+    "customer": "hl_b95863b4",
+    "can_make_requests": false
+  },
+  "apollo": {
+    // Keys are stringified JSON arrays: ["api/path", "action"]
+    "[\"api/v1/mixed_people\", \"api_search\"]": {
+      "day":    { "limit": 600, "consumed": 5,  "left_over": 595 },
+      "hour":   { "limit": 200, "consumed": 0,  "left_over": 200 },
+      "minute": { "limit": 50,  "consumed": 0,  "left_over": 50  }
+    },
+    "[\"api/v1/people\", \"match\"]": {
+      "day":    { "limit": 600, "consumed": 2,  "left_over": 598 },
+      "hour":   { "limit": 200, "consumed": 0,  "left_over": 200 },
+      "minute": { "limit": 50,  "consumed": 0,  "left_over": 50  }
+    }
+    // ... all other Apollo endpoints
+  }
+}`,
+      },
+      {
+        id: 'bd-records', method: 'GET', path: '/api/bd-filter/records', title: 'BrightData Saved Records',
+        desc: 'List profiles saved via BrightData filter search. Token is optional — omit to retrieve records across all organisations.',
+        curl:
+`# With token (org-scoped)
+curl "${BASE}/api/bd-filter/records?token=${TOKEN}&page=1&page_size=50"
+
+# Without token (all orgs)
+curl "${BASE}/api/bd-filter/records?page=1&page_size=50"`,
+        response:
+`{
+  "total":     142,
+  "page":      1,
+  "page_size": 50,
+  "records": [
+    {
+      "id":               "a1b2c3d4e5f6",
+      "linkedin_url":     "https://www.linkedin.com/in/johndoe",
+      "name":             "John Doe",
+      "title":            "CTO",
+      "company":          "Acme Corp",
+      "city":             "London",
+      "country":          "GB",
+      "linkedin_followers": 3200,
+      "top_skills":       "[\"Python\",\"AWS\",\"Kubernetes\"]",
+      "education":        "[{\"school\":\"MIT\",\"degree\":\"MSc CS\"}]",
+      "status":           "bd_filter",
+      "created_at":       "2026-04-15T10:30:00+00:00"
+    }
+  ]
+}
+
+// Filterable fields (pass in filters object):
+// position, name, first_name, last_name
+// city, country_code, location
+// current_company_name, current_company_industry, current_company_employee_count
+// about, skills, industry, language
+// school, degree_name, field_of_study, certification
+// followers (number), connections (number), url
+
+// Operators:
+// Text fields: includes | = | != | starts_with | ends_with | is_not_null
+// Number fields: > | < | = | != | is_not_null`,
+      },
+    ],
+
+    // ── Apollo Search ─────────────────────────────────────────────────────────
+
+    apollo: [
+      {
+        id: 'ap-search', method: 'POST', path: '/api/bd-filter/apollo/search', title: 'Apollo People Search (Free)',
+        desc: 'Search Apollo\'s 275M+ person database using the master API key — no credits consumed. Returns obfuscated last names and no email/phone. Results saved to enriched_leads with status "apollo_search". Requires APOLLO_API_KEY_MASTER configured on the server.',
+        curl:
+`curl -X POST ${BASE}/api/bd-filter/apollo/search \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "token": "${TOKEN}",
+    "person_titles":            ["CTO", "Chief Technology Officer"],
+    "person_locations":         ["London, GB", "Manchester, GB"],
+    "organization_names":       ["Stripe", "Shopify"],
+    "organization_locations":   ["San Francisco, US"],
+    "organization_industries":  ["Software"],
+    "organization_num_employees_ranges": ["201,500", "501,1000"],
+    "person_seniorities":       ["c_suite", "vp"],
+    "person_departments":       ["engineering"],
+    "contact_email_status":     ["verified"],
+    "q_keywords":               "machine learning saas",
+    "per_page": 20,
+    "page":     1,
+    "enrich":   false
+  }'`,
+        response:
+`{
+  "total_entries": 8420,
+  "page":          1,
+  "per_page":      20,
+  "enrich_mode":   false,
+  "saved":         20,
+  "skipped":       0,
+  "failed":        0,
+  "results": [
+    {
+      "id":          "b2c3d4e5f6a7",
+      "linkedin_url":"https://app.apollo.io/#/people/6241d3ba65027a0001e88b3e",
+      "name":        "John D***",
+      "first_name":  "John",
+      "last_name":   "D***",
+      "title":       "CTO",
+      "company":     "Acme Corp",
+      "city":        "London",
+      "country":     "GB",
+      "status":      "apollo_search"
+    }
+  ]
+}`,
+      },
+      {
+        id: 'ap-enrich', method: 'POST', path: '/api/bd-filter/apollo/search', title: 'Apollo Enrichment (Credits)',
+        desc: 'Same endpoint as free search but with enrich: true. After the initial search, calls POST /api/v1/people/match for each result using the regular API key — costs 1 credit per successful match. Returns full unobfuscated profile: real last name, work email, LinkedIn URL, and phone (async via webhook if APOLLO_WEBHOOK_BASE_URL is set). Status saved as "apollo_enriched".',
+        curl:
+`curl -X POST ${BASE}/api/bd-filter/apollo/search \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "token":          "${TOKEN}",
+    "person_titles":  ["CTO"],
+    "person_locations":["London, GB"],
+    "per_page": 10,
+    "page":     1,
+    "enrich":   true
+  }'`,
+        response:
+`{
+  "total_entries":   8420,
+  "page":            1,
+  "per_page":        10,
+  "enrich_mode":     true,
+  "saved":           9,
+  "skipped":         0,
+  "failed":          0,
+  "enrich_ok":       9,
+  "enrich_failed":   1,
+  "enrich_failures": ["id=abc123: people/match returned null person"],
+  "results": [
+    {
+      "id":           "b2c3d4e5f6a7",
+      "linkedin_url": "https://www.linkedin.com/in/johndoe",
+      "name":         "John Doe",
+      "first_name":   "John",
+      "last_name":    "Doe",
+      "title":        "CTO",
+      "company":      "Acme Corp",
+      "work_email":   "john.doe@acme.com",
+      "direct_phone": "",
+      "status":       "apollo_enriched"
+    }
+  ]
+}`,
+      },
+      {
+        id: 'ap-records', method: 'GET', path: '/api/bd-filter/apollo/records', title: 'Apollo Saved Records',
+        desc: 'List profiles saved via Apollo search (both free and enriched). Token optional — omit to get all organisations. Returns records with status "apollo_search" or "apollo_enriched".',
+        curl:
+`# With token (org-scoped)
+curl "${BASE}/api/bd-filter/apollo/records?token=${TOKEN}&page=1&page_size=50"
+
+# Without token (all orgs)
+curl "${BASE}/api/bd-filter/apollo/records?page=1&page_size=50"`,
+        response:
+`{
+  "total":     67,
+  "page":      1,
+  "page_size": 50,
+  "records": [
+    {
+      "id":            "b2c3d4e5f6a7",
+      "name":          "John Doe",
+      "title":         "CTO",
+      "company":       "Acme Corp",
+      "work_email":    "john.doe@acme.com",
+      "direct_phone":  "+44 20 1234 5678",
+      "industry":      "Software",
+      "employee_count": 350,
+      "status":        "apollo_enriched",
+      "organization_id": "48eaef0d-...",
+      "created_at":    "2026-04-15T09:00:00+00:00"
+    }
+  ]
+}`,
+      },
+      {
+        id: 'ap-seniorities', method: 'GET', path: '/api/bd-filter/apollo/seniorities', title: 'Apollo Seniority Options',
+        desc: 'Returns the list of valid seniority values accepted by Apollo\'s people search filter.',
+        curl:
+`curl "${BASE}/api/bd-filter/apollo/seniorities"`,
+        response:
+`{
+  "seniorities": [
+    "owner", "founder", "c_suite", "partner",
+    "vp", "head", "director", "manager",
+    "senior", "entry", "intern"
+  ]
+}`,
+      },
+      {
+        id: 'ap-webhook', method: 'POST', path: '/api/bd-filter/apollo/phone-webhook', title: 'Apollo Phone Webhook',
+        desc: 'Apollo calls this endpoint asynchronously when a phone reveal is ready (triggered by reveal_phone_number: true in people/match). Updates direct_phone in enriched_leads for the matching lead. No auth required — Apollo calls this directly. Requires APOLLO_WEBHOOK_BASE_URL set in backend/.env pointing to this server\'s public URL.',
+        curl:
+`# Apollo POSTs automatically — example payload shape:
+curl -X POST ${BASE}/api/bd-filter/apollo/phone-webhook \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "person": {
+      "id": "6241d3ba65027a0001e88b3e",
+      "phone_numbers": [
+        { "sanitized_number": "+442012345678", "type": "work_direct" }
+      ]
+    }
+  }'`,
+        response:
+`{
+  "ok":      true,
+  "updated": true,
+  "lead_id": "b2c3d4e5f6a7",
+  "phone":   "+442012345678"
 }`,
       },
     ],
