@@ -8,8 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Build context is repo root — copy from backend/ subdirectory
-COPY backend/requirements.txt .
+COPY requirements.txt .
 
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir --prefix=/install -r requirements.txt \
@@ -56,13 +55,12 @@ COPY --from=builder /install /usr/local
 ENV PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
 RUN playwright install chromium 2>/dev/null || echo "WARNING: Playwright Chromium install failed — screenshot fallback disabled"
 
-# Copy application source from backend/ subdirectory (build context = repo root)
-COPY backend/ .
+COPY . .
 
 # Seed configs so entrypoint can cp -n (no-overwrite) into the volume mount
 RUN mkdir -p configs && cp -r /app/configs /app/configs_seed
 
-COPY backend/entrypoint.sh /entrypoint.sh
+COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 EXPOSE ${PORT:-8020}
