@@ -137,7 +137,6 @@ from ._contact import (
     _try_apollo,
     _try_dropcontact,
     _try_pdl,
-    _try_zerobounce,
     find_contact_info,
 )
 
@@ -241,7 +240,7 @@ __all__ = [
     "trigger_batch_snapshot", "poll_snapshot",
     # contact
     "_SOCIAL_DOMAINS", "_extract_domain",
-    "_try_apollo", "_try_dropcontact", "_try_pdl", "_try_zerobounce",
+    "_try_apollo", "_try_dropcontact", "_try_pdl",
     "find_contact_info",
     # company
     "_try_clearbit_logo", "_normalize_apollo_org",
