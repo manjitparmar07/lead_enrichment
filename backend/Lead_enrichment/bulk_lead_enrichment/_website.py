@@ -149,6 +149,89 @@ async def _fetch_page(url: str, timeout: int = 12) -> tuple[str, Optional[Beauti
         return "", None
 
 
+async def scrape_contact_page(domain: str) -> dict:
+    """
+    Lightweight contact scraper — only hits homepage + /contact + /contact-us.
+    Used in the email enrichment waterfall as a free fallback before pattern guessing.
+
+    Returns: {email, phone, source, confidence} or {} if nothing found.
+    - email: first business email found (mailto: links first, regex fallback)
+    - phone: first phone found (tel: links first, regex fallback)
+    - source: "website_scrape"
+    - confidence: "medium"
+    """
+    if not domain:
+        return {}
+
+    base = domain.strip().rstrip("/")
+    if not base.startswith("http"):
+        base = f"https://{base}"
+    base_www = base.replace("://", "://www.", 1) if "://www." not in base else None
+
+    # Only contact-focused pages — fast and targeted
+    urls_to_try = [
+        f"{base}/contact",
+        f"{base}/contact-us",
+        base,                         # homepage (footer often has email/phone)
+    ]
+    if base_www:
+        urls_to_try += [
+            f"{base_www}/contact",
+            f"{base_www}/contact-us",
+            base_www,
+        ]
+
+    fetch_tasks = [_fetch_page(url, timeout=8) for url in urls_to_try]
+    results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+
+    found_emails: list[str] = []
+    found_phones: list[str] = []
+    all_text = ""
+
+    for result in results:
+        if isinstance(result, Exception):
+            continue
+        text, soup = result
+        if not text:
+            continue
+        all_text += " " + text
+        if soup:
+            _p, _e = _extract_contacts_from_soup(soup)
+            for e in _e:
+                if e not in found_emails:
+                    found_emails.append(e)
+            for p in _p:
+                if p not in found_phones:
+                    found_phones.append(p)
+        if found_emails and found_phones:
+            break  # We have both — stop early
+
+    # Regex fallback if structured extraction found nothing
+    if not found_emails and all_text:
+        found_emails = _extract_emails_regex_fallback(all_text)
+    if not found_phones and all_text:
+        found_phones = _extract_phones_regex_fallback(all_text)
+
+    if not found_emails and not found_phones:
+        return {}
+
+    # Filter out image/asset false positives that slip through regex
+    clean_emails = [
+        e for e in found_emails
+        if "@" in e and not any(ext in e.lower() for ext in [".png", ".jpg", ".svg", ".gif", ".webp"])
+    ]
+
+    result_data: dict = {"source": "website_scrape", "confidence": "medium"}
+    if clean_emails:
+        result_data["email"] = clean_emails[0]
+        logger.info("[WebContactScrape] Found email: %s from %s", clean_emails[0], domain)
+    if found_phones:
+        result_data["phone"] = found_phones[0]
+        logger.info("[WebContactScrape] Found phone: %s from %s", found_phones[0], domain)
+
+    return result_data
+
+
 async def scrape_website_intelligence(website: str) -> dict:
     """
     Scrapes homepage, about, product, services, contact, pricing, careers, blog pages.

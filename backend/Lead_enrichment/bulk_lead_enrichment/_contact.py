@@ -16,8 +16,9 @@ import logging
 import re
 from typing import Optional
 
-from ._utils import _apollo_api_key, _dropcontact_key, _pdl_api_key, _zerobounce_key
+from ._utils import _apollo_api_key, _dropcontact_key, _pdl_api_key
 from ._clients import _get_api_client
+from ._website import scrape_contact_page
 
 try:
     from analytics import api_usage_service as _usage
@@ -159,35 +160,38 @@ async def _try_pdl(first: str, last: str, linkedin_url: str, domain: str) -> Opt
     return None
 
 
-async def _try_zerobounce(email: str) -> dict:
-    """ZeroBounce — email verification. Falls through gracefully if key not set."""
-    key = _zerobounce_key()
-    if not key or not email:
+async def _try_validemail(email: str) -> dict:
+    """ValidEmail.net — email verification. Falls through gracefully if token not set."""
+    import os
+    token = os.getenv("VALIDEMAIL_TOKEN", "")
+    if not token or not email:
         return {"email": email, "verified": False, "bounce_risk": None}
     try:
         c = _get_api_client()
         r = await c.get(
-            "https://api.zerobounce.net/v2/validate",
-            params={"api_key": key, "email": email, "ip_address": ""},
+            "https://api.ValidEmail.net/",
+            params={"email": email, "token": token},
         )
         if r.status_code == 200:
             d = r.json()
-            status = d.get("status", "")
-            sub_status = d.get("sub_status", "")
-            verified = status == "valid"
-            if status in ("invalid", "do_not_mail", "abuse"):
+            if "Message" in d or "message" in d:
+                logger.warning("[ValidEmail] API message for %s: %s", email,
+                               d.get("Message") or d.get("message"))
+                return {"email": email, "verified": False, "bounce_risk": None}
+            valid       = bool(d.get("valid", False))
+            result_str  = (d.get("result") or "").lower()
+            disposable  = bool(d.get("disposable", False))
+            if not valid or disposable or result_str in ("invalid", "disabled"):
                 bounce_risk = "high"
-            elif status == "catch-all" or sub_status in ("role_based", "global_suppression"):
+            elif result_str in ("risky", "accept_all", "unknown"):
                 bounce_risk = "medium"
-            elif verified:
-                bounce_risk = "low"
             else:
-                bounce_risk = "medium"
-            logger.info("[ZeroBounce] %s → status=%s bounce_risk=%s", email, status, bounce_risk)
-            return {"email": email, "verified": verified, "bounce_risk": bounce_risk,
-                    "zb_status": status, "zb_sub_status": sub_status}
+                bounce_risk = "low"
+            logger.info("[ValidEmail] %s → valid=%s result=%s bounce_risk=%s",
+                        email, valid, result_str, bounce_risk)
+            return {"email": email, "verified": valid, "bounce_risk": bounce_risk}
     except Exception as e:
-        logger.debug("[ZeroBounce] %s", e)
+        logger.debug("[ValidEmail] %s", e)
     return {"email": email, "verified": False, "bounce_risk": None}
 
 
@@ -199,12 +203,13 @@ async def find_contact_info(
     skip_apollo: bool = False,
 ) -> dict:
     """
-    5-step email discovery waterfall:
-      1. Apollo.io   — person match
-      2. Dropcontact — LinkedIn URL or name+domain
-      3. PDL         — People Data Labs person enrichment
-      4. Pattern guess — first.last@domain, flast@domain, first@domain
-      5. ZeroBounce  — verify whichever email was found
+    6-step email discovery waterfall:
+      1. Apollo.io      — person match (personal work email)
+      2. Dropcontact    — LinkedIn URL or name+domain
+      3. PDL            — People Data Labs person enrichment
+      4. Website scrape — scrape /contact + homepage for business email + phone
+      5. Pattern guess  — first.last@domain, flast@domain, first@domain
+      6. ValidEmail.net — verify whichever email was found
 
     Returns: {email, phone, source, confidence, verified, bounce_risk}
     """
@@ -237,12 +242,28 @@ async def find_contact_info(
                 result = pdl_res
                 logger.info("[ContactWaterfall] Step 3 PDL hit: %s", result.get("email"))
 
-    # Step 4 — Pattern guess
+    # Step 4 — Website scrape (contact page / footer)
+    if not result and domain:
+        web_res = await scrape_contact_page(domain)
+        if isinstance(web_res, dict) and web_res.get("email"):
+            result = web_res
+            logger.info("[ContactWaterfall] Step 4 Website scrape hit: email=%s phone=%s",
+                        result.get("email"), result.get("phone"))
+        elif isinstance(web_res, dict) and web_res.get("phone"):
+            # Phone found but no email — keep phone for later, continue to pattern guess
+            _scraped_phone = web_res.get("phone")
+            logger.info("[ContactWaterfall] Step 4 Website scrape: phone only=%s", _scraped_phone)
+        else:
+            _scraped_phone = None
+
+    # Step 5 — Pattern guess
     if not result and first and last and domain:
         last_clean = last.lower().replace(" ", "")
         guess = f"{first.lower()}.{last_clean}@{domain}"
-        result = {"email": guess, "phone": None, "source": "pattern_guess", "confidence": "low"}
-        logger.info("[ContactWaterfall] Step 4 Pattern guess: %s", guess)
+        # Attach scraped phone if we found one in Step 4 but no email
+        scraped_phone = locals().get("_scraped_phone")
+        result = {"email": guess, "phone": scraped_phone, "source": "pattern_guess", "confidence": "low"}
+        logger.info("[ContactWaterfall] Step 5 Pattern guess: %s (phone=%s)", guess, scraped_phone)
 
     if not result:
         return {"email": None, "phone": None, "source": None, "confidence": None,
@@ -254,10 +275,10 @@ async def find_contact_info(
                        result.get("source"), result.get("email"))
         result["email"] = None
 
-    # Step 5 — ZeroBounce verification
+    # Step 6 — ValidEmail.net verification
     email = result.get("email")
     if email:
-        zb = await _try_zerobounce(email)
+        zb = await _try_validemail(email)
         result["verified"]    = zb.get("verified", False)
         result["bounce_risk"] = zb.get("bounce_risk")
 

@@ -6,7 +6,8 @@ Both endpoints share the same flow via _find_email_for_lead():
   1. If email already in DB → return cached
   2. Extract first_name, last_name, domain from lead record
   3. Call Apollo.io → if found, verify via ValidEmail.net → save + return
-  4. If Apollo misses → generate 3 pattern guesses → verify each via ValidEmail.net
+  4. If Apollo misses → scrape company /contact + homepage for business email + phone
+  5. If still no email → generate 3 pattern guesses → verify each via ValidEmail.net
      → save best guess → return all guesses
 
 Endpoints:
@@ -39,6 +40,7 @@ except ImportError:
         async def track(*args, **kwargs): pass
 
 import Lead_enrichment.bulk_lead_enrichment.lead_enrichment_brightdata_service as svc
+from Lead_enrichment.bulk_lead_enrichment._website import scrape_contact_page
 from db import get_pool
 
 logger = logging.getLogger(__name__)
@@ -249,9 +251,10 @@ def _build_synthetic_lead(entry: DirectLeadInput) -> dict:
 async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False) -> dict:
     """
     Flow (identical for single and bulk):
-      1. Cache hit  → return immediately if work_email already set
-      2. Apollo.io  → if found, verify via ValidEmail.net → save → return
-      3. Pattern guesses → verify each via ValidEmail.net → save best → return all
+      1. Cache hit      → return immediately if work_email already set
+      2. Apollo.io      → if found, verify via ValidEmail.net → save → return
+      3. Website scrape → scrape /contact + homepage for business email + phone
+      4. Pattern guesses → verify each via ValidEmail.net → save best → return all
     """
     lead_id = lead["id"]
     first, last, domain, linkedin_url = _extract_lead_identity(lead)
@@ -291,7 +294,9 @@ async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False)
             "verified":          _cached_verified,
             "bounce_risk":       _cached_bounce,
             "enrichment_source": lead.get("enrichment_source"),
-            "phone":             lead.get("direct_phone") or lead.get("phone"),
+            "phone":             lead.get("direct_phone"),
+            "company_email":     lead.get("company_email"),
+            "company_phone":     lead.get("company_phone"),
             "all_emails":        [_cached_email],
             "activity_emails":   [],
             "activity_phones":   [],
@@ -307,14 +312,16 @@ async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False)
             lead_id, _cached_source, _cached_verified, _cached_bounce,
         )
 
-    work_email:    str | None    = None
-    phone:         str | None    = None
-    source:        str           = "apollo"
-    confidence:    str | None    = None
-    apollo_raw:    dict          = {}
-    verified:      bool          = False
-    bounce_risk:   str | None    = None
-    guessed_emails: list[dict]   = []
+    work_email:             str | None  = None
+    phone:                  str | None  = None   # personal phone — Apollo only
+    source:                 str         = "apollo"
+    confidence:             str | None  = None
+    apollo_raw:             dict        = {}
+    verified:               bool        = False
+    bounce_risk:            str | None  = None
+    guessed_emails:         list[dict]  = []
+    scraped_business_email: str | None  = None   # generic business email from website
+    scraped_company_phone:  str | None  = None   # business phone from website
 
     # ── Guard: need at least first name + (domain or linkedin) ───────────────
     if not first or (not domain and not linkedin_url):
@@ -385,49 +392,77 @@ async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False)
                     work_email, verified, lead_id)
 
     else:
-        # ── 3. Pattern guesses + ValidEmail.net ───────────────────────────────
-        logger.info("[EmailView] Apollo found nothing for lead %s — generating guesses", lead_id)
-
-        if first and domain:
-            guesses = _generate_guessed_emails(first, last, domain)
-            verifications = await asyncio.gather(*[_verify_email(e) for e in guesses])
-            guessed_emails = [
-                {"email": e, "verified": v["verified"], "bounce_risk": v["bounce_risk"], "source": "guessed"}
-                for e, v in zip(guesses, verifications)
-            ]
-            logger.info("[EmailView] Guessed emails for lead %s: %s",
-                        lead_id, [g["email"] for g in guessed_emails])
-
-            best = next((g for g in guessed_emails if g["verified"]),
-                        guessed_emails[0] if guessed_emails else None)
-            if best:
-                work_email  = best["email"]
-                verified    = best["verified"]
-                bounce_risk = best["bounce_risk"]
-                source      = "guessed"
+        # ── 3. Website scrape — contact page + homepage ───────────────────────
+        # Scrapes generic business email (info@, contact@) and phone from the
+        # company website. The business email is NOT stored as work_email (which
+        # must be the lead's personal address) — it goes into a separate field.
+        # Phone is always saved to direct_phone if we don't already have one.
+        scraped_business_email: str | None = None
+        scraped_company_phone:  str | None = None
+        if domain:
+            logger.info("[EmailView] Apollo found nothing for lead %s — trying website scrape", lead_id)
+            web_res = await scrape_contact_page(domain)
+            if isinstance(web_res, dict) and (web_res.get("email") or web_res.get("phone")):
+                scraped_business_email = web_res.get("email") or None
+                scraped_company_phone  = web_res.get("phone") or None
+                # company_email = generic business email (info@, contact@) — NOT work_email
+                # company_phone = business phone from website — NOT direct_phone (personal)
                 async with pool.acquire() as conn:
                     await conn.execute(
                         """UPDATE enriched_leads
-                           SET work_email=$1, email_source='guessed',
-                               email_confidence='low', enrichment_source='pattern',
-                               email_verified=$2, bounce_risk=$3,
+                           SET company_email=COALESCE(company_email, $1),
+                               company_phone=COALESCE(company_phone, $2),
                                updated_at=NOW()
-                           WHERE id=$4""",
-                        work_email, 1 if verified else 0, bounce_risk, lead_id,
+                           WHERE id=$3""",
+                        scraped_business_email, scraped_company_phone, lead_id,
                     )
-                logger.info("[EmailView] Saved best guess email=%s for lead %s", work_email, lead_id)
+                logger.info("[EmailView] Website scrape → company_email=%s company_phone=%s for lead %s",
+                            scraped_business_email, scraped_company_phone, lead_id)
+
+        # ── 4. Pattern guesses + ValidEmail.net ───────────────────────────────
+        if not work_email:
+            logger.info("[EmailView] Trying pattern guesses for lead %s", lead_id)
+
+            if first and domain:
+                guesses = _generate_guessed_emails(first, last, domain)
+                verifications = await asyncio.gather(*[_verify_email(e) for e in guesses])
+                guessed_emails = [
+                    {"email": e, "verified": v["verified"], "bounce_risk": v["bounce_risk"], "source": "guessed"}
+                    for e, v in zip(guesses, verifications)
+                ]
+                logger.info("[EmailView] Guessed emails for lead %s: %s",
+                            lead_id, [g["email"] for g in guessed_emails])
+
+                best = next((g for g in guessed_emails if g["verified"]),
+                            guessed_emails[0] if guessed_emails else None)
+                if best:
+                    work_email  = best["email"]
+                    verified    = best["verified"]
+                    bounce_risk = best["bounce_risk"]
+                    source      = "guessed"
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            """UPDATE enriched_leads
+                               SET work_email=$1, email_source='guessed',
+                                   email_confidence='low', enrichment_source='pattern',
+                                   email_verified=$2, bounce_risk=$3,
+                                   updated_at=NOW()
+                               WHERE id=$4""",
+                            work_email, 1 if verified else 0, bounce_risk, lead_id,
+                        )
+                    logger.info("[EmailView] Saved best guess email=%s for lead %s", work_email, lead_id)
+                else:
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE enriched_leads SET email_source='not_found', updated_at=NOW() WHERE id=$1",
+                            lead_id,
+                        )
             else:
                 async with pool.acquire() as conn:
                     await conn.execute(
                         "UPDATE enriched_leads SET email_source='not_found', updated_at=NOW() WHERE id=$1",
                         lead_id,
                     )
-        else:
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE enriched_leads SET email_source='not_found', updated_at=NOW() WHERE id=$1",
-                    lead_id,
-                )
 
     _message = (
         f"Email found: {work_email} | Source: {source} | Verified: {'Yes' if verified else 'No'}"
@@ -437,24 +472,26 @@ async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False)
     )
 
     return {
-        "lead_id":           lead_id,
-        "linkedin_url":      linkedin_url,
-        "name":              lead.get("name"),
-        "company":           lead.get("company"),
-        "work_email":        work_email,
-        "email":             work_email,
-        "source":            source if work_email else "not_found",
-        "message":           _message,
-        "confidence":        confidence,
-        "verified":          verified,
-        "bounce_risk":       bounce_risk,
-        "enrichment_source": source if work_email else None,
-        "phone":             phone,
-        "all_emails":        [work_email] if work_email else [],
-        "activity_emails":   [],
-        "activity_phones":   [],
-        "ai_generated":      None,
-        "guessed_emails":    guessed_emails,
+        "lead_id":              lead_id,
+        "linkedin_url":         linkedin_url,
+        "name":                 lead.get("name"),
+        "company":              lead.get("company"),
+        "work_email":           work_email,           # personal email — Apollo or pattern guess
+        "email":                work_email,
+        "source":               source if work_email else "not_found",
+        "message":              _message,
+        "confidence":           confidence,
+        "verified":             verified,
+        "bounce_risk":          bounce_risk,
+        "enrichment_source":    source if work_email else None,
+        "phone":                phone,                # personal phone — Apollo only
+        "company_email":        scraped_business_email,  # business email — scraped from website
+        "company_phone":        scraped_company_phone,   # business phone — scraped from website
+        "all_emails":           [work_email] if work_email else [],
+        "activity_emails":      [],
+        "activity_phones":      [],
+        "ai_generated":         None,
+        "guessed_emails":       guessed_emails,
     }
 
 
@@ -481,7 +518,7 @@ Two ways to call this endpoint — same flow, same response shape:
 }
 ```
 
-Flow: Apollo.io → ValidEmail.net → pattern guesses → ValidEmail.net.
+Flow: Apollo.io → website scrape (/contact + homepage) → pattern guesses → ValidEmail.net.
 When fields are passed directly the DB update is a silent no-op (no row to update).
 """,
 )
