@@ -451,11 +451,23 @@ async def regenerate_crm_brief(lead_id: str, request: Request):
 
     try:
         result = await svc.regenerate_crm_brief_for_lead(lead_id, org_id=org_id)
+        crm_brief = result.get("crm_brief") if result else None
+        if crm_brief:
+            return {"success": True, "lead_id": lead_id, "crm_brief": crm_brief}
+        return {
+            "success": False,
+            "lead_id": lead_id,
+            "crm_brief": None,
+            "error": "LLM returned no content — check HuggingFace credits (402 Payment Required)",
+        }
     except Exception as exc:
         logger.error("[RegenerateCrmBrief] Failed for lead=%s: %s", lead_id, exc)
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    return {"success": True, "lead_id": lead_id, "crm_brief": result.get("crm_brief") if result else None}
+        return {
+            "success": False,
+            "lead_id": lead_id,
+            "crm_brief": None,
+            "error": str(exc),
+        }
 
 
 @router.delete("/{lead_id}", include_in_schema=False)
