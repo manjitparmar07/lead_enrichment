@@ -812,9 +812,13 @@ async def enrich_single(
             _updated = await regenerate_crm_brief_for_lead(lead_id, org_id=org_id)
             if _updated and _updated.get("crm_brief"):
                 lead["crm_brief"] = _updated["crm_brief"]
-                lead["linkedin_enrich"] = _format_linkedin_enrich(lead, include_contact=not skip_contact)
+                lead.pop("_crm_brief_error", None)
+            else:
+                lead["_crm_brief_error"] = "LLM returned no content"
         except Exception as _regen_err:
+            lead["_crm_brief_error"] = str(_regen_err)
             logger.warning("[Enrich] crm_brief generation failed for %s: %s", url, _regen_err)
+        lead["linkedin_enrich"] = _format_linkedin_enrich(lead, include_contact=not skip_contact)
 
     # Forward to LIO — only if BrightData returned real data (lead has a name)
     if not forward_to_lio and lead.get("name"):

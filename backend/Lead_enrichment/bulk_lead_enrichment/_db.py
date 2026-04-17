@@ -878,10 +878,14 @@ def _format_linkedin_enrich(lead: dict, include_contact: bool = True) -> dict:
     full         = _parse_json_safe(lead.get("full_data"), {})
     lead_scoring = full.get("lead_scoring") or {}  # noqa: F841
 
-    return {
+    crm = _parse_json_safe(lead.get("crm_brief"), None)
+    result = {
         "lead_id":      lead.get("id"),
         "linkedin_url": lead.get("linkedin_url"),
         "enriched_at":  lead.get("enriched_at"),
         "cache_hit":    bool(lead.get("_cache_hit")),
-        "crm_brief":    _parse_json_safe(lead.get("crm_brief"), None),
+        "crm_brief":    crm,
     }
+    if crm is None:
+        result["crm_brief_error"] = lead.get("_crm_brief_error") or "crm_brief not yet generated"
+    return result

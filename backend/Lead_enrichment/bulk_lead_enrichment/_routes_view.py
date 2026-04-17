@@ -1175,7 +1175,7 @@ async def company_enrichment(body: ViewCompanyRequest):
                     except Exception as _de:
                         logger.warning("[ViewCompany] DB update failed for lead=%s: %s", lead_id, _de)
 
-            return {
+            _resp = {
                 "success":          True,
                 "cached":           False,
                 "lead_id":          lead["id"] if lead else None,
@@ -1183,6 +1183,12 @@ async def company_enrichment(body: ViewCompanyRequest):
                 "company_linkedin": company_linkedin,
                 "crm_brief":        crm_brief,
             }
+            if crm_brief is None:
+                _resp["crm_brief_error"] = (
+                    company_data.get("_llm_error")
+                    or "LLM failed to generate company CRM brief — check HuggingFace credits (402 Payment Required)"
+                )
+            return _resp
 
     finally:
         _company_locks_ref[lock_key] -= 1

@@ -602,7 +602,7 @@ async def _enrich_company_with_llm(bd_raw: dict, apollo_raw: dict, company_name:
                 {"role": "system", "content": _COMPANY_CRM_SYSTEM_PROMPT},
                 {"role": "user",   "content": user_prompt},
             ],
-            max_tokens=6000,
+            max_tokens=10000,
             temperature=0.2,
             hf_first=True,
         )
