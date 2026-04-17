@@ -804,11 +804,17 @@ async def enrich_single(
     lead["_cache_hit"] = False
     lead["linkedin_enrich"] = _format_linkedin_enrich(lead, include_contact=not skip_contact)
 
-    # If crm_brief generation failed or empty — regenerate in background
+    # If crm_brief missing/invalid — generate synchronously so it's in the response
     _saved_brief_single = _parse_json_safe(lead.get("crm_brief"), None)
     if not _validate_crm_brief(_saved_brief_single) and lead.get("name"):
-        logger.warning("[Enrich] crm_brief missing/invalid for %s — scheduling background regeneration", url)
-        asyncio.create_task(regenerate_crm_brief_for_lead(lead_id, org_id=org_id))
+        logger.info("[Enrich] crm_brief missing for %s — generating now", url)
+        try:
+            _updated = await regenerate_crm_brief_for_lead(lead_id, org_id=org_id)
+            if _updated and _updated.get("crm_brief"):
+                lead["crm_brief"] = _updated["crm_brief"]
+                lead["linkedin_enrich"] = _format_linkedin_enrich(lead, include_contact=not skip_contact)
+        except Exception as _regen_err:
+            logger.warning("[Enrich] crm_brief generation failed for %s: %s", url, _regen_err)
 
     # Forward to LIO — only if BrightData returned real data (lead has a name)
     if not forward_to_lio and lead.get("name"):
@@ -1677,11 +1683,16 @@ async def _process_one_webhook_profile(profile: dict, job_id: Optional[str], org
         _plog(job_id, url, "COMPLETED", f"score_tier={score_tier!r} — lead saved and sent to LIO")
         logger.info("[Pipeline] %s → completed", url)
 
-        # If crm_brief generation failed or empty — regenerate in background
+        # If crm_brief missing/invalid — generate synchronously so caller gets it
         _saved_brief = _parse_json_safe(lead.get("crm_brief"), None)
         if not _validate_crm_brief(_saved_brief):
-            logger.warning("[Pipeline] crm_brief missing/invalid for %s — scheduling background regeneration", url)
-            asyncio.create_task(regenerate_crm_brief_for_lead(lead_id, org_id=org_id))
+            logger.info("[Pipeline] crm_brief missing for %s — generating now", url)
+            try:
+                _updated = await regenerate_crm_brief_for_lead(lead_id, org_id=org_id)
+                if _updated and _updated.get("crm_brief"):
+                    lead["crm_brief"] = _updated["crm_brief"]
+            except Exception as _regen_err:
+                logger.warning("[Pipeline] crm_brief generation failed for %s: %s", url, _regen_err)
 
         return lead
     except Exception as e:

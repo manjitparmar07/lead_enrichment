@@ -591,29 +591,32 @@ async def _fetch_apollo_company_raw(company_name: str, domain: str) -> dict:
 
 
 async def _enrich_company_with_llm(bd_raw: dict, apollo_raw: dict, company_name: str, website_intel: dict | None = None) -> dict:
-    """Call Qwen2.5-7B with combined BD + Apollo + website data. Returns CRM profile dict."""
+    """Call LLM with combined BD + Apollo + website data. Returns CRM profile dict."""
     if not bd_raw and not apollo_raw and not website_intel:
         return {}
     try:
         user_prompt = _build_company_crm_user_prompt(bd_raw, apollo_raw, company_name, website_intel)
-        logger.info("[CompanyLLM] Calling Qwen2.5-7B for company: %s", company_name)
+        logger.info("[CompanyLLM] Calling LLM for company: %s (prompt=%d chars)", company_name, len(user_prompt))
         raw = await _call_llm(
             [
                 {"role": "system", "content": _COMPANY_CRM_SYSTEM_PROMPT},
                 {"role": "user",   "content": user_prompt},
             ],
-            max_tokens=4000,
+            max_tokens=6000,
             temperature=0.2,
             hf_first=True,
         )
         if not raw:
+            logger.warning("[CompanyLLM] LLM returned empty response for %s", company_name)
             return {}
         raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
         raw = re.sub(r"<think>.*", "", raw, flags=re.DOTALL).strip()
+        logger.info("[CompanyLLM] Raw LLM response for %s: %d chars", company_name, len(raw))
         start = raw.find("{")
         if start == -1:
+            logger.warning("[CompanyLLM] No JSON object in response for %s — preview: %r", company_name, raw[:300])
             return {}
-        depth, end = 0, start
+        depth, end = 0, -1
         for i, ch in enumerate(raw[start:], start):
             if ch == "{":
                 depth += 1
@@ -622,9 +625,15 @@ async def _enrich_company_with_llm(bd_raw: dict, apollo_raw: dict, company_name:
                 if depth == 0:
                     end = i
                     break
+        if end == -1:
+            logger.warning("[CompanyLLM] JSON truncated (max_tokens hit) for %s — len=%d", company_name, len(raw))
+            return {}
         parsed = json.loads(raw[start:end + 1])
         logger.info("[CompanyLLM] CRM brief generated for %s (%d top-level keys)", company_name, len(parsed))
         return parsed
+    except json.JSONDecodeError as e:
+        logger.warning("[CompanyLLM] JSON parse failed for %s: %s", company_name, e)
+        return {}
     except Exception as e:
         logger.warning("[CompanyLLM] LLM enrichment failed for %s: %s", company_name, e)
         return {}

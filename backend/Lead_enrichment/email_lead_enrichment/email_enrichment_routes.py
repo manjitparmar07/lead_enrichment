@@ -273,9 +273,9 @@ async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False)
 
     _is_quality_cache = (
         _cached_email and not force_refresh and (
-            _cached_verified                          # ValidEmail confirmed it
-            or _cached_source == "apollo"             # Apollo is authoritative
-            or _cached_bounce in ("low", "medium")    # acceptable bounce risk
+            _cached_verified                                              # ValidEmail confirmed it
+            or (_cached_source == "apollo" and _cached_bounce != "high") # Apollo + acceptable bounce
+            or _cached_bounce in ("low", "medium")                       # acceptable bounce risk
         )
     )
 
@@ -285,6 +285,7 @@ async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False)
             "linkedin_url":      linkedin_url,
             "name":              lead.get("name"),
             "company":           lead.get("company"),
+            "domain":            domain,
             "work_email":        _cached_email,
             "email":             _cached_email,
             "source":            _cached_source,
@@ -340,6 +341,7 @@ async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False)
             "linkedin_url":      linkedin_url,
             "name":              lead.get("name"),
             "company":           lead.get("company"),
+            "domain":            domain,
             "work_email":        None, "email": None,
             "source":            "missing_params",
             "message":           "Cannot search email — missing first name and company domain or LinkedIn URL.",
@@ -350,13 +352,42 @@ async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False)
             "guessed_emails":    guessed_emails,
         }
 
-    # ── 2. Apollo ─────────────────────────────────────────────────────────────
-    try:
-        apollo_result = await svc._try_apollo(first, last, domain, linkedin_url=linkedin_url)
-    except Exception as e:
-        logger.warning("[EmailView] Apollo error for lead %s: %s", lead_id, e)
-        apollo_result = None
+    # ── 2. Apollo + website scrape — run in parallel always ──────────────────
+    async def _run_apollo():
+        try:
+            return await svc._try_apollo(first, last, domain, linkedin_url=linkedin_url)
+        except Exception as e:
+            logger.warning("[EmailView] Apollo error for lead %s: %s", lead_id, e)
+            return None
 
+    async def _run_scrape():
+        if not domain:
+            return None
+        try:
+            return await scrape_contact_page(domain)
+        except Exception as e:
+            logger.warning("[EmailView] Website scrape error for lead %s: %s", lead_id, e)
+            return None
+
+    apollo_result, web_res = await asyncio.gather(_run_apollo(), _run_scrape())
+
+    # ── Process website scrape result (always, regardless of Apollo) ──────────
+    if isinstance(web_res, dict) and (web_res.get("email") or web_res.get("phone")):
+        scraped_business_email = web_res.get("email") or None
+        scraped_company_phone  = web_res.get("phone") or None
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE enriched_leads
+                   SET company_email=COALESCE(company_email, $1),
+                       company_phone=COALESCE(company_phone, $2),
+                       updated_at=NOW()
+                   WHERE id=$3""",
+                scraped_business_email, scraped_company_phone, lead_id,
+            )
+        logger.info("[EmailView] Website scrape → company_email=%s company_phone=%s for lead %s",
+                    scraped_business_email, scraped_company_phone, lead_id)
+
+    # ── Process Apollo result ─────────────────────────────────────────────────
     if apollo_result and apollo_result.get("_credit_exhausted"):
         logger.warning("[EmailView] Apollo credits exhausted for lead %s", lead_id)
         apollo_result = None
@@ -392,77 +423,49 @@ async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False)
                     work_email, verified, lead_id)
 
     else:
-        # ── 3. Website scrape — contact page + homepage ───────────────────────
-        # Scrapes generic business email (info@, contact@) and phone from the
-        # company website. The business email is NOT stored as work_email (which
-        # must be the lead's personal address) — it goes into a separate field.
-        # Phone is always saved to direct_phone if we don't already have one.
-        scraped_business_email: str | None = None
-        scraped_company_phone:  str | None = None
-        if domain:
-            logger.info("[EmailView] Apollo found nothing for lead %s — trying website scrape", lead_id)
-            web_res = await scrape_contact_page(domain)
-            if isinstance(web_res, dict) and (web_res.get("email") or web_res.get("phone")):
-                scraped_business_email = web_res.get("email") or None
-                scraped_company_phone  = web_res.get("phone") or None
-                # company_email = generic business email (info@, contact@) — NOT work_email
-                # company_phone = business phone from website — NOT direct_phone (personal)
+        # ── 3. Pattern guesses + ValidEmail.net (Apollo found nothing) ────────
+        logger.info("[EmailView] Apollo found nothing for lead %s — trying pattern guesses", lead_id)
+
+        if first and domain:
+            guesses = _generate_guessed_emails(first, last, domain)
+            verifications = await asyncio.gather(*[_verify_email(e) for e in guesses])
+            guessed_emails = [
+                {"email": e, "verified": v["verified"], "bounce_risk": v["bounce_risk"], "source": "guessed"}
+                for e, v in zip(guesses, verifications)
+            ]
+            logger.info("[EmailView] Guessed emails for lead %s: %s",
+                        lead_id, [g["email"] for g in guessed_emails])
+
+            best = next((g for g in guessed_emails if g["verified"]),
+                        guessed_emails[0] if guessed_emails else None)
+            if best:
+                work_email  = best["email"]
+                verified    = best["verified"]
+                bounce_risk = best["bounce_risk"]
+                source      = "guessed"
                 async with pool.acquire() as conn:
                     await conn.execute(
                         """UPDATE enriched_leads
-                           SET company_email=COALESCE(company_email, $1),
-                               company_phone=COALESCE(company_phone, $2),
+                           SET work_email=$1, email_source='guessed',
+                               email_confidence='low', enrichment_source='pattern',
+                               email_verified=$2, bounce_risk=$3,
                                updated_at=NOW()
-                           WHERE id=$3""",
-                        scraped_business_email, scraped_company_phone, lead_id,
+                           WHERE id=$4""",
+                        work_email, 1 if verified else 0, bounce_risk, lead_id,
                     )
-                logger.info("[EmailView] Website scrape → company_email=%s company_phone=%s for lead %s",
-                            scraped_business_email, scraped_company_phone, lead_id)
-
-        # ── 4. Pattern guesses + ValidEmail.net ───────────────────────────────
-        if not work_email:
-            logger.info("[EmailView] Trying pattern guesses for lead %s", lead_id)
-
-            if first and domain:
-                guesses = _generate_guessed_emails(first, last, domain)
-                verifications = await asyncio.gather(*[_verify_email(e) for e in guesses])
-                guessed_emails = [
-                    {"email": e, "verified": v["verified"], "bounce_risk": v["bounce_risk"], "source": "guessed"}
-                    for e, v in zip(guesses, verifications)
-                ]
-                logger.info("[EmailView] Guessed emails for lead %s: %s",
-                            lead_id, [g["email"] for g in guessed_emails])
-
-                best = next((g for g in guessed_emails if g["verified"]),
-                            guessed_emails[0] if guessed_emails else None)
-                if best:
-                    work_email  = best["email"]
-                    verified    = best["verified"]
-                    bounce_risk = best["bounce_risk"]
-                    source      = "guessed"
-                    async with pool.acquire() as conn:
-                        await conn.execute(
-                            """UPDATE enriched_leads
-                               SET work_email=$1, email_source='guessed',
-                                   email_confidence='low', enrichment_source='pattern',
-                                   email_verified=$2, bounce_risk=$3,
-                                   updated_at=NOW()
-                               WHERE id=$4""",
-                            work_email, 1 if verified else 0, bounce_risk, lead_id,
-                        )
-                    logger.info("[EmailView] Saved best guess email=%s for lead %s", work_email, lead_id)
-                else:
-                    async with pool.acquire() as conn:
-                        await conn.execute(
-                            "UPDATE enriched_leads SET email_source='not_found', updated_at=NOW() WHERE id=$1",
-                            lead_id,
-                        )
+                logger.info("[EmailView] Saved best guess email=%s for lead %s", work_email, lead_id)
             else:
                 async with pool.acquire() as conn:
                     await conn.execute(
                         "UPDATE enriched_leads SET email_source='not_found', updated_at=NOW() WHERE id=$1",
                         lead_id,
                     )
+        else:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE enriched_leads SET email_source='not_found', updated_at=NOW() WHERE id=$1",
+                    lead_id,
+                )
 
     _message = (
         f"Email found: {work_email} | Source: {source} | Verified: {'Yes' if verified else 'No'}"
@@ -476,6 +479,7 @@ async def _find_email_for_lead(lead: dict, pool, *, force_refresh: bool = False)
         "linkedin_url":         linkedin_url,
         "name":                 lead.get("name"),
         "company":              lead.get("company"),
+        "domain":               domain,
         "work_email":           work_email,           # personal email — Apollo or pattern guess
         "email":                work_email,
         "source":               source if work_email else "not_found",
