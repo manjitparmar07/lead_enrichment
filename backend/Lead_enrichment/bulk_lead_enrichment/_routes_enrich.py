@@ -166,7 +166,7 @@ async def enrich_single(body: SingleEnrichRequest, request: Request, background_
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error("[EnrichSingle] %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Enrichment failed: {e}")
+        return {"success": False, "cache_hit": False, "lead": None, "error": str(e)}
 
 
 @router.post(
@@ -217,7 +217,7 @@ async def enrich_single_public(body: SingleEnrichPublicRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error("[EnrichSinglePublic] %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Enrichment failed: {e}")
+        return {"success": False, "_cache_hit": False, "lead": None, "linkedin_enrich": None, "error": str(e)}
 
 
 @router.post("/enrich/bulk")
@@ -312,7 +312,7 @@ async def enrich_bulk(request: Request):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error("[EnrichBulk] %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Batch trigger failed: {e}")
+        return {"success": False, "job": None, "submitted_count": 0, "skipped_count": 0, "skipped_urls": [], "error": str(e)}
 
 
 # ── Job management ─────────────────────────────────────────────────────────
